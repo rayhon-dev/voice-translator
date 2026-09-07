@@ -1,0 +1,26 @@
+# Virtualenvs / caches - must never enter the build context
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local debug artifacts written at runtime
+debug_audio/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Env files
+.env
+.env.*
+
+# Docker files themselves
+Dockerfile
+.dockerignore

@@ -1,0 +1,54 @@
+# Compose v2 - no top-level `version:` key needed.
+services:
+  backend:
+    build:
+      context: ./backend
+    image: voice-translator-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Persist HuggingFace downloads (Whisper + NLLB) across rebuilds.
+      - hf-cache:/root/.cache/huggingface
+      # Optional: expose the /identify-speaker debug clips on the host.
+      # - ./backend/debug_audio:/app/debug_audio
+    # Modern Compose GPU passthrough (needs nvidia-container-toolkit on the host).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # First boot downloads ~2.5 GB of models and warms them up - don't flap
+      # to "unhealthy" during that window.
+      start_period: 600s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    image: voice-translator-frontend
+    ports:
+      # host 5173 -> nginx :80. 5173 keeps the backend's CORS allow-list
+      # (http://localhost:5173) valid without changes.
+      - "5173:80"
+    depends_on:
+      # SPA doesn't strictly need this, but it orders startup sensibly.
+      # Use `condition: service_healthy` instead if you want the frontend to
+      # wait until the backend has finished loading models (can be minutes on
+      # the very first run).
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  hf-cache:

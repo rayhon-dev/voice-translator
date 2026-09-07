@@ -1,0 +1,34 @@
+@import "tailwindcss";
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+@keyframes float-slow {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(5%, 8%) scale(1.1); }
+}
+
+@keyframes float-medium {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(-8%, 5%) scale(1.05); }
+}
+@keyframes wave-drift {
+  0% { transform: translate(0%, 0%) rotate(0deg); }
+  50% { transform: translate(-3%, 2%) rotate(1deg); }
+  100% { transform: translate(0%, 0%) rotate(0deg); }
+}
+
+.animate-wave-drift {
+  animation: wave-drift 20s ease-in-out infinite;
+}
+
+@keyframes wave-bar {
+  0%, 100% { height: 6px; }
+  50% { height: 32px; }
+}
+
+.animate-wave-bar {
+  animation: wave-bar 0.8s ease-in-out infinite;
+}

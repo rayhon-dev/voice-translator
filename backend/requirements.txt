@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+faster-whisper==1.0.3
+transformers==4.44.2
+sentencepiece==0.2.0
+resemblyzer==0.1.4
+soundfile==0.12.1
+numpy==1.26.4
+uroman

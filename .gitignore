@@ -1,0 +1,101 @@
+# ─────────────────────────── Python / backend ───────────────────────────
+venv/
+.venv/
+env/
+ENV/
+backend/venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# ─────────────────────────── Node / frontend ────────────────────────────
+node_modules/
+frontend/dist/
+frontend/dist-ssr/
+*.local
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ─────────────────────── Secrets / environment ──────────────────────────
+# .env may hold API keys / tokens — never commit. Commit a .env.example instead.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials.json
+secrets.*
+
+# ──────────── Model weights & caches (must never be in the repo) ─────────
+# A local HuggingFace cache accidentally created inside the project tree:
+**/.cache/
+.huggingface/
+huggingface/
+hf-cache/
+transformers_cache/
+# Raw weight files, in case any are downloaded next to the code:
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.gguf
+
+# ───────────────── Project-specific runtime artifacts ───────────────────
+# Microphone recordings captured while debugging speaker ID (contain a voice)
+backend/debug_audio/
+# Any captured / generated audio — force-add explicitly if you ever need one
+*.wav
+*.webm
+*.mp3
+*.m4a
+*.ogg
+*.flac
+# Ad-hoc local test script + its output (see README notes)
+/test.py
+/test_uz.wav
+/test_long_uz.wav
+
+# ─────────────────────────────── OS junk ────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ────────────────────────── Editors / IDEs ──────────────────────────────
+# VS Code: ignore the folder but keep genuinely shareable, machine-agnostic
+# configs (uncomment / commit these deliberately if the team wants them).
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+# JetBrains: project files are user/machine specific — ignore entirely.
+.idea/
+*.iml
+# Vim / misc
+*.swp
+*.swo
+*~
