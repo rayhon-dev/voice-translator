@@ -1,43 +1,29 @@
+import os
 import time
-from datetime import datetime
-from pathlib import Path
+import uuid
 
-from fastapi import APIRouter, UploadFile, File
+from fastapi import APIRouter, File, UploadFile
 
 from app.models.speaker_id import identify_speaker, reset_speakers
 
 router = APIRouter()
 
-# Persistent folder (NOT /tmp) so the exact audio sent to /identify-speaker
-# survives for manual inspection. <repo>/backend/debug_audio/
-DEBUG_AUDIO_DIR = Path(__file__).resolve().parent.parent.parent / "debug_audio"
-DEBUG_AUDIO_DIR.mkdir(exist_ok=True)
-
 
 @router.post("/identify-speaker")
 async def identify(audio: UploadFile = File(...)):
-    req_t0 = time.perf_counter()
+    t0 = time.perf_counter()
+    temp_filename = f"/tmp/{uuid.uuid4()}.webm"
 
-    raw = await audio.read()
+    with open(temp_filename, "wb") as buffer:
+        buffer.write(await audio.read())
 
-    # The frontend uploads this as "recording.wav" but the bytes are actually a
-    # WebM/Opus container from MediaRecorder — save with the true extension so
-    # ffmpeg/librosa pick the right demuxer, and keep it around for inspection.
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    debug_path = DEBUG_AUDIO_DIR / f"identify_{ts}.webm"
-    debug_path.write_bytes(raw)
-    print(
-        f"[/identify-speaker] received {len(raw)} bytes "
-        f"(upload filename={audio.filename!r}, content_type={audio.content_type!r}) "
-        f"-> saved {debug_path}",
-        flush=True,
-    )
-
-    speaker = identify_speaker(str(debug_path))
+    try:
+        speaker = identify_speaker(temp_filename)
+    finally:
+        os.remove(temp_filename)
 
     print(
-        f"[/identify-speaker] total={time.perf_counter() - req_t0:.2f}s "
-        f"speaker={speaker!r} file={debug_path.name}",
+        f"[/identify-speaker] speaker={speaker!r} ({time.perf_counter() - t0:.2f}s)",
         flush=True,
     )
     return {"speaker": speaker}

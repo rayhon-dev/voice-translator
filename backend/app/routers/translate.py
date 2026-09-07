@@ -13,13 +13,11 @@ class TranslateRequest(BaseModel):
 
 @router.post("/translate")
 async def translate(request: TranslateRequest):
-    # translate_text() is synchronous and GPU-bound; called directly in this
-    # async route it blocks the event loop for its whole duration.
     t0 = time.perf_counter()
     translation = translate_text(request.text, request.target_lang)
     print(
-        f"[/translate] total={time.perf_counter() - t0:.2f}s "
-        f"target={request.target_lang!r} in_chars={len(request.text)}",
+        f"[/translate] target={request.target_lang!r} "
+        f"{len(request.text)} chars in {time.perf_counter() - t0:.2f}s",
         flush=True,
     )
     return {"translation": translation}
