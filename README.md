@@ -69,20 +69,6 @@ The flow for one spoken turn:
 6. When the user hits play, the translated text is sent to `/speak` (MMS-TTS),
    which streams back a WAV that the browser plays.
 
-```mermaid
-flowchart TD
-    Mic["Browser mic<br/>MediaRecorder, ~1s chunks"] -->|audio stream| WS["WebSocket<br/>/ws/transcribe"]
-    WS -->|latest buffer only,<br/>stale audio dropped| LiveSTT["faster-whisper<br/>live pass (thread pool)"]
-    LiveSTT -->|partial text| Caption["Live captions"]
-    Mic -->|on stop:<br/>full recording| FinalSTT["faster-whisper final pass<br/>+ RMS / VAD / confidence filters"]
-    FinalSTT -->|English transcript| MT["NLLB-200<br/>/translate"]
-    MT -->|translated text| Bubble["Translated bubble"]
-    Mic -->|dialog mode:<br/>turn audio| SPK["Resemblyzer<br/>/identify-speaker"]
-    SPK -->|speaker A / B| Bubble
-    Bubble -->|user clicks play| TTS["MMS-TTS<br/>/speak → WAV"]
-    TTS -->|audio| Play["Playback"]
-```
-
 The backend is a FastAPI app; each capability lives in its own router
 (`routers/`) backed by a thin model wrapper (`models/`) that owns loading and
 inference. Models are module-level singletons so they load once per process.
