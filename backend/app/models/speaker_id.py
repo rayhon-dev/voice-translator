@@ -8,9 +8,9 @@ from app.config import SPEAKER_SIMILARITY_THRESHOLD
 # duration maths stays correct if the library ever changes it.
 try:
     from resemblyzer.hparams import sampling_rate as RESEMBLYZER_SR
-except Exception:  # pragma: no cover - defensive
+except Exception: 
     RESEMBLYZER_SR = 16000
-.
+
 MIN_VOICED_SECONDS = 1.5
 
 
@@ -24,7 +24,6 @@ _speakers = {}
 def _load_encoder():
     global _encoder
     if _encoder is None:
-        # Loaded once per process. VoiceEncoder runs on CPU here (no device arg).
         t0 = time.perf_counter()
         _encoder = VoiceEncoder()
         print(
@@ -32,8 +31,6 @@ def _load_encoder():
             flush=True,
         )
 
-        # preprocess_wav() only trims silence when webrtcvad is importable;
-        # without it, pauses stay in the clip and dilute embeddings.
         try:
             import webrtcvad  
         except Exception:
