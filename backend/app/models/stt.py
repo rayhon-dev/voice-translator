@@ -1,14 +1,17 @@
 import time
 
 import numpy as np
+import soundfile as sf
 from faster_whisper import WhisperModel
 from app.config import WHISPER_MODEL_SIZE, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
 
 
-NO_SPEECH_PROB_THRESHOLD = 0.6      
-AVG_LOGPROB_THRESHOLD = -1.0     
+NO_SPEECH_PROB_THRESHOLD = 0.6
+AVG_LOGPROB_THRESHOLD = -1.0
 RMS_SILENCE_THRESHOLD = 0.003
 USE_VAD_FILTER = True
+
+DEBUG_STT = False
 
 SAMPLE_RATE = 16000
 
@@ -86,7 +89,20 @@ def _decode_waveform(audio_path: str):
             return None
 
 
-def transcribe_audio(audio_path: str) -> str:
+def _decode_waveform_bytes(chunk: bytes):
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=True) as tmp:
+        tmp.write(chunk)
+        tmp.flush()
+        return _decode_waveform(tmp.name)
+
+
+def _write_wav(path: str, wav: np.ndarray) -> None:
+    sf.write(path, wav, SAMPLE_RATE)
+
+
+def transcribe_audio(audio_path: str, language: str = "en") -> str:
     model = get_model()
 
     audio = _decode_waveform(audio_path)
@@ -94,7 +110,7 @@ def transcribe_audio(audio_path: str) -> str:
     if audio is not None and audio.size:
         rms = float(np.sqrt(np.mean(np.square(audio.astype(np.float64)))))
         if rms < RMS_SILENCE_THRESHOLD:
-            print("[STT] audio below RMS threshold — skipping transcription", flush=True)
+            print(f"[STT] audio below RMS threshold (rms={rms:.5f} < {RMS_SILENCE_THRESHOLD}) — skipping transcription", flush=True)
             return ""
 
    
@@ -105,7 +121,7 @@ def transcribe_audio(audio_path: str) -> str:
     try:
         segments, _ = model.transcribe(
             source,
-            language="en",
+            language=language,
             vad_filter=use_vad,
             condition_on_previous_text=False,
         )
@@ -115,7 +131,7 @@ def transcribe_audio(audio_path: str) -> str:
             print(f"[STT] vad_filter failed ({e!r}); retrying without VAD", flush=True)
             use_vad = False
             segments, _ = model.transcribe(
-                source, language="en", condition_on_previous_text=False
+                source, language=language, condition_on_previous_text=False
             )
             seg_list = list(segments)
         else:
@@ -123,16 +139,50 @@ def transcribe_audio(audio_path: str) -> str:
     elapsed = time.perf_counter() - t0
 
     kept_parts = []
+    raw_parts = []
     dropped = 0
     for seg in seg_list:
         nsp = getattr(seg, "no_speech_prob", 0.0)
         alp = getattr(seg, "avg_logprob", 0.0)
+        seg_start = getattr(seg, "start", None)
+        seg_end = getattr(seg, "end", None)
+        seg_text = seg.text.strip()
+        raw_parts.append(seg_text)
+
         if nsp > NO_SPEECH_PROB_THRESHOLD or alp < AVG_LOGPROB_THRESHOLD:
+            reasons = []
+            if nsp > NO_SPEECH_PROB_THRESHOLD:
+                reasons.append(f"no_speech_prob {nsp:.3f} > {NO_SPEECH_PROB_THRESHOLD}")
+            if alp < AVG_LOGPROB_THRESHOLD:
+                reasons.append(f"avg_logprob {alp:.3f} < {AVG_LOGPROB_THRESHOLD}")
+            if DEBUG_STT:
+                print(
+                    f"[STT][DEBUG] segment DROPPED [{seg_start}-{seg_end}] text={seg_text!r} "
+                    f"no_speech_prob={nsp:.3f} avg_logprob={alp:.3f} reason=({'; '.join(reasons)})",
+                    flush=True,
+                )
             dropped += 1
             continue
-        kept_parts.append(seg.text.strip())
+
+        if DEBUG_STT:
+            print(
+                f"[STT][DEBUG] segment KEPT    [{seg_start}-{seg_end}] text={seg_text!r} "
+                f"no_speech_prob={nsp:.3f} avg_logprob={alp:.3f}",
+                flush=True,
+            )
+        kept_parts.append(seg_text)
 
     text = "".join(kept_parts).strip()
+
+    if not text and raw_parts:
+        fallback_text = "".join(raw_parts).strip()
+        if fallback_text:
+            if DEBUG_STT:
+                print(
+                    "[STT][DEBUG] fallback used: all segments filtered, using raw transcript",
+                    flush=True,
+                )
+            text = fallback_text
 
     msg = f"[STT] {len(text)} chars in {elapsed:.2f}s"
     if dropped:

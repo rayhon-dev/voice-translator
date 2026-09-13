@@ -2,7 +2,7 @@ import time
 
 from resemblyzer import VoiceEncoder, preprocess_wav
 import numpy as np
-from app.config import SPEAKER_SIMILARITY_THRESHOLD
+from app.config import UNKNOWN_SPEAKER_THRESHOLD
 
 # Resemblyzer works internally at 16 kHz. Import the real value if we can so the
 # duration maths stays correct if the library ever changes it.
@@ -66,34 +66,59 @@ def _load_waveform(audio_path: str) -> np.ndarray:
     return wav.astype(np.float32)
 
 
-def identify_speaker(audio_path: str) -> str:
-    encoder = _load_encoder()
-    t0 = time.perf_counter()
-
-    # Decode ourselves (librosa handles webm), then normalise + trim silence.
+def _prepare_wav(audio_path: str) -> np.ndarray:
     try:
-        wav = preprocess_wav(_load_waveform(audio_path), source_sr=RESEMBLYZER_SR)
+        return preprocess_wav(_load_waveform(audio_path), source_sr=RESEMBLYZER_SR)
     except Exception as e:
         print(f"[SPK] waveform decode failed ({e!r}); using path decode", flush=True)
-        wav = preprocess_wav(audio_path)
+        return preprocess_wav(audio_path)
+
+
+def enroll_speaker(audio_path: str, label: str) -> bool:
+    encoder = _load_encoder()
+
+    wav = _prepare_wav(audio_path)
     voiced_s = len(wav) / RESEMBLYZER_SR
 
     if voiced_s < MIN_VOICED_SECONDS:
         print(
-            f"[SPK] only {voiced_s:.1f}s of voiced audio "
+            f"[SPK] enroll {label!r} failed: only {voiced_s:.1f}s voiced audio "
+            f"(< {MIN_VOICED_SECONDS}s)",
+            flush=True,
+        )
+        return False
+
+    window_samples = int(IDENTIFY_WINDOW_SECONDS * RESEMBLYZER_SR)
+    embedding = encoder.embed_utterance(wav[-window_samples:])
+
+    _speakers[label] = embedding
+    print(f"[SPK] enrolled speaker {label!r} ({voiced_s:.1f}s voiced audio)", flush=True)
+    return True
+
+
+def identify_from_enrolled(audio_path: str) -> str:
+    if len(_speakers) < 2:
+        print(
+            "[SPK] identify_from_enrolled called before both speakers enrolled",
+            flush=True,
+        )
+        return "unknown"
+
+    encoder = _load_encoder()
+
+    wav = _prepare_wav(audio_path)
+    voiced_s = len(wav) / RESEMBLYZER_SR
+
+    if voiced_s < MIN_VOICED_SECONDS:
+        print(
+            f"[SPK] turn only {voiced_s:.1f}s of voiced audio "
             f"(< {MIN_VOICED_SECONDS}s); returning 'unknown'",
             flush=True,
         )
         return "unknown"
 
-    
     window_samples = int(IDENTIFY_WINDOW_SECONDS * RESEMBLYZER_SR)
     embedding = encoder.embed_utterance(wav[-window_samples:])
-
-    if not _speakers:
-        _speakers["A"] = embedding
-        print(f"[SPK] registered first speaker 'A' ({time.perf_counter() - t0:.2f}s)", flush=True)
-        return "A"
 
     best_label = None
     best_score = -1.0
@@ -103,26 +128,13 @@ def identify_speaker(audio_path: str) -> str:
             best_score = score
             best_label = label
 
-    if best_score > SPEAKER_SIMILARITY_THRESHOLD:
+    if best_score < UNKNOWN_SPEAKER_THRESHOLD:
         print(
-            f"[SPK] speaker={best_label!r} score={best_score:.3f} "
-            f"(> {SPEAKER_SIMILARITY_THRESHOLD}, {time.perf_counter() - t0:.2f}s)",
+            f"[SPK] turn does not match A or B (best={best_score:.3f} "
+            f"< {UNKNOWN_SPEAKER_THRESHOLD}) -> unknown",
             flush=True,
         )
-        return best_label
+        return "unknown"
 
-    if "B" not in _speakers:
-        _speakers["B"] = embedding
-        print(
-            f"[SPK] registered new speaker 'B' "
-            f"(best score {best_score:.3f} <= {SPEAKER_SIMILARITY_THRESHOLD})",
-            flush=True,
-        )
-        return "B"
-
-    print(
-        f"[SPK] speaker={best_label!r} score={best_score:.3f} "
-        f"(below threshold, A and B already registered)",
-        flush=True,
-    )
+    print(f"[SPK] turn matched to {best_label!r} (score={best_score:.3f})", flush=True)
     return best_label

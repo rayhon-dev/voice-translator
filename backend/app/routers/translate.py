@@ -9,14 +9,15 @@ router = APIRouter()
 class TranslateRequest(BaseModel):
     text: str
     target_lang: str
+    source_lang: str = "en"
 
 
 @router.post("/translate")
 async def translate(request: TranslateRequest):
     t0 = time.perf_counter()
-    translation = translate_text(request.text, request.target_lang)
+    translation = translate_text(request.text, request.target_lang, request.source_lang)
     print(
-        f"[/translate] target={request.target_lang!r} "
+        f"[/translate] {request.source_lang!r} -> {request.target_lang!r} "
         f"{len(request.text)} chars in {time.perf_counter() - t0:.2f}s",
         flush=True,
     )

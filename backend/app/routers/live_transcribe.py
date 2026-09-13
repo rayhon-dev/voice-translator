@@ -5,20 +5,19 @@ import uuid
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.models.stt import transcribe_audio
+from app.config import DIALOG_PROCESS_INTERVAL
 
 router = APIRouter()
-
-# How often the processor loop wakes up to look for new audio to transcribe.
-PROCESS_INTERVAL = 0.3
 
 
 @router.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket):
     await websocket.accept()
     loop = asyncio.get_running_loop()
+    language = websocket.query_params.get("language", "en")
     temp_filename = f"/tmp/{uuid.uuid4()}_live.webm"
 
-    # Shared state between the receiver and processor loops.
+    # Shared state between the receiver and processor loops
     #   latest: the most recent audio chunk received, or None
     #   dirty:  True when `latest` has not been transcribed yet
     state = {"latest": None, "dirty": False}
@@ -44,7 +43,7 @@ async def websocket_transcribe(websocket: WebSocket):
 
         tag = "final" if final else "live"
         try:
-            text = await loop.run_in_executor(None, transcribe_audio, temp_filename)
+            text = await loop.run_in_executor(None, transcribe_audio, temp_filename, language)
         except Exception as e:
             print(f"[/ws/transcribe] {tag} pass failed: {e!r}", flush=True)
             return
@@ -59,7 +58,7 @@ async def websocket_transcribe(websocket: WebSocket):
 
     async def processor():
         while not disconnected.is_set():
-            await asyncio.sleep(PROCESS_INTERVAL)
+            await asyncio.sleep(DIALOG_PROCESS_INTERVAL)
             if state["dirty"] and state["latest"] is not None:
                 await transcribe_latest()
 

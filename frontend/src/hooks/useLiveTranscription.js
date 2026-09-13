@@ -1,7 +1,5 @@
 import { useRef, useState, useCallback } from "react";
 
-const WS_URL = "ws://localhost:8000/ws/transcribe";
-
 // How long to wait after sending the final blob for the backend to deliver
 // its last (most accurate) transcription before we close the socket.
 const FINAL_RESULT_GRACE_MS = 1200;
@@ -22,7 +20,7 @@ export function useLiveTranscription() {
   // Diagnostics: when the most recent WS transcription message arrived.
   const lastMessageAtRef = useRef(0);
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (language = "en") => {
     setLiveText("");
     liveTextRef.current = "";
     chunksRef.current = [];
@@ -30,7 +28,7 @@ export function useLiveTranscription() {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     streamRef.current = stream;
 
-    const ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(`ws://localhost:8000/ws/transcribe?language=${language}`);
     wsRef.current = ws;
 
     ws.onmessage = (event) => {

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import speak, identify_speaker, transcribe, translate, live_transcribe
+from app.routers import speak, translate, live_transcribe, dialog
 from app.models import stt, translator, speaker_id, tts
 
 
@@ -55,11 +55,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(transcribe.router)
 app.include_router(translate.router)
 app.include_router(speak.router)
-app.include_router(identify_speaker.router)
 app.include_router(live_transcribe.router)
+app.include_router(dialog.router)
 
 @app.get("/")
 async def root():

@@ -1,295 +1,131 @@
 # Voice Translator
 
-A real-time, fully self-hosted speech translation web app. Speak English into
-your microphone and get it back as **text and synthesized speech** in **Uzbek,
-Korean, or Russian** — with live captions appearing while you talk. It has two
-modes: **Solo** for a single speaker, and **Dialog** for a two-person
-conversation, where the backend automatically works out which speaker is talking
-on each turn.
+A real-time speech translation app with two modes:
 
-Every AI model runs locally — [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-for speech-to-text, [NLLB-200](https://huggingface.co/facebook/nllb-200-distilled-600M)
-for translation, [MMS-TTS](https://huggingface.co/facebook/mms-tts) for
-text-to-speech, and [Resemblyzer](https://github.com/resemble-ai/Resemblyzer)
-for speaker identification. **No paid APIs, and no audio ever leaves the
-machine.** It was built as a learning / portfolio project, with most of the
-effort going into the harder problems: a streaming transcription architecture
-that doesn't fall behind, filtering Whisper's hallucinations on silence, and
-fitting six models into 6 GB of GPU memory.
-
-
-
-## Features
-
-- **Streaming transcription over WebSocket.** Audio is sent to the backend
-  while you speak. The server always transcribes the *most recent* buffer and
-  drops any older unprocessed audio, so a slow pass can never cause a backlog —
-  then it runs one clean final pass over the whole recording after you stop.
-- **English → Uzbek / Korean / Russian**, delivered as both text and speech.
-- **Solo and Dialog modes.** In Dialog mode, each turn's audio is embedded with
-  Resemblyzer and compared (cosine similarity) against the speakers seen so far,
-  labelling turns as speaker **A** or **B**.
-- **Script-aware TTS preprocessing.** The MMS-TTS checkpoints expect specific
-  scripts, so translated text is preprocessed before synthesis: Uzbek is
-  transliterated from Latin to Cyrillic, and Korean is romanized with
-  [uroman](https://github.com/isi-nlp/uroman). Russian is passed through
-  directly.
-- **Three-layer Whisper hallucination filtering.** Whisper will invent
-  plausible sentences out of room tone. Before any text is trusted: an RMS
-  energy pre-check skips near-silent buffers entirely, faster-whisper's built-in
-  Silero VAD removes non-speech regions, and a per-segment check on
-  `no_speech_prob` / `avg_logprob` drops low-confidence output. The streaming
-  loop also disables `condition_on_previous_text` so a hallucination can't
-  snowball across passes.
-- **Startup model warm-up.** A FastAPI `lifespan` handler loads every model and
-  runs one dummy inference through each *before* Uvicorn starts accepting
-  connections, so the first real request is already warm.
-- **Fully Dockerized with NVIDIA GPU passthrough**, plus a multi-stage
-  Node-build → nginx image for the frontend.
-- **100% local / self-hosted.** No external services, no telemetry, no API keys.
-
----
-
-## Architecture
-
-The flow for one spoken turn:
-
-1. The browser captures the microphone with `MediaRecorder` in ~1-second
-   chunks.
-2. **While speaking**, chunks stream over the `/ws/transcribe` WebSocket. The
-   backend keeps only the latest accumulated buffer, transcribes it in a thread
-   pool (so the event loop stays responsive), and sends partial text back for
-   the live captions.
-3. **On stop**, the backend runs a single final Whisper pass over the complete
-   recording to produce the clean transcript.
-4. The transcript goes to `/translate` (NLLB-200) and comes back as
-   target-language text.
-5. **Dialog mode only:** the turn's audio is sent to `/identify-speaker`
-   (Resemblyzer), which returns an `A` / `B` label.
-6. When the user hits play, the translated text is sent to `/speak` (MMS-TTS),
-   which streams back a WAV that the browser plays.
-
-The backend is a FastAPI app; each capability lives in its own router
-(`routers/`) backed by a thin model wrapper (`models/`) that owns loading and
-inference. Models are module-level singletons so they load once per process.
-
----
+- **Solo mode** — one person speaks, their speech is transcribed live and translated into a target language.
+- **Dialog mode** — two people have a conversation; the app automatically detects who is speaking, transcribes their turn, and translates it into the other person's language.
 
 ## Tech stack
 
-| Category | Technology |
-| --- | --- |
-| Backend framework | FastAPI, Uvicorn, WebSockets |
-| Speech-to-text | faster-whisper 1.0.3 (Whisper `small`), running on CTranslate2 |
-| Translation | NLLB-200 distilled 600M, via Hugging Face Transformers |
-| Text-to-speech | MMS-TTS (VITS) via Transformers; uroman for Korean romanization |
-| Speaker identification | Resemblyzer (`VoiceEncoder` embeddings) |
-| Anti-hallucination | Silero VAD (through faster-whisper) + custom RMS & confidence filters |
-| ML runtime | PyTorch 2.4 + CUDA 12.1, CTranslate2 |
-| Frontend | React 19, Vite 8, Tailwind CSS 4, Axios |
-| Audio capture | `MediaRecorder` / Web Audio APIs |
-| Packaging | Docker, Docker Compose, NVIDIA Container Toolkit, nginx |
+- **Backend:** FastAPI (Python), served over both REST and WebSocket endpoints.
+- **Frontend:** React + Vite, using the browser's `MediaRecorder` and Web Audio API (`AnalyserNode`) for microphone capture and voice-activity detection.
+- **Containerization:** Docker + Docker Compose, with NVIDIA GPU passthrough (tested under WSL2).
+- **Models:**
+  - **Speech-to-text:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (`medium` size, float16, CUDA).
+  - **Translation:** [`facebook/nllb-200-distilled-600M`](https://huggingface.co/facebook/nllb-200-distilled-600M) (NLLB-200).
+  - **Text-to-speech:** [`facebook/mms-tts-*`](https://huggingface.co/facebook/mms-tts) (one model per target language).
+  - **Speaker identification:** [Resemblyzer](https://github.com/resemble-ai/Resemblyzer) (used only in Dialog mode, to tell the two speakers apart).
+- **Supported languages:** English (`en`), Uzbek (`uz`), Korean (`ko`), Russian (`ru`) — for both speech recognition and translation/text-to-speech. Whisper (`faster-whisper`, `medium`) is multilingual and transcribes in whichever of these four languages the speaker selects (it is not English-only); that selected language is then translated into whichever of the four the listener/other speaker uses.
 
----
+## Requirements
 
-## Performance
+- Docker and Docker Compose (Compose v2 syntax — no `version:` key needed).
+- An NVIDIA GPU with `nvidia-container-toolkit` installed (or GPU passthrough enabled under WSL2 on Windows).
+- **VRAM:** the app has been developed and tested on an **RTX 4050 with 6GB VRAM**, running Whisper (medium), NLLB-200-distilled-600M, four MMS-TTS models, and Resemblyzer concurrently. Treat ~6GB as the practical minimum; more headroom is safer if you plan to run other GPU workloads at the same time.
+- A working microphone in the browser you use to open the app.
 
-Measured on an **NVIDIA RTX 4050 Laptop GPU (6 GB VRAM)**, CUDA 12.1, Whisper
-`small` at `float16`.
-
-### Startup warm-up — ~50 s, once, before the server accepts traffic
-
-| Model | Warm-up time |
-| --- | --- |
-| Whisper (STT) | ~5 s |
-| NLLB-200 (translation) | ~10–27 s (varies by run / disk cache state) |
-| Resemblyzer (speaker ID) | ~3 s |
-| MMS-TTS (all three languages) | ~10.6 s combined |
-
-### Per-request latency, after warm-up
-
-| Operation | Latency |
-| --- | --- |
-| Translation | ~0.5–3 s (scales with text length) |
-| Speaker identification | ~0.3–0.8 s |
-| Text-to-speech (several-second clip) | ~0.4 s (model already resident) |
-| Live transcription pass (during speech) | ~0.3–1.2 s per WebSocket update, grows with accumulated audio |
-
-### Why this matters
-
-- **The warm-up pattern.** A cold FastAPI process would make the *first* user
-  wait tens of seconds while NLLB alone loads. Paying that cost deliberately at
-  boot — load **and** one dummy inference per model, before the port opens —
-  means no user ever hits a cold model.
-- **Hallucination filtering.** Left alone, Whisper turns background noise into
-  confident-looking text. The RMS gate is essentially free and stops most of it;
-  VAD and the `no_speech_prob` / `avg_logprob` checks catch the rest. Silence in
-  produces an empty string out, not phantom words.
-- **GPU memory budgeting.** Whisper, NLLB, Resemblyzer and three MMS-TTS models
-  share 6 GB. That drove the choices: `float16` Whisper `small`, the distilled
-  600M NLLB, and accepting that TTS models load once and stay resident rather
-  than being swapped per request.
-
----
-
-## Getting started
-
-### Prerequisites
-
-- An **NVIDIA GPU** with a driver new enough for CUDA 12.1, and enough free
-  VRAM (~5 GB with everything loaded).
-- For Docker: **Docker Desktop** (WSL 2 backend on Windows) or Docker Engine +
-  **NVIDIA Container Toolkit**.
-- For manual setup: **Python 3.10**, **Node.js 20.19+ / 22.12+**, and system
-  packages `ffmpeg`, `libsndfile1`, plus a C toolchain (`build-essential`,
-  `python3-dev`) for building `webrtcvad`.
-- ~10 GB disk for images, plus ~3 GB for the downloaded model cache.
-
-### Option A — Docker (recommended)
-
-Verify GPU passthrough works first:
+## Installation and running
 
 ```bash
-docker run --rm --gpus all nvidia/cuda:12.1.1-base-ubuntu22.04 nvidia-smi
-```
-
-You should see your GPU listed. Then, from the repo root:
-
-```bash
+git clone <this-repo-url>
+cd voice-translator
 docker compose up --build
 ```
 
-- **Frontend:** http://localhost:5173
-- **Backend API:** http://localhost:8000  (interactive docs at `/docs`)
+- Backend: `http://localhost:8000`
+- Frontend: `http://localhost:5173`
 
-Stop with `Ctrl+C`. `docker compose down` removes the containers; the model
-cache lives in a named volume and survives. `docker compose down -v` wipes that
-too.
+**First run note:** the backend downloads and caches all models (Whisper, NLLB, MMS-TTS, Resemblyzer) from Hugging Face on first startup — this can take several minutes and roughly 2.5GB of disk space. Downloaded weights are cached in the `hf-cache` Docker volume, so subsequent restarts only need to *load* the models (not re-download), which still takes on the order of a minute while the GPU warms up. The backend's `/` health check has a 600-second start period specifically to tolerate this on first boot.
 
-**The first start is slow.** The backend downloads ~2.5 GB of weights from
-Hugging Face and then warms every model up — expect a few minutes before
-`[warmup] All models ready ...` appears and the API responds. Downloads are
-written to the `hf-cache` volume, so every later `docker compose up` (even with
-`--build`) is ready in seconds.
+## Solo mode
 
-### Option B — Manual local development
+Solo mode is for one person translating their own speech.
 
-Developed on WSL 2 (Ubuntu 22.04); the same steps work on native Linux.
+1. The frontend opens a WebSocket to **`/ws/transcribe`** (`backend/app/routers/live_transcribe.py`), passing the spoken language as a query parameter.
+2. The browser (`frontend/src/hooks/useLiveTranscription.js`) records continuously with a single `MediaRecorder`, and every second sends the backend the full audio recorded so far. The backend re-transcribes that growing clip on each poll (`DIALOG_PROCESS_INTERVAL`, see below) and streams the text back, so a live (partial) transcription is shown while you're still talking.
+3. When you stop recording, the complete clip is sent one final time, the backend transcribes it in full, and that result is used as the final transcription before the socket closes.
+4. The resulting text is sent to `POST /translate` (`backend/app/routers/translate.py`) to get the translation, and optionally to `POST /speak` (`backend/app/routers/speak.py`) to synthesize and play back spoken audio in the target language.
 
-**System packages** (Debian/Ubuntu):
+## Dialog mode
 
-```bash
-sudo apt install -y ffmpeg libsndfile1 build-essential python3-dev
-```
+Dialog mode is for a two-person conversation, connecting to **`/ws/dialog`** (`backend/app/routers/dialog.py`).
 
-**Backend:**
+1. **Enrollment:** each of the two speakers, in turn, picks their spoken language and records a short (~4 second) voice sample. The backend (`backend/app/models/speaker_id.py`) builds a voice embedding (via Resemblyzer) for each speaker from that sample.
+2. **Listening:** once both speakers are enrolled, the app moves into continuous listening. The frontend uses the Web Audio API (`AudioContext` + `AnalyserNode`) to measure microphone volume (RMS) roughly 10 times a second — this is a **client-side voice-activity detector (VAD)**. It requires no server round-trip to know whether someone is currently speaking.
+3. **Turn detection:** when volume crosses the speech threshold, the frontend starts a single continuous `MediaRecorder` recording for that turn. When volume stays below the threshold for long enough (silence), the recorder is stopped and the complete audio blob for that turn is sent to the backend in one piece — this avoids the audio-quality problems that come from stitching together many small, independently-encoded recordings.
+4. **Per-turn processing (backend):** the backend decodes the full turn, checks it isn't too short (likely noise), identifies which of the two enrolled speakers it best matches (Resemblyzer), transcribes it (faster-whisper) in that speaker's language, and translates it (NLLB) into the other speaker's language. The result is pushed back over the WebSocket and rendered as a chat bubble; either side's translated text can also be played back as speech via `POST /speak`.
 
-```bash
-cd backend
-python3.10 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
+## Configuration constants
 
-# PyTorch built for CUDA 12.1 — must match your driver/toolkit
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-pip install -r requirements.txt
-
-# Run from backend/ so `app.main:app` resolves
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-On first run, model weights download to `~/.cache/huggingface` and the warm-up
-runs (~50 s). Subsequent starts only pay the warm-up.
-
-**Frontend** (in a second terminal):
-
-```bash
-cd frontend
-npm install
-npm run dev        # http://localhost:5173
-```
-
-The backend's CORS config already allows `http://localhost:5173`, and the
-frontend already points at `http://localhost:8000`, so no further configuration
-is needed for local development.
-
-### Notes & limitations (Docker)
-
-- **The frontend calls `http://localhost:8000` from the browser.** That works
-  when the browser and the backend are on the same machine (the normal dev
-  setup). To serve it elsewhere, change the API base URL in
-  `frontend/src/services/api.js` and the WebSocket URL in
-  `frontend/src/hooks/useLiveTranscription.js`, or put a reverse proxy in front
-  of both, then rebuild the frontend image.
-- **CORS:** the backend allows the origin `http://localhost:5173`
-  (`backend/app/main.py`). If you change the frontend's published port, update
-  that list and rebuild.
-- Runs a **single Uvicorn worker** on purpose — one GPU, models loaded once at
-  startup.
-
----
+| Constant | File | What it controls |
+|---|---|---|
+| `SPEECH_RMS_THRESHOLD` | `frontend/src/hooks/useDialogSession.js` | RMS volume level above which the mic is considered "speaking" (client-side VAD, Dialog mode). |
+| `SILENCE_DURATION_MS` | `frontend/src/hooks/useDialogSession.js` | How many milliseconds of continuous silence end the current turn and trigger sending it to the backend. |
+| `VAD_CHECK_INTERVAL_MS` | `frontend/src/hooks/useDialogSession.js` | How often (ms) the mic's volume is sampled while listening. |
+| `DEBUG_VAD` | `frontend/src/hooks/useDialogSession.js` | Set to `true` to log detailed VAD tick/recording events to the browser console (see Debug mode below). |
+| `ENROLL_RECORD_MS` | `frontend/src/hooks/useDialogSession.js` | Length (ms) of each speaker's enrollment recording. |
+| `NO_SPEECH_PROB_THRESHOLD` | `backend/app/models/stt.py` | Whisper segments with a "no speech" probability above this are treated as noise/silence and dropped. |
+| `AVG_LOGPROB_THRESHOLD` | `backend/app/models/stt.py` | Whisper segments with an average log-probability (confidence) below this are dropped. |
+| `RMS_SILENCE_THRESHOLD` | `backend/app/models/stt.py` | Below this RMS, an audio clip is treated as silent and transcription is skipped outright. |
+| `DEBUG_STT` | `backend/app/models/stt.py` | Set to `True` to print per-segment KEPT/DROPPED confidence details and fallback-transcript usage to the backend logs (see Debug mode below). |
+| `MIN_TURN_SECONDS` | `backend/app/config.py` | A recorded Dialog-mode turn shorter than this (seconds) is discarded as noise before transcription is even attempted. |
+| `MIN_VOICED_SECONDS` | `backend/app/models/speaker_id.py` | Minimum voiced audio (seconds) required to enroll a speaker or identify one from a turn; shorter clips are treated as unreliable. |
+| `UNKNOWN_SPEAKER_THRESHOLD` | `backend/app/config.py` | Minimum Resemblyzer similarity score to attribute a turn to an enrolled speaker; below this, the turn matches neither A nor B and is skipped. |
+| `DIALOG_PROCESS_INTERVAL` | `backend/app/config.py` | Poll interval (seconds) used by Solo mode's live-transcription loop (`/ws/transcribe`). |
+| `WHISPER_MODEL_SIZE` / `WHISPER_DEVICE` / `WHISPER_COMPUTE_TYPE` | `backend/app/config.py` | Which faster-whisper model size, device, and precision to load. |
+| `TRANSLATION_MODEL_NAME` | `backend/app/config.py` | Hugging Face model id used for translation (NLLB-200). |
+| `TTS_MODEL_NAMES` | `backend/app/config.py` | Hugging Face model id per language used for text-to-speech. |
 
 ## Project structure
 
 ```
-voice-translator/
-├── backend/
-│   ├── app/
-│   │   ├── main.py            # FastAPI app + startup warm-up (lifespan handler)
-│   │   ├── config.py          # model names, device, language codes, thresholds
-│   │   ├── routers/           # HTTP + WebSocket endpoints
-│   │   │   ├── live_transcribe.py   # WS  /ws/transcribe   — streaming STT
-│   │   │   ├── transcribe.py        # POST /transcribe       — one-shot STT
-│   │   │   ├── translate.py         # POST /translate        — NLLB-200
-│   │   │   ├── speak.py             # POST /speak            — MMS-TTS → WAV
-│   │   │   └── identify_speaker.py  # POST /identify-speaker, POST /reset-dialog
-│   │   └── models/            # model loading + inference wrappers (singletons)
-│   │       ├── stt.py               # faster-whisper + hallucination filtering
-│   │       ├── translator.py        # NLLB-200 translation
-│   │       ├── tts.py               # MMS-TTS + Uzbek/Korean script preprocessing
-│   │       └── speaker_id.py        # Resemblyzer embeddings + A/B matching
-│   ├── requirements.txt
-│   └── Dockerfile             # nvidia/cuda 12.1 base image
-├── frontend/
-│   ├── src/
-│   │   ├── App.jsx            # top-level mode switch (Solo / Dialog)
-│   │   ├── components/        # ConversationView, MicButton, DialogBubble,
-│   │   │                      #   TranscriptLine, LanguageSelector, ModeSelector…
-│   │   ├── hooks/             # useLiveTranscription (WebSocket streaming STT),
-│   │   │                      #   usePlayAudio, useAudioRecorder…
-│   │   └── services/api.js    # Axios calls to the backend
-│   ├── package.json
-│   ├── Dockerfile             # Node build stage → nginx static-serve stage
-│   └── nginx.conf
-├── docker-compose.yml         # backend (GPU) + frontend, hf-cache named volume
-└── README.md
+backend/
+  app/
+    main.py                 # FastAPI app, router registration, model warmup on startup
+    config.py                # Shared configuration constants
+    models/
+      stt.py                 # faster-whisper wrapper (transcription, segment filtering)
+      translator.py          # NLLB-200 wrapper (translation)
+      tts.py                  # MMS-TTS wrapper (speech synthesis, uz/ko/ru transliteration helpers)
+      speaker_id.py           # Resemblyzer wrapper (enrollment + speaker identification)
+    routers/
+      dialog.py               # WebSocket /ws/dialog — Dialog mode (enrollment + turn-based conversation)
+      live_transcribe.py       # WebSocket /ws/transcribe — Solo mode (live transcription)
+      translate.py             # POST /translate
+      speak.py                  # POST /speak (text-to-speech)
+  Dockerfile
+  requirements.txt
+
+frontend/
+  src/
+    App.jsx                    # Mode selection (Solo vs Dialog)
+    main.jsx
+    components/
+      ModeSelector.jsx          # Solo / Dialog picker
+      ConversationView.jsx       # Solo mode UI
+      DialogSessionView.jsx       # Dialog mode UI
+      LanguageSelector.jsx
+      MicButton.jsx
+      TranscriptLine.jsx           # Solo mode transcript row
+      DialogBubble.jsx              # Dialog mode chat bubble
+      AnimatedBackground.jsx
+    hooks/
+      useLiveTranscription.js       # Solo mode: mic capture + /ws/transcribe client
+      useDialogSession.js            # Dialog mode: mic capture, client-side VAD, /ws/dialog client
+      usePlayAudio.js                  # Play/pause toggling for a synthesized-speech audio blob
+    services/
+      api.js                          # REST calls: /translate, /speak
+  Dockerfile
+  package.json
+
+docker-compose.yml
 ```
 
----
+## Debug mode
 
-## Known limitations & honest caveats
+Both the frontend VAD logic and the backend transcription filter support optional, verbose debug logging that is off by default.
 
-- **Speaker identification is heuristic.** The cosine-similarity threshold
-  (`SPEAKER_SIMILARITY_THRESHOLD` in `config.py`, currently `0.70`) is sensitive
-  to microphone, room acoustics, and how distinct the two voices are. Dialog
-  mode only tracks two speakers (A / B), and very short or quiet turns return
-  `unknown` instead of a guess. Expect to tune the threshold for your setup.
-- **6 GB VRAM is tight.** Whisper `small` (fp16), NLLB-200-600M, Resemblyzer and
-  all three MMS-TTS models are resident at once. If you hit CUDA OOM, drop
-  `WHISPER_COMPUTE_TYPE` to `int8_float16` in `config.py`.
-- **Whisper model size is `small`** — a deliberate speed/memory tradeoff for a
-  laptop GPU. `medium` / `large-v3` are more accurate but slower, and won't
-  co-exist with the other models in 6 GB.
-- **Frontend hardcodes `localhost` URLs** for the API and WebSocket. This is
-  fine for local use; see [Notes & limitations](#notes--limitations-docker) for
-  serving it elsewhere.
-- **English source only** (`SOURCE_LANGUAGE = "en"`). Translation targets are
-  Uzbek, Korean, and Russian.
-- **Single worker, single concurrent user.** This is a local/self-hosted tool,
-  not a multi-tenant service.
-- **Model licenses.** The weights this project downloads — **NLLB-200** and
-  **MMS-TTS** — are released under **CC-BY-NC 4.0 (non-commercial use only)**.
-  faster-whisper / Whisper is MIT. Your use of this project must comply with the
-  individual model licenses regardless of how the code in this repo is licensed.
+- **Frontend (Dialog mode VAD):** in `frontend/src/hooks/useDialogSession.js`, set `DEBUG_VAD = true`. This logs every VAD sampling tick (RMS value, speaking/silent state, whether a turn recording is active) and every turn start/stop event to the browser's developer console, prefixed with `[VAD-DEBUG]`. Rebuild the frontend (`docker compose build frontend && docker compose up -d frontend`) for the change to take effect.
+- **Backend (transcription filtering):** in `backend/app/models/stt.py`, set `DEBUG_STT = True`. This prints, for every Whisper segment, whether it was kept or dropped and why (`no_speech_prob` / `avg_logprob` values), plus a note whenever the raw-transcript fallback is used because all segments were filtered out. Logs are prefixed with `[STT][DEBUG]` and visible via `docker logs voice-translator-backend-1`. Rebuild the backend for the change to take effect.
 
+Remember to set both flags back to `false` / `False` before shipping, since they add non-trivial log volume.

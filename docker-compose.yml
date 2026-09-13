@@ -13,7 +13,6 @@ services:
     volumes:
       # Persist HuggingFace downloads (Whisper + NLLB) across rebuilds.
       - hf-cache:/root/.cache/huggingface
-      # Optional: expose the /identify-speaker debug clips on the host.
       # - ./backend/debug_audio:/app/debug_audio
     # Modern Compose GPU passthrough (needs nvidia-container-toolkit on the host).
     deploy:

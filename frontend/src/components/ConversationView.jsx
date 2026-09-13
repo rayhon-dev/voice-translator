@@ -2,12 +2,23 @@ import { useState } from "react";
 import MicButton from "./MicButton";
 import LanguageSelector from "./LanguageSelector";
 import TranscriptLine from "./TranscriptLine";
-import DialogBubble from "./DialogBubble";
+import DialogSessionView from "./DialogSessionView";
 import { usePlayAudio } from "../hooks/usePlayAudio";
 import { useLiveTranscription } from "../hooks/useLiveTranscription";
-import { translateText, speakText, identifySpeaker, resetDialog } from "../services/api";
+import { translateText, speakText } from "../services/api";
 
 export default function ConversationView({ mode, onBack }) {
+  // `mode` is fixed for the lifetime of a mounted instance — App.jsx only
+  // renders ConversationView after a mode is picked and unmounts it on
+  // "back", so it never changes across re-renders of the same instance.
+  // This early return (before any hooks below) is therefore safe, even
+  // though the lint rule can't verify that invariant statically.
+  /* eslint-disable react-hooks/rules-of-hooks */
+  if (mode === "dialog") {
+    return <DialogSessionView onBack={onBack} />;
+  }
+
+  const [sourceLang, setSourceLang] = useState("en");
   const [targetLang, setTargetLang] = useState("uz");
   const [messages, setMessages] = useState([]);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -16,14 +27,12 @@ export default function ConversationView({ mode, onBack }) {
 
   const { liveText, start, stop } = useLiveTranscription();
   const { playingId, togglePlay } = usePlayAudio();
+  /* eslint-enable react-hooks/rules-of-hooks */
 
   const handleMicClick = async () => {
     if (!isRecording) {
       try {
-        if (mode === "dialog" && messages.length === 0) {
-          await resetDialog();
-        }
-        await start();
+        await start(sourceLang);
         setIsRecording(true);
       } catch (err) {
         console.error("[ConversationView] failed to start recording", err);
@@ -35,22 +44,15 @@ export default function ConversationView({ mode, onBack }) {
     setIsRecording(false);
     setIsProcessing(true);
 
-    // End-to-end latency measurement for the whole "stop -> result on screen"
-    // path. Read these together with the backend [/ws/transcribe], [MT] and
-    // [SPK] log lines to locate the bottleneck.
     const flowStart = performance.now();
     const ms = (from) => `${(performance.now() - from).toFixed(0)}ms`;
 
     try {
-      // stop() always resolves; `text` comes from a ref that is in sync with
-      // the latest WebSocket message, so it is never stale.
       const stopStart = performance.now();
-      const { blob: audioBlob, text } = await stop();
+      const { text } = await stop();
       console.log(`[latency] stop() round trip: ${ms(stopStart)}`);
       const originalText = (text || "").trim();
 
-      // Nothing was transcribed (e.g. WS never connected, or silence) — don't
-      // call the translation endpoint with an empty string.
       if (!originalText) {
         console.warn(
           "[ConversationView] transcription was empty — skipping translation"
@@ -58,29 +60,17 @@ export default function ConversationView({ mode, onBack }) {
         return;
       }
 
-      let speaker = null;
-      if (mode === "dialog") {
-        try {
-          const spkStart = performance.now();
-          speaker = await identifySpeaker(audioBlob);
-          console.log(`[latency] identifySpeaker(): ${ms(spkStart)}`);
-        } catch (err) {
-          console.error("[ConversationView] identifySpeaker failed", err);
-          // Non-fatal: keep going with speaker = null.
-        }
-      }
-
       let translation;
       try {
         const trStart = performance.now();
-        translation = await translateText(originalText, targetLang);
+        translation = await translateText(originalText, targetLang, sourceLang);
         console.log(`[latency] translateText(): ${ms(trStart)}`);
       } catch (err) {
         console.error("[ConversationView] translateText failed", err);
-        return; // finally still clears the processing state
+        return;
       }
 
-      setMessages((prev) => [...prev, { originalText, translation, speaker }]);
+      setMessages((prev) => [...prev, { originalText, translation, speaker: null }]);
       console.log(
         `[latency] TOTAL stop -> message on screen: ${ms(flowStart)}`
       );
@@ -109,31 +99,38 @@ export default function ConversationView({ mode, onBack }) {
         <button onClick={onBack} className="text-gray-500 text-sm">
           ← Orqaga
         </button>
-        <LanguageSelector selectedLang={targetLang} onSelect={setTargetLang} />
+
+        <div className="flex items-center gap-3">
+          <LanguageSelector selectedLang={sourceLang} onSelect={setSourceLang} />
+
+          <button
+            onClick={() => {
+              setSourceLang(targetLang);
+              setTargetLang(sourceLang);
+            }}
+            className="w-8 h-8 rounded-full bg-white/60 backdrop-blur flex items-center justify-center hover:bg-white/80 transition-colors"
+            aria-label="Tillarni almashtirish"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-4 h-4 text-gray-600">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M7 16V4m0 0L3 8m4-4l4 4m6 4v12m0 0l4-4m-4 4l-4-4" />
+            </svg>
+          </button>
+
+          <LanguageSelector selectedLang={targetLang} onSelect={setTargetLang} />
+        </div>
       </div>
 
       <div className="w-full max-w-6xl flex flex-col gap-6 flex-1">
-        {messages.map((msg, index) =>
-          mode === "dialog" ? (
-            <DialogBubble
-              key={index}
-              originalText={msg.originalText}
-              translatedText={msg.translation}
-              speaker={msg.speaker}
-              isPlaying={playingId === index}
-              onPlayAudio={() => handlePlayAudio(index, msg.translation)}
-            />
-          ) : (
-            <TranscriptLine
-              key={index}
-              originalText={msg.originalText}
-              translatedText={msg.translation}
-              speaker={msg.speaker}
-              isPlaying={playingId === index}
-              onPlayAudio={() => handlePlayAudio(index, msg.translation)}
-            />
-          )
-        )}
+        {messages.map((msg, index) => (
+          <TranscriptLine
+            key={index}
+            originalText={msg.originalText}
+            translatedText={msg.translation}
+            speaker={msg.speaker}
+            isPlaying={playingId === index}
+            onPlayAudio={() => handlePlayAudio(index, msg.translation)}
+          />
+        ))}
 
         {isRecording && (
           <div className="grid grid-cols-2 gap-6 w-full">

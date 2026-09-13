@@ -33,12 +33,12 @@ def warmup(run_inference: bool = True) -> None:
         print(f"[MT] warm-up inference skipped: {e!r}", flush=True)
 
 
-def translate_text(text: str, target_lang: str) -> str:
+def translate_text(text: str, target_lang: str, source_lang: str = "en") -> str:
     model, tokenizer = _load_model()
 
     t0 = time.perf_counter()
 
-    src_lang = NLLB_LANG_CODES["en"]
+    src_lang = NLLB_LANG_CODES[source_lang]
     tgt_lang = NLLB_LANG_CODES[target_lang]
 
     tokenizer.src_lang = src_lang
@@ -54,7 +54,7 @@ def translate_text(text: str, target_lang: str) -> str:
 
     print(
         f"[MT] translated {len(text)} -> {len(translation)} chars "
-        f"in {time.perf_counter() - t0:.2f}s",
+        f"({source_lang} -> {target_lang}) in {time.perf_counter() - t0:.2f}s",
         flush=True,
     )
     return translation
