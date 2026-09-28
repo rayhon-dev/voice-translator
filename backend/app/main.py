@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers import speak, translate, live_transcribe, dialog
-from app.models import stt, translator, speaker_id, tts
+from app.models import stt, translator, speaker_diart, tts
 
 
 @asynccontextmanager
@@ -17,7 +17,7 @@ async def lifespan(app: FastAPI):
     warmups = (
         ("Whisper (STT)", stt.warmup),
         ("NLLB (translation)", translator.warmup),
-        ("Resemblyzer (speaker ID)", speaker_id.warmup),
+        ("diart (speaker ID)", speaker_diart.warmup),
         ("MMS-TTS (uz/ko/ru)", tts.warmup),
     )
     for name, fn in warmups:

@@ -1,5 +1,6 @@
 import time
 
+import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from app.config import TRANSLATION_MODEL_NAME, NLLB_LANG_CODES
 
@@ -13,7 +14,9 @@ def _load_model():
         # Loaded once per process 
         t0 = time.perf_counter()
         _tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_MODEL_NAME)
-        _model = AutoModelForSeq2SeqLM.from_pretrained(TRANSLATION_MODEL_NAME)
+        _model = AutoModelForSeq2SeqLM.from_pretrained(
+            TRANSLATION_MODEL_NAME, torch_dtype=torch.float16
+        )
         _model.to("cuda")
         print(
             f"[MT] translation model loaded in {time.perf_counter() - t0:.2f}s",

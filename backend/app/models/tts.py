@@ -66,7 +66,9 @@ def _load_model(lang: str):
     if lang not in _models:
         model_name = TTS_MODEL_NAMES[lang]
         _tokenizers[lang] = AutoTokenizer.from_pretrained(model_name)
-        _models[lang] = VitsModel.from_pretrained(model_name).to("cuda")
+        _models[lang] = VitsModel.from_pretrained(
+            model_name, torch_dtype=torch.float16
+        ).to("cuda")
     return _models[lang], _tokenizers[lang]
 
 
@@ -88,10 +90,10 @@ def text_to_speech(text: str, lang: str) -> tuple[np.ndarray, int]:
     model, tokenizer = _load_model(lang)
 
     inputs = tokenizer(text, return_tensors="pt").to("cuda")
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         output = model(**inputs).waveform
 
-    audio_array = output.squeeze().cpu().numpy()
+    audio_array = output.squeeze().cpu().numpy().astype(np.float32)
     sample_rate = model.config.sampling_rate
 
     print(

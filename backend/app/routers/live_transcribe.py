@@ -43,7 +43,9 @@ async def websocket_transcribe(websocket: WebSocket):
 
         tag = "final" if final else "live"
         try:
-            text = await loop.run_in_executor(None, transcribe_audio, temp_filename, language)
+            text, _detected_lang, _lang_prob = await loop.run_in_executor(
+                None, transcribe_audio, temp_filename, language
+            )
         except Exception as e:
             print(f"[/ws/transcribe] {tag} pass failed: {e!r}", flush=True)
             return

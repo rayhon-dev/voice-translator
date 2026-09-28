@@ -3,22 +3,30 @@ import { useCallback, useEffect, useRef, useState } from "react";
 const WS_URL = "ws://localhost:8000/ws/dialog";
 
 const SPEECH_RMS_THRESHOLD = 0.02;
-const SILENCE_DURATION_MS = 2000;
+// Tabiiy suhbatda gaplar orasidagi pauza ko'pincha 2 soniyadan qisqaroq
+// bo'ladi — shuning uchun bu qiymat ilgari juda katta edi (2000ms) va
+// navbatlar bir necha o'nlab soniyaga cho'zilib ketardi (real testda 80+
+// soniyagacha kuzatildi), bu esa STT'ning til-aniqlashini butunlay
+// chalg'itib yuborardi (u qisqa, alohida gaplar uchun mo'ljallangan).
+const SILENCE_DURATION_MS = 800;
+// Agar odam 2 soniyalik pauza qilmasdan uzoq gapiraversa ham, navbat
+// cheksiz cho'zilib ketmasligi (va STT/til-aniqlash sifati yomonlashmasligi,
+// tarjima esa real vaqtga yaqin chiqishi) uchun qattiq yuqori chegara.
+const MAX_TURN_DURATION_MS = 12000;
 const VAD_CHECK_INTERVAL_MS = 100;
+const AUDIO_LEVEL_RMS_MAX = 0.15; // shu RMS qiymatida audioLevel = 1 ga yetadi
+const AUDIO_LEVEL_SMOOTHING = 0.4; // 0..1, kattaroq = tezroq (kamroq silliqlash)
 
 const DEBUG_VAD = false;
 
-// Backend'dagi speaker_id.py MIN_VOICED_SECONDS=1.5dan xavfsiz farqda
-// bo'lishi uchun ~4s enrollment yozuvi.
-const ENROLL_RECORD_MS = 4000;
-
 export function useDialogSession() {
-  const [phase, setPhase] = useState("idle"); // idle | await_language | recording_enroll | enroll_wait | listening | ended | error
+  const [phase, setPhase] = useState("idle"); // idle | await_language | listening | ended | error
   const [currentSpeaker, setCurrentSpeaker] = useState(null); // "A" | "B" | null
   const [messages, setMessages] = useState([]);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null); // vaqtinchalik "eshitilmadi" kabi xabarlar uchun, error state'dan alohida
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
 
   const wsRef = useRef(null);
   const streamRef = useRef(null);
@@ -82,6 +90,7 @@ export function useDialogSession() {
     }
 
     analyserRef.current = null;
+    setAudioLevel(0);
   }, []);
 
   const startListenLoop = useCallback(() => {
@@ -101,6 +110,7 @@ export function useDialogSession() {
 
     const dataArray = new Float32Array(analyser.fftSize);
     let silenceStartedAt = null;
+    let smoothedLevel = 0;
 
     const startTurnRecording = () => {
       if (!streamRef.current || stoppedRef.current) return;
@@ -190,6 +200,10 @@ export function useDialogSession() {
       const speaking = rms >= SPEECH_RMS_THRESHOLD;
       const silenceElapsedMs = silenceStartedAt === null ? 0 : Date.now() - silenceStartedAt;
 
+      const normalizedLevel = Math.min(1, rms / AUDIO_LEVEL_RMS_MAX);
+      smoothedLevel += (normalizedLevel - smoothedLevel) * AUDIO_LEVEL_SMOOTHING;
+      setAudioLevel(smoothedLevel);
+
       if (DEBUG_VAD) {
         console.log(
           `[VAD-DEBUG] tick rms=${rms.toFixed(5)} threshold=${SPEECH_RMS_THRESHOLD} speaking=${speaking} recording=${!!turnRecorderRef.current} silenceElapsedMs=${silenceElapsedMs}`
@@ -219,89 +233,22 @@ export function useDialogSession() {
           silenceStartedAt = null;
         }
       }
+
+      if (
+        turnRecorderRef.current &&
+        turnRecorderRef.current._vadStartedAt &&
+        Date.now() - turnRecorderRef.current._vadStartedAt >= MAX_TURN_DURATION_MS
+      ) {
+        if (DEBUG_VAD) {
+          console.log(`[VAD-DEBUG] max turn duration reached (${MAX_TURN_DURATION_MS}ms) — forcing stop`);
+        }
+        stopTurnRecording("max_duration");
+        silenceStartedAt = null;
+      }
     };
 
     vadIntervalRef.current = setInterval(tick, VAD_CHECK_INTERVAL_MS);
   }, [stopListenLoop]);
-
-  // Enrollment uchun bitta uzluksiz yozuv (~4s), keyin to'xtatib, TO'LIQ
-  // blobni bir martada yuboramiz. Bu yerda fragmentatsiya muammosi yo'q,
-  // chunki backend butun buferni bir martada (finish_enrollment orqali)
-  // dekodlaydi, alohida chunk emas.
-  const recordEnrollment = useCallback((speakerLabel) => {
-    if (!streamRef.current) {
-      setError("Mikrofon oqimi topilmadi.");
-      setPhase("error");
-      return;
-    }
-
-    let recorder;
-    try {
-      recorder = new MediaRecorder(streamRef.current);
-    } catch (err) {
-      console.error("[useDialogSession] failed to create enroll recorder", err);
-      setError(err?.message || String(err));
-      setPhase("error");
-      return;
-    }
-
-    const localChunks = [];
-
-    recorder.ondataavailable = (event) => {
-      if (event.data && event.data.size > 0) {
-        localChunks.push(event.data);
-      }
-    };
-
-    recorder.onerror = (event) => {
-      console.error("[useDialogSession] enroll recorder error", event);
-      setError("Ovoz yozishda xatolik yuz berdi.");
-      setPhase("error");
-    };
-
-    recorder.onstop = () => {
-      try {
-        const blob = new Blob(localChunks, { type: "audio/webm" });
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(blob);
-          wsRef.current.send(JSON.stringify({ action: "finish_enroll" }));
-          setPhase("enroll_wait");
-        } else {
-          setError("Ulanish yopiq — enrollment yuborilmadi.");
-          setPhase("error");
-        }
-      } catch (err) {
-        console.error("[useDialogSession] error finishing enrollment", err);
-        setError(err?.message || String(err));
-        setPhase("error");
-      }
-    };
-
-    try {
-      recorder.start();
-      setPhase("recording_enroll");
-      setCurrentSpeaker(speakerLabel);
-    } catch (err) {
-      console.error("[useDialogSession] failed to start enroll recorder", err);
-      setError(err?.message || String(err));
-      setPhase("error");
-      return;
-    }
-
-    setTimeout(() => {
-      try {
-        if (recorder.state !== "inactive") recorder.stop();
-      } catch (err) {
-        console.error("[useDialogSession] error stopping enroll recorder", err);
-      }
-    }, ENROLL_RECORD_MS);
-  }, []);
-
-  const retryEnrollment = useCallback(() => {
-    if (currentSpeaker) {
-      recordEnrollment(currentSpeaker);
-    }
-  }, [currentSpeaker, recordEnrollment]);
 
   const handleServerMessage = useCallback(
     (raw) => {
@@ -314,24 +261,9 @@ export function useDialogSession() {
       }
 
       switch (msg.status) {
-        case "enroll_prompt":
+        case "awaiting_language":
           setCurrentSpeaker(msg.speaker || null);
           setPhase("await_language");
-          break;
-
-        case "awaiting_enroll_audio":
-          recordEnrollment(msg.speaker);
-          break;
-
-        case "enroll_failed":
-          setError(`${msg.speaker || "Foydalanuvchi"} ovozini ro'yxatga olish muvaffaqiyatsiz tugadi. Qaytadan urinib ko'ring.`);
-          setCurrentSpeaker(msg.speaker || null);
-          setPhase("enroll_failed");
-          break;
-
-        case "enrolled":
-          // enroll_wait holatida qolamiz — keyingi "enroll_prompt" (B uchun)
-          // yoki "listening_started" xabarini kutamiz.
           break;
 
         case "listening_started":
@@ -375,10 +307,14 @@ export function useDialogSession() {
           console.warn("[useDialogSession] unknown status", msg);
       }
     },
-    [recordEnrollment, startListenLoop]
+    [startListenLoop]
   );
 
   const startDialog = useCallback(async () => {
+    if (wsRef.current) {
+      return;
+    }
+
     setError(null);
     setMessages([]);
     setCurrentSpeaker(null);
@@ -386,7 +322,11 @@ export function useDialogSession() {
 
     try {
       streamRef.current = await navigator.mediaDevices.getUserMedia({
-        audio: true,
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
       });
     } catch (err) {
       console.error("[useDialogSession] mic access denied", err);
@@ -398,14 +338,6 @@ export function useDialogSession() {
     try {
       const ws = new WebSocket(WS_URL);
       wsRef.current = ws;
-
-      // Backend enroll_a fazasida ulanganda hech qanday boshlang'ich xabar
-      // yubormaydi, shuning uchun birinchi so'zlovchi (A) uchun til so'rash
-      // ekranini frontend o'zi ochadi.
-      ws.onopen = () => {
-        setCurrentSpeaker("A");
-        setPhase("await_language");
-      };
 
       ws.onmessage = (event) => handleServerMessage(event.data);
 
@@ -472,6 +404,7 @@ export function useDialogSession() {
     setPhase("ended");
     setCurrentSpeaker(null);
     setIsSpeaking(false);
+    setAudioLevel(0);
   }, [closeSocket, cleanupMedia, stopListenLoop]);
 
   // Xavfsizlik to'ri: komponent kutilmaganda unmount bo'lsa ham (masalan
@@ -497,9 +430,9 @@ export function useDialogSession() {
     error,
     notice,
     isSpeaking,
+    audioLevel,
     startDialog,
     selectLanguage,
     stopDialog,
-    retryEnrollment,
   };
 }

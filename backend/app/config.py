@@ -25,14 +25,9 @@ TTS_MODEL_NAMES = {
 
 }
 
-# Speaker identification (Resemblyzer) sozlamalari
-# 1.0 = bir xil ovoz, 0.0 = butunlay farqli
 
-# Dialog rejimida: agar eng yaqin topilgan speaker balli shundan past bo'lsa,
-# bu — A yoki B emas, notanish (uchinchi) odam deb hisoblanadi.
 UNKNOWN_SPEAKER_THRESHOLD = 0.65
 
 DIALOG_PROCESS_INTERVAL = 0.3
 
-# Juda qisqa "gap"larni (masalan tasodifiy shovqin) to'liq navbat deb hisoblamaslik uchun.
 MIN_TURN_SECONDS = 1.0

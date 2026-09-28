@@ -1,7 +1,9 @@
 import time
+import traceback
 
 import numpy as np
 import soundfile as sf
+import torch  # noqa: F401 — ctranslate2 uchun libcublas.so.12'ni oldindan yuklaydi
 from faster_whisper import WhisperModel
 from app.config import WHISPER_MODEL_SIZE, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
 
@@ -10,6 +12,12 @@ NO_SPEECH_PROB_THRESHOLD = 0.6
 AVG_LOGPROB_THRESHOLD = -1.0
 RMS_SILENCE_THRESHOLD = 0.003
 USE_VAD_FILTER = True
+
+# Muvozanatli fallback: temp=0.0 muvaffaqiyatsiz bo'lsa (compression_ratio/logprob
+# mezonlaridan o'tmasa), faster-whisper faqat BITTA marta temp=0.4 bilan qayta urinadi
+# (default 6-qiymatli (0.0..1.0) fallback ro'yxati o'rniga) — bu eng katta kechikish
+# manbai edi (har bir qo'shimcha temperature — butun segmentni qayta decode qilish).
+TRANSCRIBE_TEMPERATURE = (0.0, 0.4)
 
 DEBUG_STT = False
 
@@ -102,7 +110,113 @@ def _write_wav(path: str, wav: np.ndarray) -> None:
     sf.write(path, wav, SAMPLE_RATE)
 
 
-def transcribe_audio(audio_path: str, language: str = "en") -> str:
+def _run_transcribe(model, source, language: str | None, use_vad: bool):
+    """model.transcribe() ni chaqiradi; vad_filter xato bersa (masalan qisqa
+    audio'da faster-whisper'ning ichki til aniqlash kodi bo'sh to'plamda max()
+    chaqirishi mumkin) — VAD'siz BITTA marta qayta uriniladi."""
+    t0 = time.perf_counter()
+    try:
+        segments, info = model.transcribe(
+            source,
+            language=language,
+            vad_filter=use_vad,
+            condition_on_previous_text=False,
+            temperature=TRANSCRIBE_TEMPERATURE,
+        )
+        return list(segments), info
+    except Exception as e:
+        first_attempt_elapsed = time.perf_counter() - t0
+        if not use_vad:
+            raise
+        print(
+            f"[STT][VAD_RETRY] vad_filter failed after {first_attempt_elapsed:.2f}s "
+            f"(language={language!r}, exception={e!r}); retrying without VAD\n"
+            f"{traceback.format_exc()}",
+            flush=True,
+        )
+        t_retry0 = time.perf_counter()
+        segments, info = model.transcribe(
+            source,
+            language=language,
+            condition_on_previous_text=False,
+            temperature=TRANSCRIBE_TEMPERATURE,
+        )
+        seg_list = list(segments)
+        print(
+            f"[STT][VAD_RETRY] retry (no VAD) took {time.perf_counter() - t_retry0:.2f}s "
+            f"(first attempt had already spent {first_attempt_elapsed:.2f}s)",
+            flush=True,
+        )
+        return seg_list, info
+
+
+def _detect_language_restricted(model, audio: np.ndarray, candidates: list[str]) -> tuple[str, float]:
+    """Whisper'ning o'zining til-aniqlash (language-ID) boshini ishlatadi va
+    faqat berilgan nomzod tillar orasidan eng ehtimolini tanlaydi.
+
+    Ilgari sinovdan o'tgan yondashuv — ikkala tilni ham majburan to'liq decode
+    qilib, avg_logprob'larini solishtirish — juda shovqinli chiqdi (masalan
+    real testda en=-0.685 va ru=-0.682 kabi, deyarli tasodifiy natija berardi),
+    chunki forced-decode noto'g'ri tilda ham "ishonchli ko'ringan" matn
+    generatsiya qilishi mumkin. Bu funksiya esa shu vazifa uchun maxsus
+    o'qitilgan klassifikator boshidan (`model.detect_language`) foydalanadi —
+    faqat BITTA yengil forward pass (to'liq decode emas) talab qiladi.
+
+    E'TIBOR: qaytarilgan ehtimollik (xom, ~99 tilli taqsimotdan) real
+    mikrofon audiosida past bo'lishi mumkin (masalan haqiqiy aniq inglizcha
+    gap uchun ham 0.2-0.5 atrofida chiqishi kuzatilgan) — shuning uchun bu
+    qiymatni mutlaq chegara sifatida emas, faqat ma'lumot/pending-streak
+    uchun ishlating. Asosiy qabul/rad qarori shu funksiya ICHIDA, global
+    argmax tekshiruvi orqali qabul qilinadi (pastga qarang)."""
+    features = model.feature_extractor(audio)
+    segment = features[:, : model.feature_extractor.nb_max_frames]
+    encoder_output = model.encode(segment)
+    results = model.model.detect_language(encoder_output)[0]
+    all_probs = {token[2:-2]: prob for token, prob in results}
+    cand_probs = {lang: all_probs.get(lang, 0.0) for lang in candidates}
+
+    print(f"[STT][LANGID] candidates={cand_probs}", flush=True)
+
+    if not all_probs:
+        return candidates[0], 0.0
+
+    best_lang = max(cand_probs, key=cand_probs.get)
+    global_best_lang = max(all_probs, key=all_probs.get)
+    print(
+        f"[STT][LANGID] global_top={global_best_lang!r} "
+        f"({all_probs.get(global_best_lang, 0.0):.3f})",
+        flush=True,
+    )
+
+    # E'TIBOR: mutlaq foiz chegarasi ISHLATILMAYDI (masalan "0.75 dan yuqori
+    # bo'lsin"). Real (studiya emas, mikrofon orqali, aksentli, fon shovqini
+    # bilan) nutqda XOM ehtimollik to'g'ri til uchun ham past chiqishi mumkin
+    # (real testda aniq inglizcha gap uchun en=0.26, aniq ruscha gap uchun
+    # ru=0.24 kabi chiqdi — 0.75'dan ancha past). Shuning uchun buning o'rniga
+    # "shu nomzod til to'liq ~99 tilli taqsimotda ENG YUQORI ehtimolli
+    # tanlovmi" tekshiriladi — bu mutlaq qiymatga emas, NISBIY tartibga
+    # asoslangani uchun yozib olish sharoitidan (past ovoz, shovqin) deyarli
+    # ta'sirlanmaydi, lekin haqiqatan ham boshqa (uchinchi) tilni ishonchli
+    # ajratib beradi.
+    if global_best_lang not in candidates:
+        return None, cand_probs[best_lang]
+
+    return best_lang, cand_probs[best_lang]
+
+
+def transcribe_audio(
+    audio_path: str,
+    language: str | None = None,
+    candidate_languages: list[str] | None = None,
+) -> tuple[str, str | None, float]:
+    """`candidate_languages` berilsa (va `language` berilmagan bo'lsa), Whisper'ning
+    ~99 tilli avtomatik aniqlashi o'rniga faqat shu ro'yxatdagi tillar orasida
+    (Whisper'ning language-ID boshi orqali) tanlanadi, so'ng transkripsiya shu
+    bitta tanlangan til bilan majburlanadi. Dialog rejimida so'zlovchilar tilini
+    oldindan tanlagani uchun bu — qisqa/shovqinli navbatlarda avtomatik aniqlash
+    tasodifiy boshqa tilni (masalan gruzincha yoki bengalcha) tanlab qo'yishining
+    oldini oladi."""
+
     model = get_model()
 
     audio = _decode_waveform(audio_path)
@@ -111,31 +225,24 @@ def transcribe_audio(audio_path: str, language: str = "en") -> str:
         rms = float(np.sqrt(np.mean(np.square(audio.astype(np.float64)))))
         if rms < RMS_SILENCE_THRESHOLD:
             print(f"[STT] audio below RMS threshold (rms={rms:.5f} < {RMS_SILENCE_THRESHOLD}) — skipping transcription", flush=True)
-            return ""
+            return "", None, 0.0
 
-   
+
     source = audio if (audio is not None and audio.size) else audio_path
 
     use_vad = USE_VAD_FILTER and _ONNX_AVAILABLE
     t0 = time.perf_counter()
-    try:
-        segments, _ = model.transcribe(
-            source,
-            language=language,
-            vad_filter=use_vad,
-            condition_on_previous_text=False,
-        )
-        seg_list = list(segments)
-    except Exception as e:
-        if use_vad:
-            print(f"[STT] vad_filter failed ({e!r}); retrying without VAD", flush=True)
-            use_vad = False
-            segments, _ = model.transcribe(
-                source, language=language, condition_on_previous_text=False
-            )
-            seg_list = list(segments)
-        else:
-            raise
+
+    candidates = [c for c in dict.fromkeys(candidate_languages or []) if c]
+
+    if language is None and len(candidates) >= 2 and audio is not None and audio.size:
+        detected_lang, lang_prob = _detect_language_restricted(model, audio, candidates)
+        seg_list, info = _run_transcribe(model, source, detected_lang, use_vad)
+    else:
+        seg_list, info = _run_transcribe(model, source, language, use_vad)
+        detected_lang = getattr(info, "language", None)
+        lang_prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+
     elapsed = time.perf_counter() - t0
 
     kept_parts = []
@@ -184,9 +291,9 @@ def transcribe_audio(audio_path: str, language: str = "en") -> str:
                 )
             text = fallback_text
 
-    msg = f"[STT] {len(text)} chars in {elapsed:.2f}s"
+    msg = f"[STT] {len(text)} chars in {elapsed:.2f}s detected_lang={detected_lang} ({lang_prob:.2f})"
     if dropped:
         msg += f" ({dropped} low-confidence segment(s) filtered)"
     print(msg, flush=True)
 
-    return text
+    return text, detected_lang, lang_prob
