@@ -154,6 +154,23 @@ def _detect_language_restricted(model, audio: np.ndarray, candidates: list[str])
     """Whisper'ning o'zining til-aniqlash (language-ID) boshini ishlatadi va
     faqat berilgan nomzod tillar orasidan eng ehtimolini tanlaydi.
 
+    MUHIM: bu funksiya HECH QACHON None qaytarmaydi — doim `candidates`dan
+    BITTASINI tanlab qaytaradi. Sabab: qaytarilgan til chaqiruvchida
+    (`transcribe_audio`) HAQIQIY decode bosqichiga `language=` sifatida
+    to'g'ridan-to'g'ri uzatiladi (`_run_transcribe(..., detected_lang, ...)`).
+    Ilgari bu yerda `None` qaytarilganda (global ~99 tilli taqsimotning
+    yetakchisi candidates'da bo'lmasa) HAQIQIY decode `language=None` bilan
+    chaqirilib, Whisper'ning TO'LIQ cheklanmagan avtomatik aniqlashiga
+    qaytib ketar edi — natijada chiqqan MATN candidates'dan butunlay
+    tashqari tilda (masalan bengal yoki ukraincha) bo'lib chiqishi mumkin
+    edi, garchi shu funksiyaning o'zi `detected_lang=None` qaytargani uchun
+    bu tashqariga "ko'rinmas" edi (real testda aynan shu tarzda kuzatildi).
+    Endi bunday holatda ham `best_lang` (candidates ichidagi eng yaqini)
+    MAJBURIY qaytariladi — shunda haqiqiy decode ham doim candidates bilan
+    CHEKLANGAN bo'lib qoladi — faqat ishonch darajasi 0.0 qilib qaytariladi,
+    shunda chaqiruvchi tomondagi past-ishonch filtrlari (dialog.py'dagi
+    VERY_LOW_CONFIDENCE_LANG_PROB va h.k.) buni baribir to'g'ri rad etadi.
+
     Ilgari sinovdan o'tgan yondashuv — ikkala tilni ham majburan to'liq decode
     qilib, avg_logprob'larini solishtirish — juda shovqinli chiqdi (masalan
     real testda en=-0.685 va ru=-0.682 kabi, deyarli tasodifiy natija berardi),
@@ -197,9 +214,19 @@ def _detect_language_restricted(model, audio: np.ndarray, candidates: list[str])
     # tanlovmi" tekshiriladi — bu mutlaq qiymatga emas, NISBIY tartibga
     # asoslangani uchun yozib olish sharoitidan (past ovoz, shovqin) deyarli
     # ta'sirlanmaydi, lekin haqiqatan ham boshqa (uchinchi) tilni ishonchli
-    # ajratib beradi.
+    # ajratib beradi. Qabul/rad QARORINING o'zi ENDI bu yerda emas — faqat
+    # ISHONCH darajasi (0.0 yoki haqiqiy ehtimollik) hisoblanadi; haqiqiy
+    # rad etish chaqiruvchi tomonda (dialog.py'dagi lang_prob chegaralari)
+    # sodir bo'ladi, chunki decode HAR DOIM candidates bilan cheklangan
+    # bo'lib qolishi kerak (yuqoridagi MUHIM izohga qarang).
     if global_best_lang not in candidates:
-        return None, cand_probs[best_lang]
+        print(
+            f"[STT][LANGID] global top {global_best_lang!r} not in candidates "
+            f"{candidates} — forcing decode with best candidate {best_lang!r} "
+            f"anyway (confidence forced to 0.0, NOT falling back to unrestricted detection)",
+            flush=True,
+        )
+        return best_lang, 0.0
 
     return best_lang, cand_probs[best_lang]
 
