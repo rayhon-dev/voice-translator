@@ -19,7 +19,7 @@ export default function ConversationView({ mode, onBack }) {
   }
 
   const [sourceLang, setSourceLang] = useState("en");
-  const [targetLang, setTargetLang] = useState("uz");
+  const [targetLang, setTargetLang] = useState("ru");
   const [messages, setMessages] = useState([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isRecording, setIsRecording] = useState(false);

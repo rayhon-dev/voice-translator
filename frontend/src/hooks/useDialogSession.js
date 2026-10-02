@@ -22,6 +22,10 @@ const DEBUG_VAD = false;
 export function useDialogSession() {
   const [phase, setPhase] = useState("idle"); // idle | await_language | listening | ended | error
   const [currentSpeaker, setCurrentSpeaker] = useState(null); // "A" | "B" | null
+  // A va B tanlagan tillar, masalan {A: "en"} — B hali tanlamagan bo'lsa
+  // kalit yo'q. LanguageSelector'ga B uchun A ning tilini "band" deb
+  // ko'rsatish (bir xil tilni ikkalasi ham tanlay olmasligi) uchun kerak.
+  const [speakerLangs, setSpeakerLangs] = useState({});
   const [messages, setMessages] = useState([]);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null); // vaqtinchalik "eshitilmadi" kabi xabarlar uchun, error state'dan alohida
@@ -101,9 +105,32 @@ export function useDialogSession() {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     const audioContext = new AudioContextClass();
     const source = audioContext.createMediaStreamSource(streamRef.current);
+
+    // Mikrofon kirish signali haddan tashqari baland bo'lganda clipping
+    // (buzilish) yuzaga kelib, diarizatsiya/til aniqlashni chalg'itishi
+    // mumkin edi (DIAG_CLIP_PEAK_THRESHOLD logida tasdiqlangan). Shu
+    // sababli signal tahlil qilinishi (analyser) VA yozib olinishi
+    // (MediaRecorder, destination orqali) dan oldin limiter sifatida
+    // DynamicsCompressorNode qo'yiladi — nutq uchun odatiy sozlamalar.
+    const compressor = audioContext.createDynamicsCompressor();
+    compressor.threshold.value = -24;
+    compressor.knee.value = 30;
+    compressor.ratio.value = 12;
+    compressor.attack.value = 0.003;
+    compressor.release.value = 0.25;
+    source.connect(compressor);
+
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 2048;
-    source.connect(analyser);
+    compressor.connect(analyser);
+
+    // MediaRecorder avval xom mikrofon oqimidan (streamRef.current) to'g'ridan
+    // to'g'ri yozib olardi — bu compressor grafigini butunlay chetlab
+    // o'tardi. Backend'ga (va diarizatsiyaga) haqiqatan ham kompressiyalangan
+    // signal borishi uchun, yozib olish shu destination'dan amalga oshiriladi.
+    const compressedDestination = audioContext.createMediaStreamDestination();
+    compressor.connect(compressedDestination);
+    const recordingStream = compressedDestination.stream;
 
     audioContextRef.current = audioContext;
     analyserRef.current = analyser;
@@ -117,7 +144,7 @@ export function useDialogSession() {
 
       let recorder;
       try {
-        recorder = new MediaRecorder(streamRef.current);
+        recorder = new MediaRecorder(recordingStream);
       } catch (err) {
         console.error("[useDialogSession] failed to create turn recorder", err);
         setError(err?.message || String(err));
@@ -279,16 +306,39 @@ export function useDialogSession() {
             clearTimeout(noticeTimeoutRef.current);
             noticeTimeoutRef.current = null;
           }
-          setMessages((prev) => [
-            ...prev,
-            {
-              speaker: msg.speaker,
-              originalText: msg.original,
-              translation: msg.translation,
-              sourceLang: msg.source_lang,
-              targetLang: msg.target_lang,
-            },
-          ]);
+          // Backend turnlarni PARALLEL qayta ishlaydi (STT/tarjima vaqti
+          // turn uzunligiga qarab farq qiladi) — shuning uchun natijalar
+          // aytilish emas, TUGASH tartibida kelishi mumkin (masalan qisqa
+          // ikkinchi gap uzun birinchi gapdan oldin tugashi mumkin). `seq`
+          // audio backend'ga KELGAN tartibni bildiradi (dialog.py'da
+          // receiver()da beriladi) — shunga qarab to'g'ri joyga
+          // sortirovka qilamiz.
+          //
+          // Qabul qilingan yondashuv: DARHOL ko'rsatish + sort, navbatga
+          // qo'yib KUTDIRISH emas. Sabab: bu jonli suhbat tarjimoni —
+          // asosiy qiymati tezlik (deyarli real vaqtda tarjima). Ikki turn
+          // deyarli bir vaqtda tugab, biri boshqasidan oldinroq kelib
+          // qolishi juda kam uchraydigan holat; shunday bo'lganda ro'yxat
+          // bir lahzalik "o'z-o'zini to'g'irlashi" (yangi xabar yuqoriroqqa
+          // joylashishi) ko'rinishida chiqadi — bu barcha xabarlarni eng
+          // sekin tugagan turn tugaguncha umuman ko'rsatmay turishdan
+          // ANCHA yaxshiroq (navbatga qo'yish real vaqt tuyg'usini
+          // buzadi).
+          setMessages((prev) => {
+            const next = [
+              ...prev,
+              {
+                seq: msg.seq,
+                speaker: msg.speaker,
+                originalText: msg.original,
+                translation: msg.translation,
+                sourceLang: msg.source_lang,
+                targetLang: msg.target_lang,
+              },
+            ];
+            next.sort((a, b) => a.seq - b.seq);
+            return next;
+          });
           break;
 
         case "turn_skipped":
@@ -318,6 +368,7 @@ export function useDialogSession() {
     setError(null);
     setMessages([]);
     setCurrentSpeaker(null);
+    setSpeakerLangs({});
     stoppedRef.current = false;
 
     try {
@@ -372,20 +423,26 @@ export function useDialogSession() {
     }
   }, [cleanupMedia, handleServerMessage, stopListenLoop]);
 
-  const selectLanguage = useCallback((lang) => {
-    try {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ action: "set_language", lang }));
-      } else {
-        setError("Ulanish ochiq emas — til yuborilmadi.");
+  const selectLanguage = useCallback(
+    (lang) => {
+      try {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ action: "set_language", lang }));
+          if (currentSpeaker) {
+            setSpeakerLangs((prev) => ({ ...prev, [currentSpeaker]: lang }));
+          }
+        } else {
+          setError("Ulanish ochiq emas — til yuborilmadi.");
+          setPhase("error");
+        }
+      } catch (err) {
+        console.error("[useDialogSession] error sending set_language", err);
+        setError(err?.message || String(err));
         setPhase("error");
       }
-    } catch (err) {
-      console.error("[useDialogSession] error sending set_language", err);
-      setError(err?.message || String(err));
-      setPhase("error");
-    }
-  }, []);
+    },
+    [currentSpeaker]
+  );
 
   const stopDialog = useCallback(() => {
     stoppedRef.current = true;
@@ -426,6 +483,7 @@ export function useDialogSession() {
   return {
     phase,
     currentSpeaker,
+    speakerLangs,
     messages,
     error,
     notice,

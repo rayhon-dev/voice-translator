@@ -2,12 +2,11 @@ import { useState, useRef, useEffect } from "react";
 
 const LANGUAGES = [
   { code: "en", label: "English" },
-  { code: "uz", label: "O'zbek" },
-  { code: "ko", label: "한국어" },
   { code: "ru", label: "Русский" },
+  { code: "ko", label: "한국어" },
 ];
 
-export default function LanguageSelector({ selectedLang, onSelect }) {
+export default function LanguageSelector({ selectedLang, onSelect, excludeLangs = [] }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
 
@@ -37,20 +36,36 @@ export default function LanguageSelector({ selectedLang, onSelect }) {
 
       {open && (
         <div className="absolute top-full mt-2 left-0 bg-white/90 backdrop-blur rounded-2xl shadow-lg overflow-hidden min-w-[140px] z-20">
-          {LANGUAGES.map((lang) => (
-            <button
-              key={lang.code}
-              onClick={() => {
-                onSelect(lang.code);
-                setOpen(false);
-              }}
-              className={`block w-full text-left px-4 py-2 text-sm hover:bg-purple-100 transition-colors ${
-                selectedLang === lang.code ? "bg-purple-100 text-purple-700" : "text-gray-700"
-              }`}
-            >
-              {lang.label}
-            </button>
-          ))}
+          {LANGUAGES.map((lang) => {
+            // Suhbatdosh (masalan A) allaqachon shu tilni tanlagan bo'lsa —
+            // Google Translate'ning "conversation mode"idagi kabi, ikkinchi
+            // spiker bir xil tilni tanlay olmasligi uchun band qilib
+            // (disabled) ko'rsatiladi, ro'yxatdan butunlay olib
+            // tashlanmaydi — shunda foydalanuvchi "nega faqat 2 ta variant
+            // bor" deb chalkashmaydi, balki NIMA UCHUN band ekanini ko'radi.
+            const isExcluded = excludeLangs.includes(lang.code);
+            return (
+              <button
+                key={lang.code}
+                disabled={isExcluded}
+                onClick={() => {
+                  if (isExcluded) return;
+                  onSelect(lang.code);
+                  setOpen(false);
+                }}
+                className={`flex items-center justify-between gap-2 w-full text-left px-4 py-2 text-sm transition-colors ${
+                  isExcluded
+                    ? "text-gray-300 cursor-not-allowed"
+                    : selectedLang === lang.code
+                    ? "bg-purple-100 text-purple-700 hover:bg-purple-100"
+                    : "text-gray-700 hover:bg-purple-100"
+                }`}
+              >
+                {lang.label}
+                {isExcluded && <span className="text-xs text-gray-300">band</span>}
+              </button>
+            );
+          })}
         </div>
       )}
     </div>

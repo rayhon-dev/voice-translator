@@ -12,6 +12,7 @@ export default function DialogSessionView({ onBack }) {
   const {
     phase,
     currentSpeaker,
+    speakerLangs,
     messages,
     error,
     notice,
@@ -24,14 +25,14 @@ export default function DialogSessionView({ onBack }) {
   const [audioCache, setAudioCache] = useState({});
   const { playingId, togglePlay } = usePlayAudio();
 
-  const handlePlayAudio = async (index, text, lang) => {
+  const handlePlayAudio = async (seq, text, lang) => {
     try {
-      let blob = audioCache[index];
+      let blob = audioCache[seq];
       if (!blob) {
         blob = await speakText(text, lang);
-        setAudioCache((prev) => ({ ...prev, [index]: blob }));
+        setAudioCache((prev) => ({ ...prev, [seq]: blob }));
       }
-      togglePlay(index, blob);
+      togglePlay(seq, blob);
     } catch (err) {
       console.error("[DialogSessionView] failed to play audio", err);
     }
@@ -60,10 +61,22 @@ export default function DialogSessionView({ onBack }) {
   }
 
   if (phase === "await_language") {
+    // B tanlayotganda A allaqachon tanlagan til band qilinadi (Google
+    // Translate'ning "conversation mode"idagi kabi) — ikkala spiker bir
+    // xil tilni tanlay olmasligi uchun, chunki bunday holatda tarjima
+    // qilinadigan narsa qolmas edi.
+    const otherSpeaker = currentSpeaker === "B" ? "A" : "B";
+    const otherLang = speakerLangs[otherSpeaker];
+    const excludeLangs = otherLang ? [otherLang] : [];
+    const defaultLang = otherLang === "en" ? "ru" : "en";
     return (
       <div className="min-h-screen flex flex-col items-center justify-center gap-6 px-6">
         <p className="text-gray-700 text-lg">{speakerLabel}, tilingizni tanlang</p>
-        <LanguageSelector selectedLang="en" onSelect={selectLanguage} />
+        <LanguageSelector
+          selectedLang={speakerLangs[currentSpeaker] || defaultLang}
+          onSelect={selectLanguage}
+          excludeLangs={excludeLangs}
+        />
       </div>
     );
   }
@@ -134,14 +147,14 @@ export default function DialogSessionView({ onBack }) {
       </div>
 
       <div className="w-full max-w-6xl flex flex-col gap-6 flex-1 px-10 py-8">
-        {messages.map((msg, index) => (
+        {messages.map((msg) => (
           <DialogBubble
-            key={index}
+            key={msg.seq}
             originalText={msg.originalText}
             translatedText={msg.translation}
             speaker={msg.speaker}
-            isPlaying={playingId === index}
-            onPlayAudio={() => handlePlayAudio(index, msg.translation, msg.targetLang)}
+            isPlaying={playingId === msg.seq}
+            onPlayAudio={() => handlePlayAudio(msg.seq, msg.translation, msg.targetLang)}
           />
         ))}
       </div>
