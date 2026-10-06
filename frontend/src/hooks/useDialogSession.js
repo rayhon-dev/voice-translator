@@ -29,7 +29,6 @@ export function useDialogSession() {
   const [messages, setMessages] = useState([]);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null); // vaqtinchalik "eshitilmadi" kabi xabarlar uchun, error state'dan alohida
-  const [isSpeaking, setIsSpeaking] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
 
   const wsRef = useRef(null);
@@ -236,8 +235,6 @@ export function useDialogSession() {
           `[VAD-DEBUG] tick rms=${rms.toFixed(5)} threshold=${SPEECH_RMS_THRESHOLD} speaking=${speaking} recording=${!!turnRecorderRef.current} silenceElapsedMs=${silenceElapsedMs}`
         );
       }
-
-      setIsSpeaking(speaking);
 
       if (speaking) {
         silenceStartedAt = null;
@@ -460,7 +457,6 @@ export function useDialogSession() {
     cleanupMedia();
     setPhase("ended");
     setCurrentSpeaker(null);
-    setIsSpeaking(false);
     setAudioLevel(0);
   }, [closeSocket, cleanupMedia, stopListenLoop]);
 
@@ -487,7 +483,6 @@ export function useDialogSession() {
     messages,
     error,
     notice,
-    isSpeaking,
     audioLevel,
     startDialog,
     selectLanguage,

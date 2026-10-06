@@ -192,18 +192,11 @@ def _detect_language_restricted(model, audio: np.ndarray, candidates: list[str])
     all_probs = {token[2:-2]: prob for token, prob in results}
     cand_probs = {lang: all_probs.get(lang, 0.0) for lang in candidates}
 
-    print(f"[STT][LANGID] candidates={cand_probs}", flush=True)
-
     if not all_probs:
         return candidates[0], 0.0
 
     best_lang = max(cand_probs, key=cand_probs.get)
     global_best_lang = max(all_probs, key=all_probs.get)
-    print(
-        f"[STT][LANGID] global_top={global_best_lang!r} "
-        f"({all_probs.get(global_best_lang, 0.0):.3f})",
-        flush=True,
-    )
 
     # E'TIBOR: mutlaq foiz chegarasi ISHLATILMAYDI (masalan "0.75 dan yuqori
     # bo'lsin"). Real (studiya emas, mikrofon orqali, aksentli, fon shovqini
@@ -220,12 +213,6 @@ def _detect_language_restricted(model, audio: np.ndarray, candidates: list[str])
     # sodir bo'ladi, chunki decode HAR DOIM candidates bilan cheklangan
     # bo'lib qolishi kerak (yuqoridagi MUHIM izohga qarang).
     if global_best_lang not in candidates:
-        print(
-            f"[STT][LANGID] global top {global_best_lang!r} not in candidates "
-            f"{candidates} — forcing decode with best candidate {best_lang!r} "
-            f"anyway (confidence forced to 0.0, NOT falling back to unrestricted detection)",
-            flush=True,
-        )
         return best_lang, 0.0
 
     return best_lang, cand_probs[best_lang]

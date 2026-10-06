@@ -3,7 +3,6 @@ import json
 import os
 import uuid
 
-import numpy as np
 from fastapi import APIRouter, WebSocket
 
 from app.models.stt import (
@@ -42,29 +41,6 @@ SHORT_TEXT_MIN_PROB = 0.5
 # UMUMAN ko'rsatilmaydi.
 VERY_LOW_CONFIDENCE_LANG_PROB = 0.3
 
-# --- VAQTINCHALIK DIAGNOSTIKA (baland ovozli spikerlarda tasodifiy past-ishonchli
-# noto'g'ri til aniqlanishi sababini — clipping/distorsiya ehtimolini — tekshirish
-# uchun). Sinov tugagach shu blok va uni ishlatuvchi kod olib tashlansin. ---
-DIAG_CLIP_PEAK_THRESHOLD = 0.98  # shundan yuqori peak amplituda — clipping belgisi
-DIAG_LOW_CONF_THRESHOLD = 0.5  # shundan past lang_prob — "diagnostika uchun saqlash" chegarasi
-DIAG_MAX_SAVED_TURNS = 20  # /tmp'ni cheksiz to'ldirib yubormaslik uchun
-DIAG_DIR = "/tmp/dialog_diagnostics"
-_diag_saved_count = 0
-
-
-def _save_diagnostic_turn(wav: np.ndarray, detected_lang, lang_prob: float, peak: float, clipped: bool) -> None:
-    global _diag_saved_count
-    if _diag_saved_count >= DIAG_MAX_SAVED_TURNS:
-        return
-    os.makedirs(DIAG_DIR, exist_ok=True)
-    _diag_saved_count += 1
-    filename = (
-        f"{DIAG_DIR}/{uuid.uuid4()}_lang={detected_lang}_prob={lang_prob:.2f}"
-        f"_peak={peak:.3f}_clipped={clipped}.wav"
-    )
-    _write_wav(filename, wav)
-    print(f"[/ws/dialog][DIAG] past-ishonchli turn saqlandi ({_diag_saved_count}/{DIAG_MAX_SAVED_TURNS}): {filename}", flush=True)
-
 
 @router.websocket("/ws/dialog")
 async def websocket_dialog(websocket: WebSocket):
@@ -98,16 +74,6 @@ async def websocket_dialog(websocket: WebSocket):
             print(f"[/ws/dialog] turn skipped (too short: {duration_s:.2f}s)", flush=True)
             await send_status("turn_skipped", reason="too_short")
             return
-
-        # --- VAQTINCHALIK DIAGNOSTIKA: clipping (audio buzilishi) belgisi ---
-        peak_amplitude = float(np.abs(wav).max())
-        is_clipped = peak_amplitude >= DIAG_CLIP_PEAK_THRESHOLD
-        if is_clipped:
-            print(
-                f"[/ws/dialog][DIAG] CLIPPING shubhasi: peak_amplitude={peak_amplitude:.4f} "
-                f"(chegara={DIAG_CLIP_PEAK_THRESHOLD})",
-                flush=True,
-            )
 
         temp_filename = f"/tmp/{uuid.uuid4()}_turn.wav"
         await loop.run_in_executor(None, _write_wav, temp_filename, wav)
@@ -157,26 +123,9 @@ async def websocket_dialog(websocket: WebSocket):
                 await send_status("turn_skipped", reason="processing_error")
                 return
 
-            # Threshold kalibrlash uchun diagnostika: bu turnning har bir
-            # mavjud A/B klasteriga o'xshashligi + unda aniqlangan til — shu
-            # ikkisini qo'lda solishtirib ("bu chindan ham mening ovozim
-            # ekanmi") SPEAKER_MATCH_THRESHOLD qayerda bo'lishi kerakligini
-            # baholash uchun (hozircha threshold o'zgartirilmagan).
-            sim_str = " ".join(f"vs {name}={sim:.3f}" for name, sim in sim_debug.items())
-            print(
-                f"[SPK][SIM] raw_label={raw_label} {sim_str} "
-                f"detected_lang={detected_lang} lang_prob={lang_prob:.2f} text={text!r}",
-                flush=True,
-            )
         finally:
             if os.path.exists(temp_filename):
                 os.remove(temp_filename)
-
-        # --- VAQTINCHALIK DIAGNOSTIKA: past-ishonchli turnni qo'lda eshitish uchun saqlash ---
-        if lang_prob < DIAG_LOW_CONF_THRESHOLD:
-            await loop.run_in_executor(
-                None, _save_diagnostic_turn, wav, detected_lang, lang_prob, peak_amplitude, is_clipped
-            )
 
         text = (text or "").strip()
         if not text:
