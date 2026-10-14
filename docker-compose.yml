@@ -13,7 +13,7 @@ services:
     volumes:
       # Persist HuggingFace downloads (Whisper + NLLB) across rebuilds.
       - hf-cache:/root/.cache/huggingface
-      # - ./backend/debug_audio:/app/debug_audio
+      - ./backend/debug_audio:/app/debug_audio
     # Modern Compose GPU passthrough (needs nvidia-container-toolkit on the host).
     deploy:
       resources:

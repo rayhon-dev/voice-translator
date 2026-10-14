@@ -5,6 +5,10 @@ import torch
 import numpy as np
 from app.config import TTS_MODEL_NAMES
 import uroman as ur
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 
 _models = {}
@@ -96,22 +100,28 @@ def text_to_speech(text: str, lang: str) -> tuple[np.ndarray, int]:
     audio_array = output.squeeze().cpu().numpy().astype(np.float32)
     sample_rate = model.config.sampling_rate
 
-    print(
-        f"[TTS] lang={lang} {text_len} chars -> "
-        f"{len(audio_array) / sample_rate:.1f}s audio in {time.perf_counter() - t0:.2f}s",
-        flush=True,
-    )
+    logger.info(f"[TTS] lang={lang} {text_len} chars -> "
+        f"{len(audio_array) / sample_rate:.1f}s audio in {time.perf_counter() - t0:.2f}s")
     return audio_array, sample_rate
 
 
 def warmup(run_inference: bool = True) -> None:
-    samples = {"uz": "Salom", "ko": "안녕", "ru": "Привет"}
+    # XATO TUZATISHI: "en" ro'yxatda yo'q edi — bu TTS_MODEL_NAMES'dagi 4
+    # tildan BIRI bo'lsa ham, hech qachon oldindan yuklanmasdi. Natijada
+    # inglizcha audio BIRINCHI so'ralganda model "sovuq" holda (hali
+    # GPU'ga yuklanmagan) lazy-load qilinardi — bu sekin, va agar aynan
+    # shu payt GPU boshqa model (Whisper/NLLB/boshqa til) bilan band
+    # bo'lsa, xatolikka ham olib kelishi mumkin edi (speak.py bu holatda
+    # 500 qaytaradi, frontend esa buni jim yutib yuboradi — DialogSessionView.
+    # handlePlayAudio faqat console.error qiladi, foydalanuvchiga xato
+    # ko'rsatilmaydi).
+    samples = {"uz": "Salom", "ko": "안녕", "ru": "Привет", "en": "Hello"}
     for lang, sample_text in samples.items():
         try:
             if run_inference:
                 text_to_speech(sample_text, lang)
             else:
                 _load_model(lang)
-            print(f"[TTS] warm-up for {lang!r} done", flush=True)
+            logger.info(f"[TTS] warm-up for {lang!r} done")
         except Exception as e:  
-            print(f"[TTS] warm-up for {lang!r} skipped: {e!r}", flush=True)
+            logger.info(f"[TTS] warm-up for {lang!r} skipped: {e!r}")

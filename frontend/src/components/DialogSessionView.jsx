@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useDialogSession } from "../hooks/useDialogSession";
 import { usePlayAudio } from "../hooks/usePlayAudio";
 import { speakText } from "../services/api";
@@ -17,16 +17,42 @@ export default function DialogSessionView({ onBack }) {
     error,
     notice,
     audioLevel,
+    isProcessing,
     startDialog,
     selectLanguage,
     stopDialog,
+    correctSpeaker,
+    pauseMic,
+    resumeMic,
   } = useDialogSession();
 
   const [audioCache, setAudioCache] = useState({});
+  // XATO TUZATISHI: ilgari TTS so'rovi muvaffaqiyatsiz bo'lganda (masalan
+  // "en" modeli hali GPU'ga yuklanmagan paytda birinchi so'rov bilan to'qnashib
+  // qolsa) handlePlayAudio buni faqat console.error qilardi — foydalanuvchi
+  // hech narsa eshitmay, SABABSIZ qolardi. Endi shu seq uchun ko'rinadigan
+  // xato belgisi chiqariladi.
+  const [audioErrors, setAudioErrors] = useState({});
   const { playingId, togglePlay } = usePlayAudio();
+
+  // DIALOG_PLAN.md 3-bosqich (C5): TTS (tarjima ovozi) ijro etilayotganda
+  // mikrofon VAD'ini to'xtatamiz — aks holda karnaydan chiqayotgan ovoz
+  // mikrofon orqali qayta eshitilib, YANGI turn sifatida yuborilib ketishi
+  // mumkin edi. `playingId` — usePlayAudio() dagi reaktiv holat: biror
+  // bubble ijro etilayotganda shu bubble'ning `seq`'iga teng, aks holda
+  // `null`. shuning uchun null<->non-null o'tishi aynan "TTS boshlandi"/
+  // "TTS tugadi" voqeasiga to'g'ri keladi.
+  useEffect(() => {
+    if (playingId !== null) {
+      pauseMic("tts_playback");
+    } else {
+      resumeMic("tts_playback_ended");
+    }
+  }, [playingId, pauseMic, resumeMic]);
 
   const handlePlayAudio = async (seq, text, lang) => {
     try {
+      setAudioErrors((prev) => ({ ...prev, [seq]: false }));
       let blob = audioCache[seq];
       if (!blob) {
         blob = await speakText(text, lang);
@@ -35,6 +61,7 @@ export default function DialogSessionView({ onBack }) {
       togglePlay(seq, blob);
     } catch (err) {
       console.error("[DialogSessionView] failed to play audio", err);
+      setAudioErrors((prev) => ({ ...prev, [seq]: true }));
     }
   };
 
@@ -142,7 +169,16 @@ export default function DialogSessionView({ onBack }) {
         {notice ? (
           <p className="text-amber-600 text-sm">{notice}</p>
         ) : (
-          <AudioLevelBars level={audioLevel} />
+          <>
+            <AudioLevelBars level={audioLevel} />
+            {/* DIALOG_PLAN.md 4-bosqich: "Tinglanmoqda / Qayta ishlanmoqda…"
+                ko'rsatkichi — STT/tarjima bir necha soniya cho'zilishi
+                mumkin, shu payt hech narsa ko'rinmasa foydalanuvchi
+                "ishlamayapti" deb o'ylab qolishi mumkin edi. */}
+            <p className="text-xs text-gray-400">
+              {isProcessing ? "Qayta ishlanmoqda…" : "Tinglanmoqda…"}
+            </p>
+          </>
         )}
       </div>
 
@@ -154,7 +190,10 @@ export default function DialogSessionView({ onBack }) {
             translatedText={msg.translation}
             speaker={msg.speaker}
             isPlaying={playingId === msg.seq}
+            conflict={msg.conflict}
+            audioError={audioErrors[msg.seq]}
             onPlayAudio={() => handlePlayAudio(msg.seq, msg.translation, msg.targetLang)}
+            onCorrectSpeaker={() => correctSpeaker(msg.seq)}
           />
         ))}
       </div>

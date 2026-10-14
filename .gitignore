@@ -60,8 +60,9 @@ transformers_cache/
 *.gguf
 
 # ───────────────── Project-specific runtime artifacts ───────────────────
-# Microphone recordings captured while debugging speaker ID (contain a voice)
-backend/debug_audio/
+# Microphone recordings captured while debugging speaker ID (contain a voice).
+# Wildcard covers renamed copies too (eval_dialog.py workflow: debug_audio_session1/, ...).
+backend/debug_audio*/
 # Any captured / generated audio — force-add explicitly if you ever need one
 *.wav
 *.webm

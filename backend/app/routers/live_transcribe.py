@@ -6,6 +6,10 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.models.stt import transcribe_audio
 from app.config import DIALOG_PROCESS_INTERVAL
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 router = APIRouter()
 
@@ -43,11 +47,11 @@ async def websocket_transcribe(websocket: WebSocket):
 
         tag = "final" if final else "live"
         try:
-            text, _detected_lang, _lang_prob = await loop.run_in_executor(
+            text, _detected_lang, _lang_prob, _unsupported_language = await loop.run_in_executor(
                 None, transcribe_audio, temp_filename, language
             )
         except Exception as e:
-            print(f"[/ws/transcribe] {tag} pass failed: {e!r}", flush=True)
+            logger.error(f"[/ws/transcribe] {tag} pass failed: {e!r}")
             return
 
         try:
@@ -56,7 +60,7 @@ async def websocket_transcribe(websocket: WebSocket):
             pass
 
         if final:
-            print(f"[/ws/transcribe] final transcription: {len(text)} chars", flush=True)
+            logger.info(f"[/ws/transcribe] final transcription: {len(text)} chars")
 
     async def processor():
         while not disconnected.is_set():
