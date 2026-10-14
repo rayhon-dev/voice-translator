@@ -99,6 +99,35 @@ const MIN_NOISE_FLOOR = 0.003;
 // bilan BIR XIL mexanizm, shu VAD qarori uchun alohida nusxa).
 const VAD_RMS_SMOOTHING_ALPHA = 0.5; // 0..1, kattaroq = tezroq (kamroq silliqlash)
 
+// --- D1: NISBIY (near-field) VAD — shovqinli muhit tuzatishi ---
+// MUAMMO: xonada boshqa odamlar ham gapirayotganda, ularning ovozi
+// NOISE_FLOOR_MULTIPLIER asosidagi bazaviy `dynamicThreshold`dan baland
+// bo'lib qolishi mumkin (chunki bu threshold faqat gaplar ORASIDAGI haqiqiy
+// jimlikka moslashadi, "boshqa odam gapirmoqda" holatiga emas). Natijada
+// foydalanuvchi gapirib to'xtagandan keyin ham, fondagi ovoz shu bazaviy
+// threshold'dan baland bo'lib qolgani uchun VAD "hali gapirilmoqda" deb
+// hisoblaydi, SILENCE_DURATION_MS hech qachon to'lmaydi va turn abadiy
+// ochiq qolib ketadi.
+//
+// YECHIM: mikrofonga ENG YAQIN turgan odam deyarli doim ENG BALAND RMS'ga
+// ega bo'ladi (masofa kvadrati bo'yicha signal kuchi kamayadi). Shu sababli
+// faol turn davomida "joriy spiker"ning darajasini (`speechLevelRef`, sekin
+// EMA) kuzatib boramiz va navbatdagi freym shu darajaning NEAR_FIELD_RATIO
+// ulushidan PAST bo'lsa — garchi bazaviy threshold'dan baland bo'lsa ham —
+// buni "fon" (jimlik) deb hisoblaymiz. Bazaviy threshold HAR DOIM pastki
+// chegara sifatida saqlanadi (`Math.max(dynamicThreshold, ...)`), shuning
+// uchun jim xonada (fon yo'q) xatti-harakat O'ZGARMAYDI: speechLevel past
+// bo'lsa, nearThreshold = dynamicThreshold bilan bir xil bo'lib qoladi.
+const NEAR_FIELD_RATIO = 0.35; // 0..1 — joriy spiker darajasining shuncha ulushidan past freym "fon" deb hisoblanadi
+const SPEECH_LEVEL_EMA_ALPHA = 0.1; // sekin EMA — bir martalik baland fon-impulsi speechLevel'ni darhol ko'tarib yubormasin
+
+// --- D1: turn boshida "fon shovqinidan tasodifan ochilish"ning oldini
+// olish — nutq hech bo'lmasa shuncha millisoniya UZLUKSIZ chegaradan
+// yuqori bo'lgandagina turn RASMAN boshlanadi. PRE_ROLL_MS (300ms) bu
+// qiymatdan katta bo'lishi SHART — shunda tasdiqlash davridagi audio ham
+// (preRoll orqali) yo'qolmaydi, alohida bufer kerak emas.
+const MIN_SPEECH_START_MS = 150;
+
 // Muqobil/qo'shimcha variant (bu bosqichda ISHLATILMAGAN, faqat
 // hujjatlashtirilgan — qarang fayl oxiridagi "@ricky0123/vad-web" izohi):
 // Silero VAD (@ricky0123/vad-web) neyron-tarmoq asosidagi, shovqinga
@@ -164,22 +193,18 @@ const DEBUG_VAD = false;
 // butunlay boshqa narsa bo'lsa ham. Ro'yxatda yo'q/kutilmagan reason uchun
 // DEFAULT ishlatiladi.
 //
-// DIALOG_PLAN.md 2-bosqich: spiker aniqlash resolve_speaker()dan
-// identify_speaker()ga (til+ovoz birlashgan balli) o'tgani uchun
-// "language_mismatch"/"low_confidence_language" sabablari ENDI HECH QACHON
-// yuborilmaydi (olib tashlandi) — o'rniga yangi "ambiguous_speaker" keldi:
-// backend ikki spiker balli orasidagi farqni (margin) yetarli deb
-// topmagan, ya'ni KIM gapirgani ANIQ emas. Hozircha bu ham shunchaki
-// skip qilinadi — KELAJAKDA shu signal asosida frontendga "A yoki B
-// gapirdi?" so'raydigan tanlash UI qo'shilishi mumkin (msg.seq va
-// msg.original — backend yuborgan asl matn — shu UI uchun allaqachon
-// payload'da bor, dialog.py'ga qarang).
+// Spiker aniqlash endi cheklanmagan sonli, FAQAT ovoz asosidagi onlayn
+// klasterlash orqali ishlaydi (speaker_diart.py) — har bir turn ALBATTA
+// biror spikerga (yangisi bo'lsa ham) tayinlanadi, shuning uchun eski
+// "ambiguous_speaker" skip-sababi ENDI HECH QACHON yuborilmaydi (olib
+// tashlandi) — noaniq hollarda backend endi turnni ko'rsatadi, faqat
+// `uncertain=true` bayrog'i bilan (qarang DialogBubble.jsx'dagi "?"
+// belgisi va "spikerni almashtirish" menyusi).
 const SKIP_REASON_MESSAGES = {
   too_short: "Juda qisqa gap — tashlab yuborildi.",
   unknown_speaker: "Ovoz aniq eshitilmadi — yana gapirib ko'ring.",
   empty_transcription: "Hech narsa eshitilmadi.",
   processing_error: "Ichki xatolik yuz berdi — qayta urinib ko'ring.",
-  ambiguous_speaker: "Kim gapirganini aniqlab bo'lmadi — ovoz ikkala kishiga ham o'xshab qoldi.",
   translation_error: "Tarjima qilishda xatolik yuz berdi.",
   empty_audio: "Audio bo'sh keldi — tashlab yuborildi.",
   // Real testda topilgan 2-muammo: tanlangan ikki tildan TASHQARI tilda
@@ -226,12 +251,7 @@ function _mergeFloat32Chunks(chunks) {
 }
 
 export function useDialogSession() {
-  const [phase, setPhase] = useState("idle"); // idle | await_language | listening | ended | error
-  const [currentSpeaker, setCurrentSpeaker] = useState(null); // "A" | "B" | null
-  // A va B tanlagan tillar, masalan {A: "en"} — B hali tanlamagan bo'lsa
-  // kalit yo'q. LanguageSelector'ga B uchun A ning tilini "band" deb
-  // ko'rsatish (bir xil tilni ikkalasi ham tanlay olmasligi) uchun kerak.
-  const [speakerLangs, setSpeakerLangs] = useState({});
+  const [phase, setPhase] = useState("idle"); // idle | listening | ended | error
   const [messages, setMessages] = useState([]);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null); // vaqtinchalik "eshitilmadi" kabi xabarlar uchun, error state'dan alohida
@@ -263,6 +283,15 @@ export function useDialogSession() {
   // asosida qabul qilinadi, xom `rms`ning o'zi emas (qarang
   // VAD_RMS_SMOOTHING_ALPHA izohi).
   const smoothedRmsRef = useRef(0);
+  // D1: faol turn davomida "joriy (eng yaqin/baland) spiker"ning
+  // darajasi — qarang NEAR_FIELD_RATIO izohi yuqorida. Faol turn YO'Q
+  // paytda 0 (neytral — nearThreshold shunda dynamicThreshold bilan
+  // bir xil bo'lib qoladi).
+  const speechLevelRef = useRef(0);
+  // D1: hali RASMIY boshlanmagan ("tasdiqlanmagan") nutq qachon
+  // boshlanganini belgilaydi — MIN_SPEECH_START_MS to'lmaguncha turn
+  // ochilmaydi (qarang handleWorkletChunk). `null` = hozir nomzod yo'q.
+  const pendingSpeechStartAtRef = useRef(null);
   const preRollChunksRef = useRef([]);
   const turnChunksRef = useRef(null); // null = hozir faol turn yo'q
   const turnStartedAtRef = useRef(null);
@@ -302,6 +331,8 @@ export function useDialogSession() {
     calibrationSamplesRef.current = [];
     noiseFloorRef.current = null;
     smoothedRmsRef.current = 0;
+    speechLevelRef.current = 0;
+    pendingSpeechStartAtRef.current = null;
     preRollChunksRef.current = [];
     turnChunksRef.current = null;
     turnStartedAtRef.current = null;
@@ -385,6 +416,7 @@ export function useDialogSession() {
       turnChunksRef.current = null;
       turnStartedAtRef.current = null;
       silenceStartedAtRef.current = null;
+      speechLevelRef.current = 0;
       if (!chunks || chunks.length === 0) return;
 
       const merged = _mergeFloat32Chunks(chunks);
@@ -417,23 +449,6 @@ export function useDialogSession() {
       const normalizedLevel = Math.min(1, rms / AUDIO_LEVEL_RMS_MAX);
       smoothedLevelRef.current += (normalizedLevel - smoothedLevelRef.current) * AUDIO_LEVEL_SMOOTHING;
       setAudioLevel(smoothedLevelRef.current);
-
-      // Diagnostika: har 2 soniyada joriy holatni chiqaramiz — mikrofon
-      // pauza qilingan bo'lsa ham (shuning uchun bu bloк pastdagi
-      // micPausedRef tekshiruvidan OLDIN turadi).
-      if (now - lastDiagLogAtRef.current >= 2000) {
-        lastDiagLogAtRef.current = now;
-        const thresholdDisplay =
-          noiseFloorRef.current === null
-            ? "calibrating"
-            : (Math.max(MIN_NOISE_FLOOR, noiseFloorRef.current) * NOISE_FLOOR_MULTIPLIER).toFixed(5);
-        console.log(
-          `[VAD] status rms=${rms.toFixed(5)} smoothedRms=${smoothedRmsRef.current.toFixed(5)} ` +
-            `noiseFloor=${noiseFloorRef.current === null ? "calibrating" : noiseFloorRef.current.toFixed(5)} ` +
-            `threshold=${thresholdDisplay} mic=${micPausedRef.current ? "paused" : "active"} ` +
-            `turn=${turnChunksRef.current !== null ? "recording" : "idle"}`
-        );
-      }
 
       // --- C5: TTS ijro etilayotganda hech narsa qabul qilinmaydi/yozilmaydi ---
       if (micPausedRef.current) {
@@ -478,6 +493,38 @@ export function useDialogSession() {
 
       const dynamicThreshold = Math.max(MIN_NOISE_FLOOR, noiseFloorRef.current) * NOISE_FLOOR_MULTIPLIER;
       const speaking = smoothedRmsRef.current >= dynamicThreshold;
+      const hasActiveTurn = turnChunksRef.current !== null;
+
+      // --- D1: nisbiy (near-field) VAD — qarang NEAR_FIELD_RATIO izohi
+      // yuqorida. FAQAT faol turn davomida qo'llaniladi: turn hali
+      // boshlanmagan bo'lsa (fon-shovqin kalibratsiyasi/gaplar orasi),
+      // bazaviy `speaking` ham hozircha yetarli signal.
+      let nearThreshold = dynamicThreshold;
+      let nearFieldSpeaking = speaking;
+      let silenceReason = speaking ? "above_threshold" : "below_threshold";
+      if (hasActiveTurn) {
+        nearThreshold = Math.max(dynamicThreshold, speechLevelRef.current * NEAR_FIELD_RATIO);
+        nearFieldSpeaking = smoothedRmsRef.current >= nearThreshold;
+        silenceReason = nearFieldSpeaking ? "near_field_speech" : "far_field_background";
+        if (nearFieldSpeaking) {
+          // Sekin EMA — joriy ("eng yaqin") spikerning darajasini vaqt
+          // bo'yicha kuzatib boradi, bir martalik baland fon-impulsidan
+          // darhol "aldanib" yuqoriga sirg'alib ketmaydi.
+          speechLevelRef.current += SPEECH_LEVEL_EMA_ALPHA * (smoothedRmsRef.current - speechLevelRef.current);
+        }
+      }
+
+      // Diagnostika: har 2 soniyada joriy holatni chiqaramiz.
+      if (now - lastDiagLogAtRef.current >= 2000) {
+        lastDiagLogAtRef.current = now;
+        console.log(
+          `[VAD] status rms=${rms.toFixed(5)} smoothedRms=${smoothedRmsRef.current.toFixed(5)} ` +
+            `noiseFloor=${noiseFloorRef.current.toFixed(5)} threshold=${dynamicThreshold.toFixed(5)} ` +
+            `speechLevel=${speechLevelRef.current.toFixed(5)} nearThreshold=${nearThreshold.toFixed(5)} ` +
+            `frame=${nearFieldSpeaking ? "speech" : "silence"}(${silenceReason}) ` +
+            `turn=${hasActiveTurn ? "recording" : "idle"}`
+        );
+      }
 
       // Shovqin darajasi FAQAT "gapirilmayotgan" paytlarda sekin
       // yangilanadi — aks holda nutqning o'zi "yangi shovqin darajasi"
@@ -505,7 +552,7 @@ export function useDialogSession() {
       // (haqiqiy, gaplar ORASIDAGI jimlikda) moslashtiramiz — nutq
       // ICHIDAGI vaqtinchalik pastroq lahzalar endi floor'ni yuqoriga
       // surmaydi.
-      if (!speaking && turnChunksRef.current === null) {
+      if (!speaking && !hasActiveTurn) {
         const updated = noiseFloorRef.current + NOISE_FLOOR_EMA_ALPHA * (smoothedRmsRef.current - noiseFloorRef.current);
         noiseFloorRef.current = Math.min(MAX_NOISE_FLOOR, Math.max(MIN_NOISE_FLOOR, updated));
       }
@@ -514,7 +561,8 @@ export function useDialogSession() {
         console.log(
           `[VAD-DEBUG] rms=${rms.toFixed(5)} smoothedRms=${smoothedRmsRef.current.toFixed(5)} ` +
             `noiseFloor=${noiseFloorRef.current.toFixed(5)} threshold=${dynamicThreshold.toFixed(5)} ` +
-            `speaking=${speaking} activeTurn=${turnChunksRef.current !== null}`
+            `speechLevel=${speechLevelRef.current.toFixed(5)} nearThreshold=${nearThreshold.toFixed(5)} ` +
+            `speaking=${speaking} nearFieldSpeaking=${nearFieldSpeaking} activeTurn=${hasActiveTurn}`
         );
       }
 
@@ -525,22 +573,41 @@ export function useDialogSession() {
         preRollChunksRef.current.shift();
       }
 
-      if (turnChunksRef.current === null) {
+      if (!hasActiveTurn) {
         if (speaking) {
-          // Yangi turn — PRE-ROLL BILAN boshlanadi (C3): nutq energiya-
-          // chegarasidan "rasman" o'tgunga qadar allaqachon o'tib ketgan
-          // bir necha bloq (odatda so'z boshidagi yumshoq tovush) ham
-          // qo'shiladi.
-          turnChunksRef.current = [...preRollChunksRef.current];
-          turnStartedAtRef.current = now;
-          silenceStartedAtRef.current = null;
-          console.log(
-            `[VAD] speech STARTED at=${new Date(now).toISOString()} rms=${rms.toFixed(5)} ` +
-              `smoothedRms=${smoothedRmsRef.current.toFixed(5)} threshold=${dynamicThreshold.toFixed(5)}`
-          );
-          if (DEBUG_VAD) {
-            console.log(`[VAD-DEBUG] turn STARTED (preRollChunks=${preRollChunksRef.current.length})`);
+          // D1: turn FAQAT nutq kamida MIN_SPEECH_START_MS UZLUKSIZ
+          // chegaradan yuqori bo'lgandan KEYIN rasman boshlanadi — bitta
+          // qisqa fon-impulsi (masalan uzoqdagi odamning bir so'zi) shu
+          // bilan turn ochib yubormaydi. `pendingSpeechStartAtRef` — shu
+          // nomzod davrining boshlanish vaqti; har qanday "gapirilmayapti"
+          // freymi buni DARHOL bekor qiladi (pastdagi else branch).
+          if (pendingSpeechStartAtRef.current === null) {
+            pendingSpeechStartAtRef.current = now;
           }
+          const pendingElapsedMs = now - pendingSpeechStartAtRef.current;
+          if (pendingElapsedMs >= MIN_SPEECH_START_MS) {
+            // Yangi turn — PRE-ROLL BILAN boshlanadi (C3): nutq energiya-
+            // chegarasidan "rasman" o'tgunga qadar allaqachon o'tib ketgan
+            // bir necha bloq (odatda so'z boshidagi yumshoq tovush, SHU
+            // JUMLADAN tasdiqlash davridagi audio — PRE_ROLL_MS >
+            // MIN_SPEECH_START_MS bo'lgani uchun allaqachon preRoll'da) ham
+            // qo'shiladi.
+            turnChunksRef.current = [...preRollChunksRef.current];
+            turnStartedAtRef.current = pendingSpeechStartAtRef.current;
+            silenceStartedAtRef.current = null;
+            speechLevelRef.current = smoothedRmsRef.current;
+            pendingSpeechStartAtRef.current = null;
+            console.log(
+              `[VAD] speech STARTED at=${new Date(now).toISOString()} rms=${rms.toFixed(5)} ` +
+                `smoothedRms=${smoothedRmsRef.current.toFixed(5)} threshold=${dynamicThreshold.toFixed(5)} ` +
+                `confirmedAfterMs=${pendingElapsedMs.toFixed(0)}`
+            );
+            if (DEBUG_VAD) {
+              console.log(`[VAD-DEBUG] turn STARTED (preRollChunks=${preRollChunksRef.current.length})`);
+            }
+          }
+        } else {
+          pendingSpeechStartAtRef.current = null;
         }
         return;
       }
@@ -550,7 +617,11 @@ export function useDialogSession() {
       // yopilmaydi, shuning uchun qisqa pauzalar gap ICHIDA qoladi).
       turnChunksRef.current.push(chunk);
 
-      if (speaking) {
+      // D1: silence-taymer endi BAZAVIY `speaking` emas, NISBIY
+      // `nearFieldSpeaking`ga qarab yuritiladi — fondagi odam(lar)ning
+      // ovozi bazaviy threshold'dan baland bo'lsa ham, bu ENDI "nutq
+      // davom etmoqda" deb hisoblanmaydi, taymer shovqin sifatida ishlayveradi.
+      if (nearFieldSpeaking) {
         silenceStartedAtRef.current = null;
       } else if (silenceStartedAtRef.current === null) {
         silenceStartedAtRef.current = now;
@@ -740,13 +811,7 @@ export function useDialogSession() {
       }
 
       switch (msg.status) {
-        case "awaiting_language":
-          setCurrentSpeaker(msg.speaker || null);
-          setPhase("await_language");
-          break;
-
         case "listening_started":
-          setCurrentSpeaker(null);
           stoppedRef.current = false;
           setPhase("listening");
           startListenLoop();
@@ -785,16 +850,19 @@ export function useDialogSession() {
           setMessages((prev) => {
             const entry = {
               seq: msg.seq,
+              // Spiker endi A/B emas, cheklanmagan sonli butun son ID
+              // (speaker_diart.py'dagi onlayn klasterlash) — DialogSessionView
+              // shuni "N-spiker" deb formatlab, rangli yorliq bilan ko'rsatadi.
               speaker: msg.speaker,
               originalText: msg.original,
               translation: msg.translation,
               sourceLang: msg.source_lang,
               targetLang: msg.target_lang,
-              // Real testda topilgan 3-muammo: til va ovoz zid bo'lganda
-              // backend natijani hali ham ko'rsatadi (til bo'yicha), lekin
-              // shu bayroq bilan — DialogBubble shuni ko'rib "⚠ spiker
-              // noaniq" belgisini chiqaradi.
-              conflict: Boolean(msg.conflict),
+              // Spiker aniqlash ishonchi past bo'lsa (uncertain band, juda
+              // qisqa turn, yoki hali tasdiqlanmagan yangi spiker nomzodi)
+              // — DialogBubble shuni ko'rib yorliq yonida "?" belgisini
+              // chiqaradi, foydalanuvchi kerak bo'lsa qo'lda to'g'rilaydi.
+              uncertain: Boolean(msg.uncertain),
             };
             const existingIdx = prev.findIndex((m) => m.seq === msg.seq);
             const next =
@@ -804,6 +872,13 @@ export function useDialogSession() {
             next.sort((a, b) => a.seq - b.seq);
             return next;
           });
+          break;
+
+        case "turn_deleted":
+          // Har bir bubble'dagi 🗑 tugmasi — backend turnni turn_history'dan
+          // o'chirgandan keyin shu statusni yuboradi, bubble ekrandan
+          // olib tashlanadi.
+          setMessages((prev) => prev.filter((m) => m.seq !== msg.seq));
           break;
 
         case "turn_skipped":
@@ -833,8 +908,6 @@ export function useDialogSession() {
 
     setError(null);
     setMessages([]);
-    setCurrentSpeaker(null);
-    setSpeakerLangs({});
     stoppedRef.current = false;
 
     try {
@@ -917,39 +990,38 @@ export function useDialogSession() {
     }
   }, [cleanupMedia, handleServerMessage, stopListenLoop]);
 
-  const selectLanguage = useCallback(
-    (lang) => {
-      try {
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ action: "set_language", lang }));
-          if (currentSpeaker) {
-            setSpeakerLangs((prev) => ({ ...prev, [currentSpeaker]: lang }));
-          }
-        } else {
-          setError("Ulanish ochiq emas — til yuborilmadi.");
-          setPhase("error");
-        }
-      } catch (err) {
-        console.error("[useDialogSession] error sending set_language", err);
-        setError(err?.message || String(err));
-        setPhase("error");
-      }
-    },
-    [currentSpeaker]
-  );
-
-  // DIALOG_PLAN.md 4-bosqich: har bir bubble'dagi "⇄" tugmasi shu
-  // funksiyani chaqiradi — backend shu `seq` uchun spikerni almashtiradi,
-  // tarjimani qayta bajaradi va ovoz markazini to'g'rilaydi (dialog.py,
-  // `correct_speaker` action), natija esa XUDDI SHU seq bilan yangi "turn"
+  // Har bir bubble'dagi "spikerni almashtirish" menyusidan bitta variant
+  // tanlanganda shu funksiya chaqiriladi — `targetSpeaker` mavjud spiker
+  // ID'si (butun son) yoki literal "new" satri ("Yangi spiker" tanlansa).
+  // Backend shu `seq` uchun ovoz profilini yangilaydi (dialog.py,
+  // `correct_speaker` action) va natija XUDDI SHU seq bilan yangi "turn"
   // sifatida qaytadi (handleServerMessage'dagi upsert shuni almashtiradi).
-  const correctSpeaker = useCallback((seq) => {
+  // Tarjima QAYTA QILINMAYDI — yo'nalish spikerga emas, aniqlangan tilga
+  // bog'liq bo'lgani uchun o'zgarmaydi.
+  const correctSpeaker = useCallback((seq, targetSpeaker) => {
     try {
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ action: "correct_speaker", seq }));
+        wsRef.current.send(
+          JSON.stringify({ action: "correct_speaker", seq, target_speaker: targetSpeaker })
+        );
       }
     } catch (err) {
       console.error("[useDialogSession] error sending correct_speaker", err);
+    }
+  }, []);
+
+  // Har bir bubble'dagi 🗑 tugmasi — backend shu seq'ni turn_history'dan
+  // o'chiradi (va agar shu turn yagona namuna sifatida biror spikerni
+  // "ochgan" bo'lsa, o'sha spiker profilini ham) — natija "turn_deleted"
+  // statusi bilan tasdiqlanadi (handleServerMessage shuni ko'rib bubble'ni
+  // ekrandan olib tashlaydi).
+  const deleteTurn = useCallback((seq) => {
+    try {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ action: "delete_turn", seq }));
+      }
+    } catch (err) {
+      console.error("[useDialogSession] error sending delete_turn", err);
     }
   }, []);
 
@@ -968,7 +1040,6 @@ export function useDialogSession() {
     stopListenLoop();
     cleanupMedia();
     setPhase("ended");
-    setCurrentSpeaker(null);
     setAudioLevel(0);
   }, [closeSocket, cleanupMedia, stopListenLoop]);
 
@@ -990,17 +1061,15 @@ export function useDialogSession() {
 
   return {
     phase,
-    currentSpeaker,
-    speakerLangs,
     messages,
     error,
     notice,
     audioLevel,
     isProcessing,
     startDialog,
-    selectLanguage,
     stopDialog,
     correctSpeaker,
+    deleteTurn,
     // C5: DialogSessionView.jsx TTS pleybek boshlanishi/tugashiga ulaydi.
     pauseMic,
     resumeMic,

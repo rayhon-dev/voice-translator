@@ -115,7 +115,13 @@ def warmup(run_inference: bool = True) -> None:
     # 500 qaytaradi, frontend esa buni jim yutib yuboradi — DialogSessionView.
     # handlePlayAudio faqat console.error qiladi, foydalanuvchiga xato
     # ko'rsatilmaydi).
-    samples = {"uz": "Salom", "ko": "안녕", "ru": "Привет", "en": "Hello"}
+    #
+    # Ikki-spikerli suhbat endi FAQAT en/ru bilan ishlaydi (til tanlash
+    # bosqichi olib tashlandi) — shuning uchun uz/ko TTS modellari bu yerda
+    # ENDI OLDINDAN YUKLANMAYDI (VRAM tejash uchun). uz/ko hali TTS_MODEL_
+    # NAMES'da qolgan — boshqa (dialog bo'lmagan) rejimlar ularni talab
+    # qilsa, text_to_speech() orqali hamon so'ngan (lazy) yuklanadi.
+    samples = {"ru": "Привет", "en": "Hello"}
     for lang, sample_text in samples.items():
         try:
             if run_inference:

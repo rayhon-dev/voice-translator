@@ -1,27 +1,46 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useDialogSession } from "../hooks/useDialogSession";
 import { usePlayAudio } from "../hooks/usePlayAudio";
 import { speakText } from "../services/api";
-import LanguageSelector from "./LanguageSelector";
 import DialogBubble from "./DialogBubble";
 import AudioLevelBars from "./AudioLevelBars";
 
-const SPEAKER_ORDINAL = { A: "1-kishi", B: "2-kishi" };
+// Spiker endi A/B (ikki kishi) emas, cheklanmagan sonli butun son ID
+// (speaker_diart.py'dagi onlayn ovoz-klasterlash) — har biriga shu 8
+// rangli palitradan (id-1) % 8 bo'yicha barqaror rang tayinlanadi, shunda
+// 9-spiker bo'lsa ham rang takrorlanib, hech kim rangsiz qolmaydi.
+const SPEAKER_PALETTE = [
+  { badge: "bg-purple-100 text-purple-700", dot: "bg-purple-400" },
+  { badge: "bg-blue-100 text-blue-700", dot: "bg-blue-400" },
+  { badge: "bg-green-100 text-green-700", dot: "bg-green-400" },
+  { badge: "bg-amber-100 text-amber-700", dot: "bg-amber-400" },
+  { badge: "bg-pink-100 text-pink-700", dot: "bg-pink-400" },
+  { badge: "bg-cyan-100 text-cyan-700", dot: "bg-cyan-400" },
+  { badge: "bg-orange-100 text-orange-700", dot: "bg-orange-400" },
+  { badge: "bg-teal-100 text-teal-700", dot: "bg-teal-400" },
+];
+
+function speakerPalette(speakerId) {
+  const idx = (Math.max(1, Number(speakerId) || 1) - 1) % SPEAKER_PALETTE.length;
+  return SPEAKER_PALETTE[idx];
+}
+
+function speakerLabel(speakerId) {
+  return `${speakerId}-spiker`;
+}
 
 export default function DialogSessionView({ onBack }) {
   const {
     phase,
-    currentSpeaker,
-    speakerLangs,
     messages,
     error,
     notice,
     audioLevel,
     isProcessing,
     startDialog,
-    selectLanguage,
     stopDialog,
     correctSpeaker,
+    deleteTurn,
     pauseMic,
     resumeMic,
   } = useDialogSession();
@@ -34,6 +53,18 @@ export default function DialogSessionView({ onBack }) {
   // xato belgisi chiqariladi.
   const [audioErrors, setAudioErrors] = useState({});
   const { playingId, togglePlay } = usePlayAudio();
+
+  // "spikerni almashtirish" menyusi uchun — hozirgacha ko'ringan BARCHA
+  // (noyob) spiker ID'lari, raqam bo'yicha tartiblangan. Alohida server
+  // holati emas — messages'ning o'zidan hisoblab chiqiladi.
+  const knownSpeakers = useMemo(() => {
+    const ids = [...new Set(messages.map((m) => m.speaker))].sort((a, b) => a - b);
+    return ids.map((id) => ({
+      id,
+      label: speakerLabel(id),
+      dotClass: speakerPalette(id).dot,
+    }));
+  }, [messages]);
 
   // DIALOG_PLAN.md 3-bosqich (C5): TTS (tarjima ovozi) ijro etilayotganda
   // mikrofon VAD'ini to'xtatamiz — aks holda karnaydan chiqayotgan ovoz
@@ -65,8 +96,6 @@ export default function DialogSessionView({ onBack }) {
     }
   };
 
-  const speakerLabel = SPEAKER_ORDINAL[currentSpeaker] || "Foydalanuvchi";
-
   if (phase === "idle") {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center gap-6 px-6">
@@ -83,27 +112,6 @@ export default function DialogSessionView({ onBack }) {
         >
           Suhbatni boshlash
         </button>
-      </div>
-    );
-  }
-
-  if (phase === "await_language") {
-    // B tanlayotganda A allaqachon tanlagan til band qilinadi (Google
-    // Translate'ning "conversation mode"idagi kabi) — ikkala spiker bir
-    // xil tilni tanlay olmasligi uchun, chunki bunday holatda tarjima
-    // qilinadigan narsa qolmas edi.
-    const otherSpeaker = currentSpeaker === "B" ? "A" : "B";
-    const otherLang = speakerLangs[otherSpeaker];
-    const excludeLangs = otherLang ? [otherLang] : [];
-    const defaultLang = otherLang === "en" ? "ru" : "en";
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-6 px-6">
-        <p className="text-gray-700 text-lg">{speakerLabel}, tilingizni tanlang</p>
-        <LanguageSelector
-          selectedLang={speakerLangs[currentSpeaker] || defaultLang}
-          onSelect={selectLanguage}
-          excludeLangs={excludeLangs}
-        />
       </div>
     );
   }
@@ -189,11 +197,15 @@ export default function DialogSessionView({ onBack }) {
             originalText={msg.originalText}
             translatedText={msg.translation}
             speaker={msg.speaker}
+            speakerLabel={speakerLabel(msg.speaker)}
+            badgeClass={speakerPalette(msg.speaker).badge}
+            uncertain={msg.uncertain}
+            knownSpeakers={knownSpeakers}
             isPlaying={playingId === msg.seq}
-            conflict={msg.conflict}
             audioError={audioErrors[msg.seq]}
             onPlayAudio={() => handlePlayAudio(msg.seq, msg.translation, msg.targetLang)}
-            onCorrectSpeaker={() => correctSpeaker(msg.seq)}
+            onSelectSpeaker={(targetSpeaker) => correctSpeaker(msg.seq, targetSpeaker)}
+            onDelete={() => deleteTurn(msg.seq)}
           />
         ))}
       </div>

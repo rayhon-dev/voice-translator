@@ -1,47 +1,98 @@
+import { useEffect, useRef, useState } from "react";
+
+// Spiker endi A/B emas, cheklanmagan sonli butun son ID (speaker_diart.py'dagi
+// onlayn klasterlash) — menyu/yorliq uchun kerakli ma'lumot (label/rang)
+// DialogSessionView.jsx'dan tayyor holda keladi (qarang SPEAKER_PALETTE).
 export default function DialogBubble({
   originalText,
   translatedText,
   onPlayAudio,
   isPlaying,
   speaker,
-  conflict,
+  speakerLabel,
+  badgeClass,
+  uncertain,
+  knownSpeakers, // [{ id, label, dotClass }]
   audioError,
-  onCorrectSpeaker,
+  onSelectSpeaker, // (targetSpeaker: number | "new") => void
+  onDelete,
 }) {
-  const isRight = speaker === "B";
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef(null);
+
+  useEffect(() => {
+    function handleClickOutside(e) {
+      if (menuRef.current && !menuRef.current.contains(e.target)) {
+        setMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   return (
-    <div className={`flex ${isRight ? "justify-end" : "justify-start"} w-full`}>
-      <div
-        className={`max-w-xl rounded-3xl p-6 ${
-          isRight ? "bg-purple-100/70" : "bg-white/70"
-        } backdrop-blur`}
-      >
-        <div className="flex items-center gap-2 mb-2">
-          <span className="text-xs text-gray-400">{speaker}</span>
-          {/* Real testda topilgan 3-muammo: til va ovoz zid bo'lganda
-              backend natijani hali ham til bo'yicha ko'rsatadi, lekin
-              `conflict` bayrog'i bilan — foydalanuvchiga buni ANIQ
-              ko'rsatish kerak, aks holda noto'g'ri spikerga ishonib
-              qolishi mumkin. */}
-          {conflict ? (
+    <div className="flex justify-start w-full">
+      <div className="max-w-xl rounded-3xl p-6 bg-white/70 backdrop-blur">
+        <div className="relative flex items-center gap-2 mb-2" ref={menuRef}>
+          <span className={`text-xs font-medium px-2.5 py-1 rounded-full ${badgeClass}`}>
+            {speakerLabel}
+          </span>
+          {/* Spiker aniqlash ishonchi past bo'lsa (noaniq o'xshashlik band,
+              juda qisqa turn, yoki hali tasdiqlanmagan yangi spiker
+              nomzodi) — foydalanuvchiga buni ko'rsatish kerak, aks holda
+              noto'g'ri spikerga ishonib qolishi mumkin. */}
+          {uncertain ? (
             <span
-              title="Til va ovoz signallari bir-biriga zid chiqdi — spiker noaniq bo'lishi mumkin."
-              className="text-xs text-amber-500"
+              title="Spiker ishonchi past — kerak bo'lsa qo'lda to'g'rilang."
+              className="text-xs text-amber-500 font-semibold"
             >
-              ⚠ spiker noaniq
+              ?
             </span>
           ) : null}
-          {/* DIALOG_PLAN.md 4-bosqich: spiker noto'g'ri aniqlangan bo'lsa,
-              foydalanuvchi shu yerdan to'g'rilaydi — backend qaytadan
-              tarjima qiladi va ovoz markazini yangilaydi. */}
+
           <button
-            onClick={onCorrectSpeaker}
-            title="Spiker noto'g'ri aniqlandimi? Bu yerni bosib almashtiring."
+            onClick={() => setMenuOpen((o) => !o)}
+            title="Spikerni almashtirish"
             className="text-xs text-gray-400 hover:text-purple-500 transition-colors"
           >
-            ⇄ spikerni almashtirish
+            ⇄
           </button>
+          <button
+            onClick={onDelete}
+            title="Bu gapni o'chirish"
+            className="text-xs text-gray-400 hover:text-red-500 transition-colors"
+          >
+            🗑
+          </button>
+
+          {menuOpen && (
+            <div className="absolute top-full left-0 mt-1 bg-white/95 backdrop-blur rounded-2xl shadow-lg overflow-hidden min-w-[160px] z-20">
+              {knownSpeakers
+                .filter((s) => s.id !== speaker)
+                .map((s) => (
+                  <button
+                    key={s.id}
+                    onClick={() => {
+                      onSelectSpeaker(s.id);
+                      setMenuOpen(false);
+                    }}
+                    className="flex items-center gap-2 w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-purple-100 transition-colors"
+                  >
+                    <span className={`w-2.5 h-2.5 rounded-full ${s.dotClass}`} />
+                    {s.label}
+                  </button>
+                ))}
+              <button
+                onClick={() => {
+                  onSelectSpeaker("new");
+                  setMenuOpen(false);
+                }}
+                className="w-full text-left px-4 py-2 text-sm text-gray-500 hover:bg-purple-100 transition-colors border-t border-gray-100"
+              >
+                + Yangi spiker
+              </button>
+            </div>
+          )}
         </div>
         <p className="text-lg text-gray-700 mb-3">{originalText}</p>
         <div className="flex items-start gap-3 pt-3 border-t border-gray-200/50">

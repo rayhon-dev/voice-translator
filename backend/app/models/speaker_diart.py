@@ -1,4 +1,3 @@
-import collections
 import datetime
 import glob
 import json
@@ -10,16 +9,11 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from app import diart_compat
-from diart import models as m
 from app.config import SAVE_DEBUG_AUDIO, DEBUG_AUDIO_DIR
 import logging
 
 logger = logging.getLogger(__name__)
 
-
-
-_embedding_model = None
 
 RMS_SILENCE_THRESHOLD = 0.003  # stt.py bilan bir xil qiymat
 _TRIM_FRAME_MS = 50
@@ -28,78 +22,81 @@ _TRIM_FRAME_MS = 50
 MIN_TRIMMED_DURATION_S = 0.5
 
 # ---------------------------------------------------------------------------
-# DIALOG_PLAN.md 2-bosqich: spiker aniqlash endi OVOZ + TIL signallarining
-# BIRLASHGAN balli orqali hal qilinadi — eski alohida bosqichlar (avval
-# FAQAT ovoz orqali klasterlash/bog'lash, til esa FAQAT klaster birinchi
-# marta tashkil bo'lganda tekshirilardi, "ovoz orqali, til tekshirilmadi"
-# yo'li) BUTUNLAY OLIB TASHLANDI. Sabab — real testda topilgan xato:
-# ikkinchi spikerning ovozi birinchisiga tasodifan o'xshab qolgani (sim
-# 0.45-0.66, eski SPEAKER_MATCH_THRESHOLD=0.4'dan yuqori) uchun uning
-# nutqi YANGI klaster emas, birinchisiga qo'shilib ketgan edi — til farqli
-# bo'lsa ham, mantiq buni TEKSHIRMAGANI uchun bu signal yo'qolgan edi.
+# OVOZ EMBEDDING MODELI — ENDI diart ORQALI EMAS, TO'G'RIDAN-TO'G'RI
+# pyannote.audio (Model.from_pretrained + Inference(window="whole")) orqali
+# yuklanadi. diart paketi hamon requirements.txt'da qoladi (boshqa
+# paketlar — xususan pyannote.audio — unga bog'liq bo'lishi mumkin, shuning
+# uchun pip uninstall QILINMAYDI), lekin shu fayl endi uni IMPORT ham
+# QILMAYDI — kodda diart'ga hech qanday bog'liqlik qolmagan.
 #
-# Yangi qaror: har bir turn uchun
-#     score_X = w_lang * p_lang(X) + w_voice * voice_sim_norm(X)   (X = A, B)
-# hisoblanadi va kattarog'i g'olib e'lon qilinadi — FAQAT agar ikkisi
-# orasidagi farq (margin) AMBIGUOUS_MARGIN'dan katta bo'lsa (pastga
-# qarang). `identify_speaker()`ga qarang.
+# Standart model: "pyannote/wespeaker-voxceleb-resnet34-LM" — ilgari
+# ishlatilgan "pyannote/embedding" (eski, kichikroq model)dan farqli,
+# WeSpeaker ResNet34 — zamonaviy, kattaroq, aniqroq speaker-verification
+# modeli (256-o'lchamli embedding). Agar yuklash muvaffaqiyatsiz bo'lsa
+# (masalan tarmoq/HF Hub muammosi) — zaxira sifatida speechbrain'ning
+# ECAPA-TDNN modeli (speechbrain/spkrec-ecapa-voxceleb, 192-o'lchamli)
+# ishlatiladi. Ikkisi ham .env orqali sozlanishi mumkin.
+SPK_EMBEDDING_MODEL = os.environ.get("SPK_EMBEDDING_MODEL", "pyannote/wespeaker-voxceleb-resnet34-LM")
+SPK_EMBEDDING_FALLBACK_MODEL = os.environ.get("SPK_EMBEDDING_FALLBACK_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
+# Ba'zi HF Hub modellari (gated repolar) uchun token kerak bo'lishi mumkin —
+# wespeaker-voxceleb-resnet34-LM ochiq litsenziyali va TOKENSIZ yuklanadi
+# (tekshirildi), lekin agar kelajakda boshqa (gated) model tanlansa yoki HF
+# Hub so'rov chegarasi tufayli muammo chiqsa, shu orqali beriladi.
+HF_TOKEN = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("HUGGINGFACE_TOKEN")
+    or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+)
+
+# CPU'da bitta embedding 130-320ms olardi — Whisper/NLLB allaqachon GPU
+# ishlatayotgan bo'lsa ham, bitta jarayonda ikkisi BIR XIL GPU'ni navbat
+# bilan ishlatadi (umumiy VRAM yetarli bo'lsa muammo emas), shuning uchun
+# CUDA mavjud bo'lsa ENDI SHU model ham GPU'ga o'tkaziladi. SPK_DEVICE
+# orqali qo'lda CPU'ga majburlash ham mumkin (masalan VRAM tanqis bo'lsa).
+SPK_DEVICE = os.environ.get("SPK_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
+
+_embedding_backend: str | None = None  # "pyannote" | "speechbrain"
+_embedding_model = None  # pyannote Inference OBYEKTI yoki speechbrain EncoderClassifier
+_embedding_model_name: str | None = None
+_embedding_load_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# ONLAYN SPIKER KLASTERLASH — cheklanmagan sonli spiker, FAQAT ovoz asosida
+# (til butunlay chiqarib tashlandi — endi faqat tarjima yo'nalishi uchun,
+# dialog.py'da ishlatiladi). Har bir spiker uchun "prototiplar" ro'yxati
+# saqlanadi (bitta o'rtacha markaz O'RNIGA) — o'xshashlik shu spikerning
+# BARCHA prototiplari bilan solishtirib, ENG KATTASI sifatida hisoblanadi
+# (nearest-neighbor, emotsiya/intonatsiya bo'yicha ovoz o'zgarishiga
+# chidamliroq). Barcha qiymatlar .env orqali sozlanadi — real suhbat
+# loglaridan ([SPK] qatoriga qarang) moslashtirish uchun.
 # ---------------------------------------------------------------------------
 
-# Bazaviy (teng) vaznlar — turn "til aniq hal qiluvchi" rejimida bo'lmaganda
-# ishlatiladi (qarang LANG_DECISIVE_* va _effective_weights()). Boshlang'ich
-# qiymat sifatida teng tanlangan — real eval_dialog.py natijalariga qarab
-# keyinroq sozlanishi mumkin, shuning uchun konstanta sifatida yuqorida.
-W_LANG = 0.5
-W_VOICE = 0.5
+# Shu va undan yuqori o'xshashlikda turn SHU spikerga ANIQ tegishli deb
+# qabul qilinadi.
+SPK_ACCEPT = float(os.environ.get("SPK_ACCEPT", "0.55"))
+# Shundan past o'xshashlikda turn HECH QANDAY mavjud spikerga tegishli
+# EMAS deb hisoblanadi (yangi ovoz nomzodi).
+SPK_NEW = float(os.environ.get("SPK_NEW", "0.35"))
+# Yangi spiker (yoki yangi prototip) uchun "nutq" (trim qilingandan keyingi,
+# haqiqiy ovoz bo'lgan) davomiyligi kamida shuncha bo'lishi SHART — qisqa
+# namunalar ovoz profilini "ifloslantirishi" (noaniq/past-sifatli embedding)
+# xavfi yuqori.
+SPK_MIN_ENROLL_SPEECH_S = float(os.environ.get("SPK_MIN_ENROLL_SPEECH_S", "2.0"))
+# Har bir spiker uchun saqlanadigan ENG KO'P prototiplar soni — birinchi
+# ("founding") prototip HAR DOIM saqlanadi, undan oshganda eng ESKI
+# (lekin birinchi EMAS) prototip olib tashlanadi (FIFO).
+SPK_MAX_PROTOTYPES = int(os.environ.get("SPK_MAX_PROTOTYPES", "10"))
+# Shundan QISQAROQ (xom, trim qilinmagan) turn uchun — agar hech kimga
+# ANIQ mos kelmasa ("best < SPK_ACCEPT") — o'xshashlikdan ko'ra ENG SO'NGGI
+# gapirgan spikerga tegishli deb hisoblash ko'proq ishonchli (juda qisqa
+# "ha"/"mhm" kabi javoblarda ovoz-o'xshashlik o'zi ishonchsiz bo'ladi).
+SPK_SHORT_TURN_S = float(os.environ.get("SPK_SHORT_TURN_S", "1.5"))
 
-# Til "hal qiluvchi" (deyarli yakuniy qarorni beradigan) rejimga o'tadigan
-# shartlar: turn yetarlicha uzun (qisqa turnlarda til-aniqlash ishonchsiz
-# bo'ladi) VA til ishonchi "noaniq oraliq"dan (pastga qarang) tashqarida —
-# ya'ni STT ANIQ bir tilni ishonch bilan ko'rsatgan. Shu holatda ovoz
-# deyarli e'tiborga olinmaydi (LANG_DECISIVE_W_VOICE juda kichik) — chunki
-# STT'ning aniq natijasi ovoz-o'xshashlikdan ANCHA ishonchli signal.
-LANG_DECISIVE_MIN_DURATION_S = 1.5
-LANG_AMBIGUOUS_PROB_LOW = 0.4
-LANG_AMBIGUOUS_PROB_HIGH = 0.6
-LANG_DECISIVE_W_LANG = 0.9
-LANG_DECISIVE_W_VOICE = 0.1
-
-# Ovoz profili (markaz) FAQAT shu til-ishonchidan yuqori turnlardan
-# tashkil topadi/yangilanadi — past/noaniq ishonchli turnlar o'ziga
-# spiker tayinlanishi mumkin (agar margin yetarli bo'lsa), lekin ULARNING
-# embeddingi markazga HECH QACHON qo'shilmaydi. Bu A3/A4'ni (sifatsiz
-# "founding sample" markazni buzishi) ildizidan hal qiladi — eski
-# MIN_RMS_FOR_NEW_CLUSTER/MIN_LANG_PROB_FOR_NEW_CLUSTER/RMS-asosidagi
-# tekshiruvlar endi keraksiz, chunki til-ishonch ulardan ANCHA to'g'ridan
-# to'g'ri va ishonchli signal.
-CENTROID_UPDATE_MIN_LANG_PROB = 0.85
-
-# Ikki ball orasidagi farq shundan kichik bo'lsa, natija "ambiguous" deb
-# belgilanadi (A2) — noto'g'ri, lekin "ishonchli ko'ringan" qarordan ko'ra
-# ochiq tanlashni so'rash xavfsizroq.
-AMBIGUOUS_MARGIN = 0.15
-
-# REAL TESTDA TOPILGAN MUAMMO (3-band): w_lang=0.90 bo'lgani uchun til
-# signali amalda deyarli HAR DOIM g'olib bo'ladi — HATTO ovoz butunlay
-# QARAMA-QARSHI narsani ko'rsatsa ham (masalan ovoz aniq A, til esa B
-# tomonidan). Bunday holatda g'olibni (til bo'yicha) o'zgartirmaymiz —
-# lekin uning centroidiga BOSHQA odamning ovozini "yuklab" qo'yish ham
-# xavfli (keyingi turnlarda ovoz-aniqlashni butunlay buzadi). Shu sababli:
-# ikkala profil ham mavjud bo'lganda, agar OVOZ g'olibi (voice_winner) TIL
-# g'olibidan (lang_winner) farq qilsa VA ovoz ballari orasidagi farq
-# yetarlicha katta (ishonchli) bo'lsa — demak ovoz signali "jim" emas, u
-# HAQIQATDA boshqa odamni ko'rsatmoqda — markaz YANGILANMAYDI (hech kim
-# uchun) va turn "conflict" deb belgilanadi (dialog.py buni frontendga
-# uzatadi, qarang DialogBubble.jsx'dagi "⚠ spiker noaniq" belgisi).
-VOICE_CONFLICT_MARGIN = 0.10
-
-# Har bir A/B ovoz profili uchun so'nggi shuncha SIFATLI (CENTROID_UPDATE_
-# MIN_LANG_PROB'dan yuqori ishonchli) embedding saqlanadi; markaz —
-# shularning (+ doim saqlanadigan "founding" namunaning, pastga qarang)
-# o'rtachasi. Eski qiymat (5) juda kichik edi — bitta "burchakka og'ib
-# ketgan" namuna markazni sezilarli siljitib yuborishi mumkin edi; 15-20
-# oraliq buferni "drift"ga ancha chidamli qiladi.
-CENTROID_BUFFER_SIZE = 18
+# Prototipga aylanish uchun embedding YANGI prototip sifatida qo'shiladigan
+# eng YUQORI o'xshashlik — bundan baland bo'lsa, bu amalda MAVJUD
+# prototiplardan biriga "deyarli bir xil" (takroriy namuna), qo'shishning
+# hojati yo'q.
+SPK_DUPLICATE_PROTOTYPE_SIM = 0.95
 
 
 def _trim_trailing_silence(wav: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -117,14 +114,64 @@ def _trim_trailing_silence(wav: np.ndarray, sample_rate: int) -> np.ndarray:
     return wav[:end]
 
 
+def _load_pyannote_model(model_name: str):
+    from pyannote.audio import Model, Inference
+
+    model = Model.from_pretrained(model_name, token=HF_TOKEN)
+    model.eval()
+    inference = Inference(model, window="whole")
+    # Inference.infer() ICHKI ravishda kiruvchi audio'ni `self.device`ga
+    # ko'chiradi va natijani CPU'ga qaytaradi (pyannote.audio manbasida
+    # tekshirildi) — shuning uchun bu yerda FAQAT `.to()` chaqirish
+    # YETARLI, _embed()da qo'lda device ko'chirish shart emas.
+    inference.to(torch.device(SPK_DEVICE))
+    return inference
+
+
+def _load_speechbrain_model(model_name: str):
+    from speechbrain.inference.speaker import EncoderClassifier
+
+    savedir = os.path.join("pretrained_models", model_name.replace("/", "_"))
+    return EncoderClassifier.from_hparams(
+        source=model_name,
+        run_opts={"device": SPK_DEVICE},
+        savedir=savedir,
+    )
+
+
 def _load_model():
-    global _embedding_model
-    if _embedding_model is None:
-        model = m.EmbeddingModel.from_pyannote("pyannote/embedding")
-        model.to(torch.device("cpu"))
-        model.eval()
-        _embedding_model = model
-    return _embedding_model
+    """Jarayonga BIR MARTA — avval SPK_EMBEDDING_MODEL (standart:
+    pyannote/wespeaker-voxceleb-resnet34-LM) pyannote.audio orqali
+    to'g'ridan-to'g'ri (diart'siz) yuklashga harakat qiladi; muvaffaqiyatsiz
+    bo'lsa (tarmoq/HF Hub xatosi, gated-repo/token muammosi va h.k.) —
+    SPK_EMBEDDING_FALLBACK_MODEL (standart: speechbrain/spkrec-ecapa-
+    voxceleb) orqali zaxira sifatida yuklanadi. Ikkisi ham butunlay
+    boshqa Python API'ga ega bo'lgani uchun `_embedding_backend` orqali
+    qaysi biri yuklanganini `_embed()` keyinroq biladi."""
+    global _embedding_backend, _embedding_model, _embedding_model_name
+    if _embedding_model is not None:
+        return _embedding_model
+
+    with _embedding_load_lock:
+        if _embedding_model is not None:
+            return _embedding_model
+
+        try:
+            _embedding_model = _load_pyannote_model(SPK_EMBEDDING_MODEL)
+            _embedding_backend = "pyannote"
+            _embedding_model_name = SPK_EMBEDDING_MODEL
+        except Exception as e:
+            logger.error(
+                f"[SPK] {SPK_EMBEDDING_MODEL!r} modelini pyannote.audio orqali yuklab bo'lmadi: "
+                f"{e!r} — zaxira modelga ({SPK_EMBEDDING_FALLBACK_MODEL!r}, speechbrain) o'tilyapti. "
+                f"Agar bu gated/xususiy HF Hub repo bo'lsa, HF_TOKEN muhit o'zgaruvchisini "
+                f"sozlash kerak bo'lishi mumkin."
+            )
+            _embedding_model = _load_speechbrain_model(SPK_EMBEDDING_FALLBACK_MODEL)
+            _embedding_backend = "speechbrain"
+            _embedding_model_name = SPK_EMBEDDING_FALLBACK_MODEL
+
+        return _embedding_model
 
 
 def _clear_debug_audio_dir() -> None:
@@ -153,13 +200,7 @@ def _save_debug_audio_async(
     """Embedding modelga AYNAN uzatiladigan (trim qilingan) audio'ni
     diagnostika uchun diskka yozadi — faqat SAVE_DEBUG_AUDIO=True bo'lsa.
     Asosiy oqimni bloklamasligi uchun alohida (daemon) thread'da ishlaydi —
-    bu funksiyaning o'zi disk I/O'ni kutmasdan darhol qaytadi.
-
-    Fayl nomini (timestamp'ga asoslangani uchun) THREAD BOSHLANISHIDAN OLDIN,
-    sinxron hisoblab, qaytaradi — shunda chaqiruvchi (identify_speaker)
-    ushbu nomni debug_label_out'ga yozib qo'yishi mumkin, dialog.py esa keyinroq
-    (speaker/lang/text ANIQLANGANDAN KEYIN) save_turn_label() orqali shu AYNAN
-    faylga mos .json yaratishi uchun — disk yozishning o'zi hamon asinxron."""
+    bu funksiyaning o'zi disk I/O'ni kutmasdan darhol qaytadi."""
     if not SAVE_DEBUG_AUDIO:
         return None
 
@@ -177,8 +218,8 @@ def _save_debug_audio_async(
     return filename
 
 
-def save_turn_label(wav_filename: str | None, speaker: str | None, lang: str | None, text: str | None) -> None:
-    """dialog.py tomonidan, bitta turn uchun YAKUNIY natija (A/B spiker, til,
+def save_turn_label(wav_filename: str | None, speaker, lang: str | None, text: str | None) -> None:
+    """dialog.py tomonidan, bitta turn uchun YAKUNIY natija (spiker ID, til,
     transkripsiya) ma'lum bo'lgandan keyin chaqiriladi. `wav_filename` —
     identify_speaker() debug_label_out orqali qaytargan, AYNAN shu turnga
     tegishli audio fayl nomi (_save_debug_audio_async natijasi). Shu nom bilan
@@ -208,19 +249,22 @@ def warmup(run_inference: bool = True) -> None:
     _clear_debug_audio_dir()
     t0 = time.perf_counter()
     _load_model()
-    logger.info(f"[SPK] pyannote embedding model loaded in {time.perf_counter() - t0:.2f}s")
+    load_s = time.perf_counter() - t0
+    logger.info(
+        f"[SPK] ovoz embedding modeli yuklandi: backend={_embedding_backend!r} "
+        f"model={_embedding_model_name!r} device={SPK_DEVICE!r} ({load_s:.2f}s)"
+    )
     if not run_inference:
         return
     try:
+        dummy_wav = (np.random.randn(16000 * 2).astype(np.float32) * 0.05)
+        t1 = time.perf_counter()
+        _embed(dummy_wav, 16000)
+        embed_ms = (time.perf_counter() - t1) * 1000
+        logger.info(f"[SPK] bitta embedding (2.0s audio, device={SPK_DEVICE!r}): {embed_ms:.1f}ms")
+
         session = create_session()
-        identify_speaker(
-            session,
-            np.random.randn(16000).astype(np.float32) * 0.05,
-            16000,
-            speaker_langs={"A": "en", "B": "ru"},
-            detected_lang="en",
-            lang_prob=0.9,
-        )
+        identify_speaker(session, dummy_wav, 16000, seq=0)
         logger.info("[SPK] warm-up inference done")
     except Exception as e:
         logger.info(f"[SPK] warm-up inference skipped: {e!r}")
@@ -228,312 +272,353 @@ def warmup(run_inference: bool = True) -> None:
 
 def create_session():
     return {
-        "embedding_model": _load_model(),
-        # "A"/"B" -> {"founding_embedding": np.ndarray, "embeddings": deque,
-        #             "centroid": np.ndarray} — kalit faqat shu spiker
-        # UCHUN ovoz profili tashkil topgandan keyin paydo bo'ladi (qarang
-        # identify_speaker/enroll_speaker).
-        "voices": {},
+        # speaker_id(int) -> {"prototypes": [np.ndarray, ...]} — birinchi
+        # (index 0) prototip "founding" namuna, HECH QACHON FIFO orqali
+        # olib tashlanmaydi (qarang _add_prototype).
+        "speakers": {},
+        # Hali TASDIQLANMAGAN yangi-spiker nomzodi: {"tentative_id":,
+        # "embedding":, "speech_s":, "seq":} yoki None. Bir vaqtning
+        # o'zida FAQAT bitta nomzod kuzatiladi (qarang identify_speaker).
+        "pending_candidate": None,
+        "next_id": 1,
+        # SPK_SHORT_TURN_S'dan qisqa, noaniq turnlar uchun fallback —
+        # eng SO'NGGI qaytarilgan (pending/uncertain ham) spiker.
+        "last_speaker": None,
         "lock": threading.Lock(),
     }
 
 
-def _embed(embedding_model, wav: np.ndarray) -> np.ndarray:
-    waveform = torch.from_numpy(np.ascontiguousarray(wav, dtype=np.float32)).reshape(1, 1, -1)
-    with torch.no_grad():
-        emb = embedding_model(waveform)
-    emb = emb.squeeze(0).cpu().numpy().astype(np.float64)
+def _embed(wav: np.ndarray, sample_rate: int) -> np.ndarray:
+    model = _load_model()
+    waveform = torch.from_numpy(np.ascontiguousarray(wav, dtype=np.float32)).reshape(1, -1)
+    if _embedding_backend == "pyannote":
+        emb = model({"waveform": waveform, "sample_rate": sample_rate})
+        emb = np.asarray(emb, dtype=np.float64).reshape(-1)
+    else:  # "speechbrain"
+        with torch.no_grad():
+            emb = model.encode_batch(waveform)
+        emb = emb.squeeze().cpu().numpy().astype(np.float64).reshape(-1)
     norm = np.linalg.norm(emb)
     if norm > 0:
         emb = emb / norm
     return emb
 
 
-def _recompute_voice_centroid(profile: dict) -> None:
-    """Markaz — "founding" (asos) namuna + sirpanuvchi bufердаgi hamma
-    namunalarning o'rtachasi. `founding_embedding` ATAYLAB `embeddings`
-    deque'sidan TASHQARIDA saqlanadi (A3): deque `maxlen=CENTROID_BUFFER_
-    SIZE` bo'lgani uchun eski namunalarni o'zi "unutadi", lekin founding
-    namuna HECH QACHON shu tarzda chiqarib tashlanmaydi — klaster "kim
-    ekanligi"ning barqaror langari sifatida doim markazga hissa qo'shadi."""
-    vectors = [profile["founding_embedding"], *profile["embeddings"]]
-    mean = np.mean(vectors, axis=0)
-    norm = np.linalg.norm(mean)
-    profile["centroid"] = mean / norm if norm > 0 else mean
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    # Ikkisi ham _embed() orqali allaqachon birlik-normallashtirilgan —
+    # shuning uchun oddiy dot product cosine o'xshashlikka teng.
+    return float(np.dot(a, b))
 
 
-def _voice_profile_score(session, speaker: str, embedding: np.ndarray | None) -> float:
-    """[0,1] oraliqda — `speaker`ning OVOZ profili asosida ushbu embedding
-    unga qanchalik mos kelishi (cosine o'xshashlik [-1,1]'dan chiziqli
-    o'tkazilgan). Profil hali tashkil topmagan BO'LSA yoki `embedding` yo'q
-    (audio juda qisqa/jim bo'lib trim qilingan) bo'lsa — NEUTRAL (0.5, ya'ni
-    "hech qanday dalil yo'q") qaytaradi, shunda yakuniy qaror shu daraja
-    bo'yicha butunlay til signaliga tortiladi."""
-    profile = session["voices"].get(speaker)
-    if profile is None or embedding is None:
-        return 0.5
-    sim = float(np.dot(embedding, profile["centroid"]))
-    return min(1.0, max(0.0, (sim + 1.0) / 2.0))
+def _speaker_best_sim(profile: dict, embedding: np.ndarray) -> float:
+    """Spikerning BARCHA prototiplari bilan o'xshashliklarning ENG
+    KATTASI — "eng yaqin prototip" (nearest-neighbor). Prototip hali
+    yo'q bo'lsa (nazariy jihatdan mumkin — masalan embedding'siz
+    yaratilgan "zaxira" spiker) — hech qachon moslashmaydigan -1.0."""
+    if not profile["prototypes"]:
+        return -1.0
+    return max(_cosine_sim(embedding, proto) for proto in profile["prototypes"])
 
 
-def _lang_profile_scores(
-    speaker_langs: dict, detected_lang: str | None, lang_prob: float
-) -> tuple[float, float]:
-    """(p_lang(A), p_lang(B)) qaytaradi. `detected_lang` A yoki B'ning
-    TANLAGAN tiliga mos kelsa, shu tomonga `lang_prob` (stt.py'da
-    ALLAQACHON 2 til orasida qayta normallashtirilgan — qarang
-    _detect_language_restricted) beriladi, ikkinchi tomonga `1 - lang_prob`
-    (faqat 2 nomzod bo'lgani uchun ehtimolliklar yig'indisi 1 bo'ladi).
-    `detected_lang` ikkisiga ham mos kelmasa (STT candidate_languages
-    orqali shu ikkisiga cheklangani uchun amalda bo'lmasligi kerak — faqat
-    himoya sifatida) — ikkisiga ham NEUTRAL (0.5)."""
-    if detected_lang == speaker_langs.get("A"):
-        return lang_prob, 1.0 - lang_prob
-    if detected_lang == speaker_langs.get("B"):
-        return 1.0 - lang_prob, lang_prob
-    return 0.5, 0.5
-
-
-def _effective_weights(duration_s: float, lang_prob: float) -> tuple[float, float]:
-    """(w_lang, w_voice). Til "hal qiluvchi" rejimga o'tadi (deyarli
-    yakuniy qarorni belgilaydi) FAQAT turn >= LANG_DECISIVE_MIN_DURATION_S
-    VA lang_prob "noaniq oraliq" [LANG_AMBIGUOUS_PROB_LOW,
-    LANG_AMBIGUOUS_PROB_HIGH]'dan TASHQARIDA bo'lsa — ya'ni STT yetarlicha
-    uzun audio'da ANIQ bir tilni ko'rsatgan. Aks holda (qisqa turn YOKI
-    til ishonchi noaniq) bazaviy (teng) vaznlarga qaytiladi va ovoz
-    amalda hal qiluvchi bo'lib qoladi."""
-    lang_is_decisive = duration_s >= LANG_DECISIVE_MIN_DURATION_S and not (
-        LANG_AMBIGUOUS_PROB_LOW <= lang_prob <= LANG_AMBIGUOUS_PROB_HIGH
-    )
-    if lang_is_decisive:
-        return LANG_DECISIVE_W_LANG, LANG_DECISIVE_W_VOICE
-    return W_LANG, W_VOICE
+def _add_prototype(profile: dict, embedding: np.ndarray) -> None:
+    profile["prototypes"].append(embedding)
+    if len(profile["prototypes"]) > SPK_MAX_PROTOTYPES:
+        # index 0 — "founding" prototip, HAR DOIM saqlanadi; eng ESKI
+        # (lekin founding EMAS) prototip index 1'da turadi.
+        del profile["prototypes"][1]
 
 
 def identify_speaker(
     session,
     wav: np.ndarray,
     sample_rate: int,
-    speaker_langs: dict,
-    detected_lang: str | None,
-    lang_prob: float,
+    seq: int,
+    detected_lang: str | None = None,
     debug_label_out: dict | None = None,
-) -> tuple[str, dict]:
-    """DIALOG_PLAN.md 2-bosqich: bitta turn uchun A/B qarorini TIL va OVOZ
-    signallarining birlashgan balli orqali chiqaradi:
+) -> dict:
+    """Cheklanmagan sonli spiker uchun ONLAYN klasterlash — FAQAT ovoz
+    asosida (til BUTUNLAY chiqarib tashlandi, `detected_lang` bu yerda
+    FAQAT [SPK] logiga chiqarish uchun — qarorga HECH QANDAY ta'sir
+    qilmaydi, tarjima yo'nalishi dialog.py'da mustaqil hal qilinadi).
 
-        score_X = w_lang * p_lang(X) + w_voice * voice_sim_norm(X)   (X=A,B)
+    Qaytaradi: {"speaker": int, "uncertain": bool, "pending": bool,
+    "decision": str, "confirmed_pending_seq": int|None}.
 
-    Qaytaradi: (`"A"` | `"B"` | `"ambiguous"`, debug_info_dict).
-    HECH QACHON `None`/"unknown_speaker" qaytarmaydi — bu suhbat ANIQ 2
-    kishi orasida ekani ma'lum (speaker_langs orqali), shuning uchun har
-    bir (bo'sh bo'lmagan) turn ALBATTA A, B yoki (agar ikkisi ham deyarli
-    teng ball olsa) "ambiguous" bo'ladi. Chaqiruvchi (dialog.py) `detected_
-    lang`/`lang_prob`ni BU FUNKSIYA chaqirilishidan OLDIN STT orqali olishi
-    kerak — eski kodda STT faqat "founding sample" tekshiruvi uchun shartli
-    chaqirilardi, endi til ASOSIY signallardan biri bo'lgani uchun HAR DOIM
-    oldindan kerak.
+        "confirmed_pending_seq" — agar bu chaqiruv ILGARI "pending" deb
+        belgilangan nomzodni HAQIQIY yangi spiker sifatida TASDIQLASA,
+        o'sha ESKI turn'ning seq'i shu yerda qaytadi — dialog.py shu
+        seq'ni YANGI spiker ID bilan qayta yuborishi (upsert) kerak,
+        aks holda o'sha bubble abadiy "pending/uncertain" holatda qolib
+        ketadi.
 
-    Eski alohida bosqichlar — FAQAT ovoz orqali klasterlash
-    (SPEAKER_MATCH_THRESHOLD), keyin FAQAT birinchi marta klaster ochilganda
-    til tekshirish, shundan keyin "ovoz orqali, til tekshirilmadi" doimiy
-    bog'lash — BUTUNLAY OLIB TASHLANDI. Buning o'rniga har bir turn
-    MUSTAQIL baholanadi (streak/pending holat saqlanmaydi)."""
+    Qaror daraxti (batafsil — [SPK] logiga qarang, chegaralarni real
+    suhbat loglaridan sozlash uchun):
+      1. sims = {speaker_id: eng yaqin prototip bilan o'xshashlik}.
+      2. best = eng yuqori sims.
+      3a. TURN (xom, trim qilinmagan) SPK_SHORT_TURN_S'dan qisqa VA
+          best < SPK_ACCEPT VA avval kimdir gapirgan bo'lsa — ENG SO'NGGI
+          gapirgan spikerga (uncertain=True), ovoz-o'xshashlikdan ko'ra
+          "suhbat davomiyligi" ko'proq ishonchli signal (juda qisqa
+          javoblarda ovoz-profil ishonchsiz).
+      3b. best >= SPK_ACCEPT → shu spiker. Agar NUTQ (trim qilingan)
+          >= SPK_MIN_ENROLL_SPEECH_S VA best < SPK_DUPLICATE_PROTOTYPE_SIM
+          (ya'ni bu aynan takroriy namuna EMAS) — YANGI prototip
+          qo'shiladi (SPK_MAX_PROTOTYPES'dan oshsa, eng eskisi — founding
+          BUNDAN MUSTASNO — olib tashlanadi).
+      3c. SPK_NEW <= best < SPK_ACCEPT → eng yaqin spikerga, uncertain=True,
+          prototip QO'SHILMAYDI.
+      3d. best < SPK_NEW (yoki hali spiker yo'q):
+          - nutq >= SPK_MIN_ENROLL_SPEECH_S:
+            - spiker UMUMAN yo'q bo'lsa → BIRINCHI spiker sifatida
+              DARHOL ochiladi (tasdiqlash shart emas — taqqoslaydigan
+              hech kim yo'q).
+            - aks holda, agar ALLAQACHON pending nomzod bo'lsa VA shu
+              nomzod bilan o'xshashlik >= SPK_ACCEPT → nomzod TASDIQLANADI
+              (haqiqiy, keyingi raqamli spiker bo'ladi;
+              confirmed_pending_seq orqali eski turn ham yangilanadi).
+            - aks holda → YANGI nomzod ochiladi (pending=True,
+              uncertain=True), hali HAQIQIY spiker emas.
+          - nutq qisqa → eng yaqin spikerga (bor bo'lsa) uncertain=True,
+            yangi spiker/nomzod OCHILMAYDI."""
     t0 = time.perf_counter()
     trimmed = _trim_trailing_silence(wav, sample_rate)
     trim_ms = (time.perf_counter() - t0) * 1000
     logger.info(f"[SPK][TRIM] wav_len={len(wav)} trimmed_len={len(trimmed)} took={trim_ms:.2f}ms")
 
-    original_duration_s = len(wav) / sample_rate
-    trimmed_duration_s = len(trimmed) / sample_rate
-    if trimmed.size > 0 and trimmed_duration_s < MIN_TRIMMED_DURATION_S and trimmed_duration_s < original_duration_s:
-        logger.info(f"[SPK][TRIM] trim too aggressive ({original_duration_s:.2f}s -> "
-            f"{trimmed_duration_s:.2f}s), using original audio")
+    turn_s = len(wav) / sample_rate
+    speech_s = len(trimmed) / sample_rate
+    if trimmed.size > 0 and speech_s < MIN_TRIMMED_DURATION_S and speech_s < turn_s:
+        logger.info(f"[SPK][TRIM] trim too aggressive ({turn_s:.2f}s -> {speech_s:.2f}s), using original audio")
         trimmed = wav
+        speech_s = turn_s
 
-    duration_s = len(trimmed) / sample_rate
     trimmed_rms = float(np.sqrt(np.mean(trimmed.astype(np.float64) ** 2))) if trimmed.size else 0.0
+
+    embedding = None
+    if trimmed.size > 0 and speech_s >= MIN_TRIMMED_DURATION_S:
+        embedding = _embed(trimmed, sample_rate)
 
     try:
         with session["lock"]:
-            # Audio juda qisqa/butunlay jim bo'lsa, ishonchli embedding
-            # OLISH MUMKIN EMAS — lekin bu, eski koddan farqli, ENDI turnni
-            # butunlay rad etishga sabab BO'LMAYDI: voice_sim ikki tomon
-            # uchun ham NEUTRAL (0.5) qoladi va qaror butunlay til signaliga
-            # tayanadi (agar u ham noaniq bo'lsa, margin tekshiruvi buni
-            # "ambiguous" deb to'g'ri belgilaydi — pastga qarang).
-            embedding = None
-            if trimmed.size > 0 and duration_s >= MIN_TRIMMED_DURATION_S:
-                embedding = _embed(session["embedding_model"], trimmed)
+            speakers = session["speakers"]
 
-            voice_a = _voice_profile_score(session, "A", embedding)
-            voice_b = _voice_profile_score(session, "B", embedding)
-            lang_a, lang_b = _lang_profile_scores(speaker_langs, detected_lang, lang_prob)
-            w_lang, w_voice = _effective_weights(duration_s, lang_prob)
+            sims: dict = {}
+            if embedding is not None:
+                for sid, profile in speakers.items():
+                    sims[sid] = _speaker_best_sim(profile, embedding)
 
-            score_a = w_lang * lang_a + w_voice * voice_a
-            score_b = w_lang * lang_b + w_voice * voice_b
+            cand_sim = None
+            pending_candidate = session["pending_candidate"]
+            if embedding is not None and pending_candidate is not None:
+                cand_sim = _cosine_sim(embedding, pending_candidate["embedding"])
 
-            debug_info = {
-                "score_a": score_a,
-                "score_b": score_b,
-                "voice_a": voice_a,
-                "voice_b": voice_b,
-                "lang_a": lang_a,
-                "lang_b": lang_b,
-                "w_lang": w_lang,
-                "w_voice": w_voice,
-            }
+            if sims:
+                best_id = max(sims, key=sims.get)
+                best_sim = sims[best_id]
+            else:
+                best_id = None
+                best_sim = -1.0
 
-            logger.info(f"[SPK][SCORE] A={score_a:.3f} (lang={lang_a:.2f} voice={voice_a:.2f}) "
-                f"B={score_b:.3f} (lang={lang_b:.2f} voice={voice_b:.2f}) "
-                f"w_lang={w_lang:.2f} w_voice={w_voice:.2f} duration={duration_s:.2f}s "
-                f"detected_lang={detected_lang!r} lang_prob={lang_prob:.2f}")
+            decision: str
+            result_speaker = None
+            uncertain = False
+            pending = False
+            confirmed_pending_seq = None
 
-            margin = abs(score_a - score_b)
-            if margin < AMBIGUOUS_MARGIN:
-                logger.info(f"[SPK][DEBUG] ambiguous (margin={margin:.3f} < {AMBIGUOUS_MARGIN}) — "
-                    f"foydalanuvchidan tanlash so'ralishi kerak")
-                wav_filename = _save_debug_audio_async(trimmed, sample_rate, duration_s, trimmed_rms, "ambiguous")
-                if debug_label_out is not None:
-                    debug_label_out["wav_filename"] = wav_filename
-                return "ambiguous", debug_info
+            if embedding is None:
+                # Audio juda qisqa/jim — hech qanday ovoz dalili yo'q.
+                # Amalda deyarli bo'lmaydi (dialog.py'dagi MIN_TURN_SECONDS/
+                # STT MIN_SPEECH_S allaqachon bundan oldin filtrlaydi), lekin
+                # xavfsizlik uchun: oxirgi spikerga (bo'lsa), aks holda
+                # (sessiyaning eng boshi) 1-spikerni prototipsiz ochamiz.
+                decision = "no_embedding"
+                uncertain = True
+                if session["last_speaker"] is not None:
+                    result_speaker = session["last_speaker"]
+                else:
+                    result_speaker = session["next_id"]
+                    session["next_id"] += 1
+                    speakers[result_speaker] = {"prototypes": []}
 
-            winner = "A" if score_a > score_b else "B"
+            elif turn_s < SPK_SHORT_TURN_S and best_sim < SPK_ACCEPT and session["last_speaker"] is not None:
+                decision = "short"
+                result_speaker = session["last_speaker"]
+                uncertain = True
 
-            # 3-band: ikkala profil ham mavjud bo'lgandagina voice_winner
-            # mazmunli (aks holda _voice_profile_score mavjud bo'lmagan
-            # tomon uchun NEUTRAL 0.5 qaytaradi — "g'olib" tasodifiy bo'lib
-            # qoladi, haqiqiy ziddiyat emas).
-            conflict = False
-            if "A" in session["voices"] and "B" in session["voices"]:
-                voice_winner = "A" if voice_a > voice_b else "B"
-                lang_winner = "A" if lang_a > lang_b else "B"
-                voice_margin = abs(voice_a - voice_b)
-                if voice_winner != lang_winner and voice_margin > VOICE_CONFLICT_MARGIN:
-                    conflict = True
-                    debug_info["conflict"] = True
+            elif best_sim >= SPK_ACCEPT:
+                decision = "accept"
+                result_speaker = best_id
+                profile = speakers[best_id]
+                if speech_s >= SPK_MIN_ENROLL_SPEECH_S and best_sim < SPK_DUPLICATE_PROTOTYPE_SIM:
+                    _add_prototype(profile, embedding)
                     logger.info(
-                        f"[SPK][CONFLICT] lang→{lang_winner} voice→{voice_winner} "
-                        f"margin={voice_margin:.3f} — centroid yangilanmadi"
+                        f"[SPK][ENROLL] speaker={best_id} yangi prototip qo'shildi "
+                        f"(sim={best_sim:.3f} < {SPK_DUPLICATE_PROTOTYPE_SIM}) — "
+                        f"jami prototiplar={len(profile['prototypes'])}"
                     )
 
-            # Markaz FAQAT yuqori til-ishonchli turnlardan tashkil topadi/
-            # yangilanadi (A3/A4) — g'olib ANIQLANGANDAN keyin, HAR DOIM,
-            # g'olib qanday aniqlanganidan (til yoki ovoz hal qilganidan)
-            # qat'i nazar shu BITTA shart tekshiriladi. 3-band: til/ovoz
-            # ziddiyati bo'lsa, bu tekshiruv UMUMAN o'tkazilmaydi — hech
-            # qaysi spiker centroidi yangilanmaydi (g'olibning o'zi esa
-            # o'zgarishsiz, hali til bo'yicha qolaveradi).
-            if conflict:
-                pass
-            elif embedding is not None and lang_prob >= CENTROID_UPDATE_MIN_LANG_PROB:
-                profile = session["voices"].get(winner)
-                if profile is None:
-                    session["voices"][winner] = {
-                        "founding_embedding": embedding,
-                        "embeddings": collections.deque(maxlen=CENTROID_BUFFER_SIZE),
-                        "centroid": embedding,
-                    }
-                    logger.info(f"[SPK][DEBUG] {winner!r} uchun YANGI ovoz profili tashkil topdi "
-                        f"(lang_prob={lang_prob:.2f} >= {CENTROID_UPDATE_MIN_LANG_PROB})")
+            elif best_id is not None and SPK_NEW <= best_sim < SPK_ACCEPT:
+                decision = "uncertain"
+                result_speaker = best_id
+                uncertain = True
+
+            elif speech_s >= SPK_MIN_ENROLL_SPEECH_S:
+                if not speakers:
+                    new_id = session["next_id"]
+                    session["next_id"] += 1
+                    speakers[new_id] = {"prototypes": [embedding]}
+                    decision = "new"
+                    result_speaker = new_id
+                elif pending_candidate is not None and cand_sim is not None and cand_sim >= SPK_ACCEPT:
+                    new_id = pending_candidate["tentative_id"]
+                    speakers[new_id] = {"prototypes": [pending_candidate["embedding"]]}
+                    if speech_s >= SPK_MIN_ENROLL_SPEECH_S and cand_sim < SPK_DUPLICATE_PROTOTYPE_SIM:
+                        _add_prototype(speakers[new_id], embedding)
+                    decision = "confirm_new"
+                    result_speaker = new_id
+                    confirmed_pending_seq = pending_candidate["seq"]
+                    session["pending_candidate"] = None
+                    # MUHIM: tentative_id ENDI haqiqiy spiker sifatida
+                    # "iste'mol qilindi" — next_id shuni hisobga olib
+                    # oldinga surilishi SHART, aks holda keyingi pending
+                    # nomzod xuddi shu ID'ni qayta ishlatib, ENDI MAVJUD
+                    # spikerning prototiplarini ustiga YOZIB yuborgan
+                    # bo'lardi (real testda topilgan xato).
+                    session["next_id"] = max(session["next_id"], new_id + 1)
                 else:
-                    profile["embeddings"].append(embedding)
-                    _recompute_voice_centroid(profile)
-                    logger.info(f"[SPK][DEBUG] {winner!r} ovoz profili yangilandi "
-                        f"(lang_prob={lang_prob:.2f} >= {CENTROID_UPDATE_MIN_LANG_PROB})")
-            elif embedding is not None:
-                logger.info(f"[SPK][DEBUG] {winner!r} g'olib, lekin markaz YANGILANMADI "
-                    f"(lang_prob={lang_prob:.2f} < {CENTROID_UPDATE_MIN_LANG_PROB})")
+                    tentative_id = session["next_id"]
+                    session["pending_candidate"] = {
+                        "tentative_id": tentative_id,
+                        "embedding": embedding,
+                        "speech_s": speech_s,
+                        "seq": seq,
+                    }
+                    decision = "pending"
+                    result_speaker = tentative_id
+                    uncertain = True
+                    pending = True
+            else:
+                # best < SPK_NEW (yoki spiker yo'q) VA nutq qisqa.
+                if best_id is not None:
+                    decision = "uncertain"
+                    result_speaker = best_id
+                    uncertain = True
+                else:
+                    # Sessiyaning eng boshi, lekin birinchi gap juda qisqa —
+                    # tizim hech qachon "spiker yo'q" holatida qolib
+                    # ketmasligi uchun 1-spiker shunchaki uncertain bilan
+                    # ochiladi (prototip SPK_MIN_ENROLL_SPEECH_S talabi
+                    # bajarilmagani uchun hali qo'shilmaydi).
+                    new_id = session["next_id"]
+                    session["next_id"] += 1
+                    speakers[new_id] = {"prototypes": []}
+                    decision = "new_short"
+                    result_speaker = new_id
+                    uncertain = True
+
+            session["last_speaker"] = result_speaker
+
+            sims_str = ", ".join(f"{sid}:{sim:.2f}" for sid, sim in sims.items())
+            if cand_sim is not None:
+                sims_str = f"{sims_str}, " if sims_str else ""
+                sims_str += f"cand:{cand_sim:.2f}"
+            best_str = f"{best_id}({best_sim:.2f})" if best_id is not None else "none"
+            proto_str = ", ".join(f"{sid}:{len(p['prototypes'])}" for sid, p in speakers.items())
+            logger.info(
+                f"[SPK] seq={seq} speech={speech_s:.2f}s turn={turn_s:.2f}s lang={detected_lang!r} "
+                f"sims={{{sims_str}}} best={best_str} decision={decision} speaker={result_speaker} "
+                f"uncertain={uncertain} prototypes={{{proto_str}}} "
+                f"thresholds=(accept={SPK_ACCEPT},new={SPK_NEW})"
+            )
 
             wav_filename = _save_debug_audio_async(
-                trimmed, sample_rate, duration_s, trimmed_rms,
-                f"speaker_{winner}_conflict" if conflict else f"speaker_{winner}",
+                trimmed, sample_rate, speech_s, trimmed_rms, f"speaker_{result_speaker}_{decision}"
             )
             if debug_label_out is not None:
                 debug_label_out["wav_filename"] = wav_filename
-            return winner, debug_info
+
+            return {
+                "speaker": result_speaker,
+                "uncertain": uncertain,
+                "pending": pending,
+                "decision": decision,
+                "confirmed_pending_seq": confirmed_pending_seq,
+            }
     except Exception as e:
         logger.error(f"[SPK][ERROR] identify_speaker raised {e!r}")
         raise
 
 
-def both_slots_bound(session) -> bool:
-    """A VA B ikkisi ham allaqachon OVOZ PROFILIGA ega (founded) — ya'ni
-    suhbatdagi ikkita spikerning ovoz "imzosi" aniq. dialog.py'dagi "fast
-    path" uchun ishlatiladi: shu holatda juda qisqa/juda past-energiyali
+def has_known_speakers(session) -> bool:
+    """dialog.py'dagi "fast path" uchun — kamida BITTA spiker uchun ovoz
+    profili allaqachon mavjud bo'lsa, juda qisqa/juda past-energiyali
     (frontend VAD'ning past chegarasi tufayli shovqindan ham "nutq" deb
     yuborilgan bo'lishi mumkin bo'lgan) audio bo'laklarini STT/embedding'ga
-    yubormasdan oldin saralab tashlash mumkin."""
+    yubormasdan oldin saralab tashlash mumkin. Eski (A/B ikki slot
+    to'lgan-to'lmaganini tekshiruvchi) `both_slots_bound()`dan farqli —
+    endi spikerlar soni cheklanmagani uchun "kamida bitta spiker bor"
+    yetarli signal."""
     with session["lock"]:
-        return "A" in session["voices"] and "B" in session["voices"]
+        return len(session["speakers"]) > 0
 
 
-def enroll_speaker(session, speaker: str, wav: np.ndarray, sample_rate: int) -> None:
-    """KEYINGI ISH uchun joy (DIALOG_PLAN.md 2-bosqich, ixtiyoriy band):
-    til tanlangandan keyin, suhbat boshlanishidan OLDIN, har bir spiker
-    3-4 soniya namunaviy gapirib "ro'yxatdan o'tishi" (enrollment) orqali
-    ovoz profilini SUHBAT boshidanoq, til signaliga bog'liq bo'lmay turib
-    tayyorlab qo'yish mumkin — bu sovuq-start muammosini (suhbatning
-    birinchi bir-ikki turnida hali hech kim uchun ovoz profili yo'qligi,
-    shuning uchun qaror butunlay til signaliga tayanishi) butunlay hal
-    qiladi.
+def apply_speaker_correction(session, wav: np.ndarray, sample_rate: int, target_speaker) -> int:
+    """Har bir bubble'dagi "spikerni almashtirish" menyusi uchun —
+    foydalanuvchi mavjud spikerlardan birini YOKI "Yangi spiker"ni
+    tanlaganda chaqiriladi (dialog.py, `correct_speaker` action).
+    `target_speaker` — mavjud spiker ID (int) yoki literal `"new"` satri.
 
-    Hozircha TO'LIQ ishlatilmaydi — na dialog.py (websocket oqimi), na
-    frontend (UI qadam/tugma) buni chaqirmaydi; bu shunchaki tayyor,
-    ishlaydigan backend funksiyasi, keyingi bosqichda ulash uchun.
-    Enrollment paytida foydalanuvchi ANIQ KIM ekanini UI orqali (masalan
-    "A, hozir 3 soniya gapiring" ko'rsatmasi bilan) o'zi tasdiqlagan
-    bo'ladi — shuning uchun bu yerda til-ishonch tekshiruvi (CENTROID_
-    UPDATE_MIN_LANG_PROB) shart emas, berilgan audio to'g'ridan-to'g'ri
-    "founding" namuna sifatida qabul qilinadi."""
-    embedding = _embed(session["embedding_model"], wav)
-    with session["lock"]:
-        session["voices"][speaker] = {
-            "founding_embedding": embedding,
-            "embeddings": collections.deque(maxlen=CENTROID_BUFFER_SIZE),
-            "centroid": embedding,
-        }
-    logger.info(f"[SPK][ENROLL] {speaker!r} uchun ovoz profili enrollment orqali tashkil topdi")
-
-
-def apply_speaker_correction(session, wav: np.ndarray, sample_rate: int, speaker: str) -> None:
-    """DIALOG_PLAN.md 4-bosqich: har bir bubble'dagi "spikerni almashtirish"
-    tugmasi uchun — foydalanuvchi "bu A emas, B edi" deb TUZATGANDA
-    chaqiriladi (dialog.py, `correct_speaker` action). Foydalanuvchining
-    o'zi tasdiqlagani — identify_speaker()dagi til/ovoz balli yoki
-    CENTROID_UPDATE_MIN_LANG_PROB tekshiruvidan HAM ishonchli signal,
-    shuning uchun enroll_speaker() kabi, hech qanday ishonch chegarasi
-    tekshirilmasdan, embedding to'g'ridan-to'g'ri TO'G'RI spikerning
-    markaziga qo'shiladi.
-
-    Eski (noto'g'ri) spikerning markazidan bu namunani olib tashlash
-    amalga oshirilmaydi (qaysi namuna ekanini qidirib topish/pop qilish
-    keraksiz murakkablik qo'shardi) — bu YETARLI, chunki markaz so'nggi
-    CENTROID_BUFFER_SIZE namunaning o'rtachasi, bitta noto'g'ri namunaning
-    ta'siri keyingi to'g'ri namunalar bilan tezda suyultiriladi."""
+    Foydalanuvchining o'zi tasdiqlagani — identify_speaker()dagi avtomatik
+    qarordan HAM ishonchli signal, shuning uchun hech qanday o'xshashlik
+    chegarasi tekshirilmasdan, embedding to'g'ridan-to'g'ri TO'G'RI
+    spikerning prototiplariga qo'shiladi. Qaytaradi: YAKUNIY spiker ID
+    (target_speaker="new" bo'lsa, yangi ajratilgan ID)."""
     trimmed = _trim_trailing_silence(wav, sample_rate)
     duration_s = len(trimmed) / sample_rate
     original_duration_s = len(wav) / sample_rate
     if trimmed.size > 0 and duration_s < MIN_TRIMMED_DURATION_S and duration_s < original_duration_s:
         trimmed = wav
         duration_s = original_duration_s
-    if duration_s < MIN_TRIMMED_DURATION_S:
-        logger.info(
-            f"[SPK][CORRECT] audio juda qisqa ({duration_s:.2f}s) — {speaker!r} markazi yangilanmadi"
-        )
-        return
 
     with session["lock"]:
-        embedding = _embed(session["embedding_model"], trimmed)
-        profile = session["voices"].get(speaker)
+        if target_speaker == "new":
+            target_speaker = session["next_id"]
+            session["next_id"] += 1
+
+        if duration_s < MIN_TRIMMED_DURATION_S:
+            logger.info(
+                f"[SPK][CORRECT] audio juda qisqa ({duration_s:.2f}s) — speaker={target_speaker} "
+                f"uchun prototip QO'SHILMADI"
+            )
+            if target_speaker not in session["speakers"]:
+                session["speakers"][target_speaker] = {"prototypes": []}
+            session["last_speaker"] = target_speaker
+            return target_speaker
+
+        embedding = _embed(trimmed, sample_rate)
+        profile = session["speakers"].get(target_speaker)
         if profile is None:
-            session["voices"][speaker] = {
-                "founding_embedding": embedding,
-                "embeddings": collections.deque(maxlen=CENTROID_BUFFER_SIZE),
-                "centroid": embedding,
-            }
+            session["speakers"][target_speaker] = {"prototypes": [embedding]}
         else:
-            profile["embeddings"].append(embedding)
-            _recompute_voice_centroid(profile)
-    logger.info(f"[SPK][CORRECT] {speaker!r} markazi foydalanuvchi tuzatishi orqali yangilandi")
+            _add_prototype(profile, embedding)
+        session["last_speaker"] = target_speaker
+
+    logger.info(f"[SPK][CORRECT] speaker={target_speaker} — foydalanuvchi tuzatishi orqali prototip qo'shildi")
+    return target_speaker
+
+
+def remove_speaker(session, speaker_id) -> None:
+    """delete_turn uchun — dialog.py, shu spikerni "ochgan" (yagona) turn
+    o'chirilganda, shu spikerning ENDI hech qanday turn'ga tegishli
+    emasligini tekshirgandan KEYIN chaqiradi. Spiker profilini, agar u
+    hozirgi `pending_candidate`/`last_speaker` bo'lsa, shu holatlardan ham
+    tozalaydi — aks holda o'chirilgan spiker "jim" holda sessiya holatida
+    osilib qolgan bo'lardi."""
+    with session["lock"]:
+        if speaker_id in session["speakers"]:
+            del session["speakers"][speaker_id]
+            logger.info(f"[SPK][DELETE] speaker={speaker_id} profili o'chirildi")
+        if session["last_speaker"] == speaker_id:
+            session["last_speaker"] = None
+        if session["pending_candidate"] is not None and session["pending_candidate"]["tentative_id"] == speaker_id:
+            session["pending_candidate"] = None

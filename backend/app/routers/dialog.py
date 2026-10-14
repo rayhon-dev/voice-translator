@@ -17,7 +17,8 @@ from app.models.speaker_diart import (
     create_session,
     identify_speaker,
     apply_speaker_correction,
-    both_slots_bound,
+    remove_speaker,
+    has_known_speakers,
     save_turn_label,
 )
 from app.models.translator import translate_text
@@ -28,6 +29,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Til tanlash bosqichi olib tashlangani uchun sessiya tillari doim FAQAT
+# shu ikkisi — STT'ga (Whisper yo'lida) nomzod sifatida beriladi,
+# pair_mass/lang_prob filtri shu ikkisidan TASHQARI tilni rad etadi
+# (qarang stt.py).
+SESSION_LANGS = ["en", "ru"]
+
 # DIALOG_PLAN.md 1-bosqich (B2/B3): avvalgi VERY_LOW_CONFIDENCE_LANG_PROB
 # (0.3) va SHORT_TEXT_MIN_PROB (0.5) chegaralari OLIB TASHLANDI. Ular
 # transcribe_audio()'dan qaytgan lang_prob'ga (xom, ~99-tilli taqsimotdan
@@ -35,12 +42,9 @@ router = APIRouter()
 # qiymat) tayangan edi — bunday mutlaq chegara ko'plab haqiqiy gaplarni
 # ham rad etardi. Endi gallyutsinatsiyaga qarshi himoya transcribe_audio()
 # ICHIDA (stt.py: no_speech_prob/avg_logprob/compression_ratio + fantom-
-# ibora ro'yxati) amalga oshiriladi. Shu yerda qoladigan bitta chegara —
-# pastda, tarjima qilish-qilmaslik qarori uchun ishlatiladi (2-bosqichdan
-# keyin, lang_prob endi 2-til-normallashtirilgan bo'lgani uchun ANCHA
-# ishonchli signal; speaker_diart.py'dagi CENTROID_UPDATE_MIN_LANG_PROB
-# bilan ADASHTIRMASLIK kerak — u OVOZ profilini yangilash uchun, bu esa
-# TARJIMA uchun alohida chegara).
+# ibora ro'yxati + MIN_PAIR_MASS/MIN_LANG_PROB) amalga oshiriladi. Shu
+# yerda qoladigan bitta chegara — pastda, tarjima qilish-qilmaslik qarori
+# uchun ishlatiladi.
 LANGUAGE_MATCH_MIN_PROB = 0.15
 
 # Frontend VAD gapning OXIRIDAGI tabiiy ovoz pasayishini ba'zan erta jimlik
@@ -65,36 +69,36 @@ MERGE_CONTINUATION_MAX_DURATION_S = 3.0
 # yuborilsa, pastdagi RETRO_MERGE_WINDOW_S (STT/tarjimadan KEYIN, kechikish
 # QO'SHMASDAN birlashtiradigan mexanizm) buni qoplaydi.
 #
-# RETROAKTIV BIRLASHTIRISH: agar BIR XIL spiker (BIR XIL tilda) oldingi
-# turn frontendga yuborilgandan keyin shu vaqt ICHIDA yana gapirsa — buni
-# YANGI, alohida kutish bilan emas, oldingi (allaqachon yuborilgan) turn
-# matniga qo'shib, BUTUN matn uchun tarjimani qayta qilib, XUDDI SHU seq
-# bilan yangilangan "turn" sifatida yuboramiz (frontend'dagi upsert
-# mantiqi — useDialogSession.js — buni yangi bubble emas, mavjudini
-# almashtiruvchi deb qabul qiladi). Bu MERGE_GAP_S'dan ANCHA uzoqroq oyna
-# (2.5s) — chunki endi hech qanday qo'shimcha KUTISH yo'q, navbat DARHOL
-# qayta ishlanadi, faqat natija KEYINROQ (agar kerak bo'lsa) birlashtiriladi.
+# RETROAKTIV BIRLASHTIRISH: agar BIR XIL spiker (OVOZ QARORI bo'yicha, BIR
+# XIL tilda) oldingi turn frontendga yuborilgandan keyin shu vaqt ICHIDA
+# yana gapirsa — buni YANGI, alohida kutish bilan emas, oldingi
+# (allaqachon yuborilgan) turn matniga qo'shib, BUTUN matn uchun tarjimani
+# qayta qilib, XUDDI SHU seq bilan yangilangan "turn" sifatida yuboramiz
+# (frontend'dagi upsert mantiqi — useDialogSession.js — buni yangi bubble
+# emas, mavjudini almashtiruvchi deb qabul qiladi). Bu MERGE_GAP_S'dan
+# ANCHA uzoqroq oyna (2.5s) — chunki endi hech qanday qo'shimcha KUTISH
+# yo'q, navbat DARHOL qayta ishlanadi, faqat natija KEYINROQ (agar kerak
+# bo'lsa) birlashtiriladi.
 RETRO_MERGE_WINDOW_S = 2.5
 
 # Frontend VAD'ning SPEECH_RMS_THRESHOLD'i (useDialogSession.js) gap-oxiri
 # so'zlarini kesib yubormasligi uchun atayin past qo'yilgan — buning oqibati,
 # real suhbatda juda ko'p sonli, past-energiyali shovqin bo'lagi ham "nutq
 # boshlandi" deb serverga yuborilishi (har biri trim/RMS/embedding/STT
-# hisoblashini talab qiladi). Bunga backend tarafdan ikkita slot (A, B)
-# ALLAQACHON ovoz profiliga ega bo'lgandan KEYIN (ya'ni yangi spiker endi
-# umuman kutilmaydigan holatda) qo'yiladigan "fast path": agar audio ham
-# QISQA ham JUDA PAST energiyali bo'lsa, STT/embedding'ga umuman
-# yubormasdan, darhol shovqin deb rad etiladi. Maqsad — nutqni noto'g'ri
-# rad etish emas, balki aniq-ravshan shovqinni protsessor/tarmoq
-# sarflamasdan saralab tashlash, shuning uchun chegaralar ATAYLAB
+# hisoblashini talab qiladi). Bunga backend tarafdan KAMIDA BITTA spiker
+# uchun ovoz profili ALLAQACHON mavjud bo'lgandan KEYIN qo'yiladigan "fast
+# path": agar audio ham QISQA ham JUDA PAST energiyali bo'lsa, STT/
+# embedding'ga umuman yubormasdan, darhol shovqin deb rad etiladi. Maqsad —
+# nutqni noto'g'ri rad etish emas, balki aniq-ravshan shovqinni protsessor/
+# tarmoq sarflamasdan saralab tashlash, shuning uchun chegaralar ATAYLAB
 # konservativ (juda past RMS, juda qisqa davomiylik) tanlangan — hatto
 # past ovozli haqiqiy nutq ham bu yerdan xavfsiz o'tib ketishi uchun.
 FAST_PATH_MAX_DURATION_S = 2.0
 FAST_PATH_MAX_RMS = 0.01
 
-# DIALOG_PLAN.md 4-bosqich: "spikerni almashtirish" tuzatishi uchun qancha
-# oxirgi turn xotirada (audio bilan) saqlanadi — uzoq suhbatda xotira
-# cheksiz o'smasligi uchun chegara.
+# DIALOG_PLAN.md 4-bosqich: "spikerni almashtirish"/delete tuzatishi uchun
+# qancha oxirgi turn xotirada (audio bilan) saqlanadi — uzoq suhbatda
+# xotira cheksiz o'smasligi uchun chegara.
 MAX_TURN_HISTORY = 50
 
 
@@ -104,25 +108,22 @@ async def websocket_dialog(websocket: WebSocket):
     loop = asyncio.get_running_loop()
 
     state = {
-        "phase": "await_lang_a",
-        "speaker_langs": {},
-        "diart_session": create_session(),
+        "phase": "listening",
+        "speaker_session": create_session(),
         "turn_seq": 0,
         # Hali dispatch qilinmagan, davom bo'lagi kelishi mumkinligi uchun
         # kutilayotgan navbat: {"wav": np.ndarray, "seq": int, "dispatch_task": Task}
         "pending": None,
-        # DIALOG_PLAN.md 4-bosqich: "spikerni almashtirish" tugmasi uchun —
-        # muvaffaqiyatli ko'rsatilgan HAR BIR turnning audiosi/matni shu
-        # yerda seq bo'yicha saqlanadi, correct_speaker action shundan
-        # qayta tarjima qilish va markazni to'g'rilash uchun foydalanadi.
-        # MAX_TURN_HISTORY'dan oshganda eng eskisi tashlab yuboriladi —
-        # uzoq sessiyada xotira cheksiz o'smasligi uchun.
+        # "spikerni almashtirish"/delete_turn tugmalari uchun — muvaffaqiyatli
+        # ko'rsatilgan HAR BIR turnning audiosi/matni/tarjimasi shu yerda seq
+        # bo'yicha saqlanadi. MAX_TURN_HISTORY'dan oshganda eng eskisi
+        # tashlab yuboriladi — uzoq sessiyada xotira cheksiz o'smasligi uchun.
         "turn_history": {},
-        # RETROAKTIV BIRLASHTIRISH uchun: har bir spiker uchun MUVAFFAQIYATLI
-        # yuborilgan ("turn" statusi bilan) ENG SO'NGGI natija — {"seq":,
-        # "lang":, "sent_at": time.monotonic()}. process_turn() yangi
-        # navbatni shu bilan solishtirib, birlashtirish kerakligini
-        # aniqlaydi (qarang RETRO_MERGE_WINDOW_S izohi yuqorida).
+        # RETROAKTIV BIRLASHTIRISH uchun: har bir spiker (ID) uchun
+        # MUVAFFAQIYATLI yuborilgan ("turn" statusi bilan) ENG SO'NGGI
+        # natija — {"seq":, "lang":, "sent_at": time.monotonic()}.
+        # process_turn() yangi navbatni shu bilan solishtirib, birlashtirish
+        # kerakligini aniqlaydi (qarang RETRO_MERGE_WINDOW_S izohi yuqorida).
         "last_turn_by_speaker": {},
     }
     # DIALOG_PLAN.md 1-bosqich (D1): navbatlar endi shu YAGONA FIFO navbat
@@ -135,6 +136,32 @@ async def websocket_dialog(websocket: WebSocket):
             await websocket.send_json({"status": message, **extra})
         except Exception:
             pass
+
+
+    def _trim_turn_history():
+        history = state["turn_history"]
+        while len(history) > MAX_TURN_HISTORY:
+            del history[min(history)]
+
+
+    async def _resend_turn(seq: int, entry: dict) -> None:
+        """Mavjud (turn_history'da saqlangan) bir turnni XUDDI SHU seq
+        bilan qayta yuboradi — frontend'dagi upsert mantiqi buni yangi
+        bubble emas, mavjudining o'rnini bosuvchi deb qabul qiladi. Yangi
+        spiker nomzodi TASDIQLANGANDA (identify_speaker'dan
+        confirmed_pending_seq) va correct_speaker/ qo'lda tuzatishda
+        ishlatiladi — ikkalasida ham tarjima/matn O'ZGARMAYDI, FAQAT
+        spiker/uncertain bayrog'i yangilanadi."""
+        await send_status(
+            "turn",
+            seq=seq,
+            speaker=entry["speaker"],
+            original=entry["text"],
+            translation=entry["translation"],
+            source_lang=entry["source_lang"],
+            target_lang=entry["target_lang"],
+            uncertain=entry.get("uncertain", False),
+        )
 
 
     async def process_turn(wav, seq: int):
@@ -151,11 +178,11 @@ async def websocket_dialog(websocket: WebSocket):
             await send_status("turn_skipped", reason="too_short")
             return
 
-        if duration_s < FAST_PATH_MAX_DURATION_S and both_slots_bound(state["diart_session"]):
+        if duration_s < FAST_PATH_MAX_DURATION_S and has_known_speakers(state["speaker_session"]):
             rms = float(np.sqrt(np.mean(wav.astype(np.float64) ** 2)))
             if rms < FAST_PATH_MAX_RMS:
                 logger.info(f"[/ws/dialog] turn skipped (fast_path_noise: duration={duration_s:.2f}s "
-                    f"rms={rms:.4f} < {FAST_PATH_MAX_RMS}, A/B slots allaqachon band) — "
+                    f"rms={rms:.4f} < {FAST_PATH_MAX_RMS}, kamida bitta spiker allaqachon ma'lum) — "
                     f"STT/embedding chaqirilmadi")
                 await send_status("turn_skipped", reason="unknown_speaker")
                 return
@@ -163,26 +190,11 @@ async def websocket_dialog(websocket: WebSocket):
         temp_filename = f"/tmp/{uuid.uuid4()}_turn.wav"
         await loop.run_in_executor(None, _write_wav, temp_filename, wav)
 
-        # DIALOG_PLAN.md 2-bosqich: spiker aniqlash endi TIL va OVOZ
-        # signallarining birlashgan balli orqali hal qilinadi
-        # (speaker_diart.identify_speaker) — shuning uchun STT endi HAR
-        # DOIM, speaker-aniqlashdan OLDIN ishga tushadi (eski koddagi
-        # "faqat founding-sample tekshiruvi uchun shartli STT" mexanizmi
-        # endi kerak emas, shu bilan birga stt_cache ham olib tashlandi).
-        #
-        # DIALOG_PLAN.md 1-bosqich (B1): butun ilovaning SUPPORTED_LANGUAGES
-        # (en/ru/ko) ro'yxati o'rniga, endi FAQAT shu sessiyaning ikki tili
-        # ([langA, langB]) nomzod sifatida beriladi. `state["speaker_langs"]`
-        # bu yerga kelguncha ALLAQACHON ikkalasi ham to'ldirilgan bo'ladi
-        # (phase="listening"ga faqat ikkisi ham tanlangandan keyin
-        # o'tiladi — handle_client_message'ga qarang).
-        session_langs = [state["speaker_langs"]["A"], state["speaker_langs"]["B"]]
-
         t_stt0 = time.perf_counter()
         try:
             try:
                 text, detected_lang, lang_prob, unsupported_language = await loop.run_in_executor(
-                    None, transcribe_audio, temp_filename, None, session_langs
+                    None, transcribe_audio, temp_filename, None, SESSION_LANGS
                 )
             except Exception as e:
                 logger.error(f"[/ws/dialog] turn processing failed: {e!r}")
@@ -198,11 +210,9 @@ async def websocket_dialog(websocket: WebSocket):
         # to'liq decode'ga umuman o'tmay), shuning uchun pastdagi `if not text`
         # bunga "Hech narsa eshitilmadi" deb noto'g'ri sabab berib qo'yardi.
         # Bu yerda identify_speaker() UMUMAN chaqirilmaydi — demak hech bir
-        # spiker centroidi bu turndan ta'sirlanmaydi.
+        # spiker profili bu turndan ta'sirlanmaydi.
         if unsupported_language:
-            logger.info(
-                f"[/ws/dialog] turn skipped (unsupported_language: session_langs={session_langs})"
-            )
+            logger.info(f"[/ws/dialog] turn skipped (unsupported_language: session_langs={SESSION_LANGS})")
             await send_status("turn_skipped", reason="unsupported_language")
             return
 
@@ -212,59 +222,44 @@ async def websocket_dialog(websocket: WebSocket):
             await send_status("turn_skipped", reason="empty_transcription")
             return
 
+        # SPIKER ANIQLASH — endi FAQAT ovoz asosida, cheklanmagan sonli
+        # onlayn klasterlash (qarang speaker_diart.identify_speaker).
+        # `detected_lang` bu yerga FAQAT [SPK] logiga chiqarish uchun
+        # uzatiladi — qarorga hech qanday ta'sir qilmaydi.
         debug_label: dict = {}
-        speaker, score_debug = await loop.run_in_executor(
+        spk_result = await loop.run_in_executor(
             None,
             identify_speaker,
-            state["diart_session"],
+            state["speaker_session"],
             wav,
             SAMPLE_RATE,
-            state["speaker_langs"],
+            seq,
             detected_lang,
-            lang_prob,
             debug_label,
         )
-
-        if speaker == "ambiguous":
-            # A2 (margin): ikki spikerning balli yetarlicha farqlanmadi —
-            # kim gapirgani ANIQ emas. Bu yerda ATAYLAB taxmin QILINMAYDI;
-            # o'rniga frontendga ALOHIDA sabab ("ambiguous_speaker") +
-            # qo'shimcha ma'lumot (asl matn, seq) yuboriladi — kelajakda
-            # frontend shu yerga "A yoki B?" so'raydigan tanlash tugmasini
-            # qo'shishi mumkin (hozircha faqat skip qilinadi, qarang
-            # useDialogSession.js'dagi SKIP_REASON_MESSAGES).
-            logger.info(f"[/ws/dialog] turn ambiguous (score_debug={score_debug})")
-            save_turn_label(debug_label.get("wav_filename"), speaker=None, lang=detected_lang, text=text)
-            await send_status(
-                "turn_skipped",
-                reason="ambiguous_speaker",
-                seq=seq,
-                original=text,
-                source_lang=detected_lang,
-            )
-            return
+        speaker = spk_result["speaker"]
+        uncertain = spk_result["uncertain"]
 
         save_turn_label(debug_label.get("wav_filename"), speaker=speaker, lang=detected_lang, text=text)
 
-        # Tarjima manbai — bu navbatda HAQIQATDA aniqlangan til (`detected_lang`),
-        # spikerning oldindan tanlagan tili EMAS (masalan odam ikkinchi tilga
-        # o'tib qolsa ham to'g'ri tarjima qilinsin uchun). Yo'nalish esa
-        # suhbatdoshning (ovoz orqali aniqlangan speaker asosida) tanlagan
-        # tili — u har doim shu ikki tildan biri bo'lgani uchun o'zgarishsiz.
+        # Tarjima yo'nalishi ENDI spiker/sessiya tiliga EMAS, FAQAT shu
+        # turnda HAQIQATDA aniqlangan tilga bog'liq — ikki sessiya tili
+        # ([en, ru]) bo'lgani uchun yo'nalish oddiy: en bo'lsa → ru,
+        # ru bo'lsa → en (STT'ning pair_mass/lang_prob filtri source_lang
+        # har doim shu ikkisidan BIRI bo'lishini kafolatlaydi — aks holda
+        # yuqorida `unsupported_language` bilan ALLAQACHON qaytarilgan).
         source_lang = detected_lang
-        other_speaker = "B" if speaker == "A" else "A"
-        target_lang = state["speaker_langs"].get(other_speaker, "en")
+        target_lang = "ru" if source_lang == "en" else "en"
 
         # RETROAKTIV BIRLASHTIRISH (3-band, tezlik tuzatishi): bu navbatni
         # KUTIB TURMASDAN (hech qanday qo'shimcha delay qo'shilmaydi, STT
-        # yuqorida ALLAQACHON tugadi) — agar AYNAN shu spiker AYNAN shu
-        # tilda, oldingi (allaqachon frontendga yuborilgan) natijadan keyin
-        # RETRO_MERGE_WINDOW_S ichida yana gapirgan bo'lsa, bu "yangi gap"
-        # emas, oldingisining DAVOMI deb hisoblanadi: matnlar qo'shiladi,
-        # tarjima BUTUN (birlashtirilgan) matn uchun qayta qilinadi va
-        # natija YANGI bubble emas, ESKI seq bilan "turn" sifatida qaytadi
-        # (useDialogSession.js'dagi upsert shuni mavjud bubble'ni
-        # almashtiradi deb qabul qiladi).
+        # yuqorida ALLAQACHON tugadi) — agar AYNAN shu spiker (OVOZ QARORI
+        # bo'yicha) AYNAN shu tilda, oldingi (allaqachon frontendga
+        # yuborilgan) natijadan keyin RETRO_MERGE_WINDOW_S ichida yana
+        # gapirgan bo'lsa, bu "yangi gap" emas, oldingisining DAVOMI deb
+        # hisoblanadi: matnlar qo'shiladi, tarjima BUTUN (birlashtirilgan)
+        # matn uchun qayta qilinadi va natija YANGI bubble emas, ESKI seq
+        # bilan "turn" sifatida qaytadi.
         merge_seq = None
         merge_prev_entry = None
         last_turn = state["last_turn_by_speaker"].get(speaker)
@@ -292,15 +287,14 @@ async def websocket_dialog(websocket: WebSocket):
             out_wav = wav
 
         if source_lang == target_lang:
-            # Suhbatdosh shu tilni allaqachon tushunadi — tarjima shart emas.
+            # Nazariy jihatdan amalda bo'lmasligi kerak (SESSION_LANGS ikki
+            # XIL til), lekin xavfsizlik uchun saqlanadi.
             translation = out_text
         elif (
             source_lang not in NLLB_LANG_CODES
             or target_lang not in NLLB_LANG_CODES
             or lang_prob < LANGUAGE_MATCH_MIN_PROB
         ):
-            # NLLB bu tilni qo'llamaydi yoki aniqlash ishonchi juda past —
-            # noto'g'ri/buzilgan tarjima chiqarish o'rniga asl matn ko'rsatiladi.
             logger.info(f"[/ws/dialog] translation skipped (source_lang={source_lang!r} "
                 f"target_lang={target_lang!r} lang_prob={lang_prob:.2f}) — showing original text")
             translation = out_text
@@ -311,31 +305,21 @@ async def websocket_dialog(websocket: WebSocket):
                     None, translate_text, out_text, target_lang, source_lang
                 )
             except Exception as e:
-                # DIALOG_PLAN.md 1-bosqich (D2): ilgari bu yerda shunchaki
-                # `return` qilinardi — frontendga HECH NARSA yuborilmasdan,
-                # turn "yo'qolib" qolardi (foydalanuvchi hatto "eshitilmadi"
-                # degan xabarni ham ko'rmasdi). Endi boshqa skip-sabablar
-                # bilan BIR XIL tarzda turn_skipped yuboriladi.
                 logger.error(f"[/ws/dialog] translation failed: {e!r}")
                 await send_status("turn_skipped", reason="translation_error")
                 return
             mt_elapsed = time.perf_counter() - t_mt0
 
-        # DIALOG_PLAN.md 4-bosqich: "spikerni almashtirish" tugmasi uchun
-        # — foydalanuvchi keyinroq shu turnni tuzatsa, qayta tarjima
-        # qilish/markazni to'g'rilash uchun kerak bo'ladigan hamma narsa
-        # shu yerda saqlanadi (qarang handle_client_message'dagi
-        # `correct_speaker`). Birlashtirilgan holatda ESKI seq ustidan
-        # YOZILADI (yangi seq uchun alohida yozuv OCHILMAYDI).
         state["turn_history"][out_seq] = {
             "wav": out_wav,
             "speaker": speaker,
             "text": out_text,
-            "detected_lang": source_lang,
+            "translation": translation,
+            "source_lang": source_lang,
+            "target_lang": target_lang,
+            "uncertain": uncertain,
         }
-        history = state["turn_history"]
-        while len(history) > MAX_TURN_HISTORY:
-            del history[min(history)]
+        _trim_turn_history()
 
         # Keyingi davomlar shu (yangilangan) seq'ga qarab zanjirlansin —
         # 3-chi bo'lak ham 2.5s ichida kelsa, u ham AYNAN shu bubble'ga
@@ -346,35 +330,39 @@ async def websocket_dialog(websocket: WebSocket):
             "sent_at": time.monotonic(),
         }
 
+        # YANGI SPIKER NOMZODI TASDIQLANDI (identify_speaker'ning
+        # "confirm_new" qarori) — ESKI (pending) turn ENDI haqiqiy spiker
+        # bilan, uncertain=False holda qayta yuboriladi. `result_speaker`
+        # confirm_new holatida ESKI pending turn'da ko'rsatilgan bilan
+        # XUDDI SHU raqam (tentative_id) bo'lgani uchun — faqat uncertain
+        # bayrog'i o'zgaradi.
+        confirmed_pending_seq = spk_result.get("confirmed_pending_seq")
+        if confirmed_pending_seq is not None:
+            old_entry = state["turn_history"].get(confirmed_pending_seq)
+            if old_entry is not None:
+                old_entry["uncertain"] = False
+                old_entry["speaker"] = speaker
+                await _resend_turn(confirmed_pending_seq, old_entry)
+                logger.info(
+                    f"[/ws/dialog] pending speaker nomzodi TASDIQLANDI: seq={confirmed_pending_seq} "
+                    f"speaker={speaker} (joriy turn seq={seq} orqali)"
+                )
+
         logger.info(
             f"[TURN] seq={out_seq} audio={duration_s:.2f}s stt={stt_elapsed:.2f}s "
             f"mt={mt_elapsed:.2f}s total={time.perf_counter() - t_turn_start:.2f}s "
-            f"merged={merge_prev_entry is not None}"
+            f"merged={merge_prev_entry is not None} speaker={speaker} uncertain={uncertain} "
+            f"decision={spk_result['decision']}"
         )
 
-        await send_status(
-            "turn",
-            seq=out_seq,
-            speaker=speaker,
-            original=out_text,
-            translation=translation,
-            source_lang=source_lang,
-            target_lang=target_lang,
-            # REAL TESTDA TOPILGAN MUAMMO (3-band): til va ovoz ZID bo'lsa
-            # (identify_speaker'dagi VOICE_CONFLICT_MARGIN tekshiruvi),
-            # natija hali ham ko'rsatiladi (til bo'yicha), lekin frontend
-            # bu bayroqni ko'rib bubble'da "⚠ spiker noaniq" belgisini
-            # chiqaradi — foydalanuvchi kerak bo'lsa "spikerni almashtirish"
-            # orqali qo'lda to'g'rilashi mumkin.
-            conflict=bool(score_debug.get("conflict", False)),
-        )
+        await _resend_turn(out_seq, state["turn_history"][out_seq])
 
 
     async def turn_worker():
         """DIALOG_PLAN.md 1-bosqich (D1): navbatlar endi SESSIYA BO'YICHA
         KETMA-KET, shu YAGONA worker tomonidan qayta ishlanadi. Ilgari har
         bir navbat alohida `asyncio.create_task()` bilan PARALLEL ishga
-        tushirilardi — bu klaster yaratish/A-B bog'lash tartibini qaysi
+        tushirilardi — bu klaster yaratish/spiker bog'lash tartibini qaysi
         navbat birinchi TUGASHIGA (STT/tarjima vaqti uzunlikka qarab farq
         qiladi) bog'liq qilib qo'yardi, natija har safar boshqacha chiqishi
         mumkin edi; GPU baribir bitta bo'lgani uchun parallellikdan tezlik
@@ -548,17 +536,7 @@ async def websocket_dialog(websocket: WebSocket):
 
         action = msg.get("action")
 
-        if action == "set_language" and state["phase"] in ("await_lang_a", "await_lang_b"):
-            if state["phase"] == "await_lang_a":
-                state["speaker_langs"]["A"] = msg.get("lang", "en")
-                state["phase"] = "await_lang_b"
-                await send_status("awaiting_language", speaker="B")
-            else:
-                state["speaker_langs"]["B"] = msg.get("lang", "en")
-                state["phase"] = "listening"
-                await send_status("listening_started")
-
-        elif action == "turn_meta":
+        if action == "turn_meta":
             # TEZLIK TUZATISHI: frontend har bir turn audio'sidan OLDIN shuni
             # yuboradi (useDialogSession.js'dagi sendTurnAudio) — keyingi
             # binary chunk uchun "reason" (silence/max_duration) shu yerda
@@ -570,57 +548,69 @@ async def websocket_dialog(websocket: WebSocket):
             await websocket.close()
 
         elif action == "correct_speaker" and state["phase"] == "listening":
-            # DIALOG_PLAN.md 4-bosqich: har bir bubble'dagi "⇄ spikerni
-            # almashtirish" tugmasi — foydalanuvchi "bu A emas, B edi"
-            # deb bosganda shu yerga keladi. Saqlangan turn_history
-            # yozuvidan (process_turn'ga qarang) spikerni almashtiramiz,
-            # YO'NALISHI teskari bo'lgani uchun tarjimani QAYTA bajaramiz
-            # va to'g'ri spikerning ovoz markazini yangilaymiz — natija
-            # frontendga XUDDI SHU `seq` bilan "turn" sifatida qayta
-            # yuboriladi (useDialogSession.js buni yangi bubble emas,
-            # MAVJUD bubble'ning o'rnini bosuvchi deb qabul qiladi).
+            # Har bir bubble'dagi "spikerni almashtirish" kichik menyusi —
+            # foydalanuvchi mavjud spikerlardan BIRINI yoki "Yangi spiker"ni
+            # tanlaganda shu yerga keladi. `target_speaker` — mavjud spiker
+            # ID (int) yoki literal "new" satri (frontend shuni yuboradi).
+            # Tarjima yo'nalishi ENDI spikerga emas, FAQAT aniqlangan tilga
+            # bog'liq bo'lgani uchun — bu yerda tarjima QAYTA QILINMAYDI,
+            # faqat spiker yorlig'i/ovoz profili yangilanadi.
             seq = msg.get("seq")
+            target_speaker = msg.get("target_speaker")
             entry = state["turn_history"].get(seq)
             if entry is None:
                 logger.info(f"[/ws/dialog] correct_speaker: seq={seq} topilmadi (eskirgan?)")
                 return
+            if target_speaker is None:
+                logger.info(f"[/ws/dialog] correct_speaker: target_speaker berilmagan (seq={seq})")
+                return
 
-            new_speaker = "B" if entry["speaker"] == "A" else "A"
-            other_speaker = "A" if new_speaker == "B" else "B"
-            source_lang = entry["detected_lang"]
-            target_lang = state["speaker_langs"].get(other_speaker, "en")
-            text = entry["text"]
-
-            if source_lang == target_lang:
-                translation = text
-            elif source_lang not in NLLB_LANG_CODES or target_lang not in NLLB_LANG_CODES:
-                translation = text
-            else:
-                try:
-                    translation = await loop.run_in_executor(
-                        None, translate_text, text, target_lang, source_lang
-                    )
-                except Exception as e:
-                    logger.error(f"[/ws/dialog] correct_speaker: translation failed: {e!r}")
-                    return
+            old_speaker = entry["speaker"]
+            new_speaker = await loop.run_in_executor(
+                None, apply_speaker_correction, state["speaker_session"], entry["wav"], SAMPLE_RATE, target_speaker
+            )
 
             entry["speaker"] = new_speaker
-            await loop.run_in_executor(
-                None, apply_speaker_correction, state["diart_session"], entry["wav"], SAMPLE_RATE, new_speaker
+            entry["uncertain"] = False
+            if state["last_turn_by_speaker"].get(old_speaker, {}).get("seq") == seq:
+                del state["last_turn_by_speaker"][old_speaker]
+            state["last_turn_by_speaker"][new_speaker] = {
+                "seq": seq,
+                "lang": entry["source_lang"],
+                "sent_at": time.monotonic(),
+            }
+            logger.info(f"[/ws/dialog] correct_speaker: seq={seq} {old_speaker} -> {new_speaker}")
+            await _resend_turn(seq, entry)
+
+        elif action == "delete_turn" and state["phase"] == "listening":
+            # Har bir bubble'dagi 🗑 tugmasi — turn butunlay o'chiriladi.
+            # Agar shu turn (yagona namunasi sifatida) biror spikerni
+            # "ochgan" bo'lsa VA endi boshqa hech qanday turn shu spikerga
+            # tegishli bo'lmasa — spiker profili ham o'chiriladi (aks holda
+            # "hech kimga tegishli bo'lmagan" spiker sessiya oxirigacha
+            # xotirada osilib qolardi).
+            seq = msg.get("seq")
+            entry = state["turn_history"].pop(seq, None)
+            if entry is None:
+                logger.info(f"[/ws/dialog] delete_turn: seq={seq} topilmadi (eskirgan?)")
+                return
+
+            deleted_speaker = entry["speaker"]
+            still_used = any(e["speaker"] == deleted_speaker for e in state["turn_history"].values())
+            if not still_used:
+                await loop.run_in_executor(None, remove_speaker, state["speaker_session"], deleted_speaker)
+
+            if state["last_turn_by_speaker"].get(deleted_speaker, {}).get("seq") == seq:
+                del state["last_turn_by_speaker"][deleted_speaker]
+
+            logger.info(
+                f"[/ws/dialog] delete_turn: seq={seq} speaker={deleted_speaker} "
+                f"speaker_removed={not still_used}"
             )
-
-            await send_status(
-                "turn",
-                seq=seq,
-                speaker=new_speaker,
-                original=text,
-                translation=translation,
-                source_lang=source_lang,
-                target_lang=target_lang,
-            )
+            await send_status("turn_deleted", seq=seq)
 
 
-    await send_status("awaiting_language", speaker="A")
+    await send_status("listening_started")
 
     try:
         await receiver()
