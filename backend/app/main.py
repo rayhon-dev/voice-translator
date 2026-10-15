@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
 
     warmups = (
         ("Whisper (STT)", stt.warmup),
-        ("NLLB (translation)", translator.warmup),
+        ("translation (DeepL + NLLB-600M)", translator.warmup),
         ("pyannote/speechbrain (speaker ID)", speaker_diart.warmup),
         ("MMS-TTS (ru/en)", tts.warmup),
     )

@@ -194,7 +194,7 @@ def run_session(debug_dir: str):
         # DIALOG_PLAN.md 2-bosqich: dialog.py'dagi kabi, STT endi HAR DOIM
         # speaker-aniqlashdan OLDIN ishga tushadi (til identify_speaker()
         # uchun ASOSIY signallardan biri, shuning uchun oldindan kerak).
-        text, detected_lang, lang_prob, unsupported_language = transcribe_audio(wav_path, None, session_langs)
+        text, detected_lang, lang_prob, unsupported_language, _stt_diag = transcribe_audio(wav_path, None, session_langs)
         text = (text or "").strip()
 
         if unsupported_language:

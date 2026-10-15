@@ -19,6 +19,8 @@ export default function DialogBubble({
   lightBgClass, // "bg-X-50" — bubble foni spiker rangida (juda ochiq)
   grouped,
   uncertain,
+  mtProvider, // "deepl" | "nllb" | null — tarjima qaysi provayder orqali qilingani
+  translationError, // true — DeepL VA NLLB ikkisi ham muvaffaqiyatsiz bo'ldi
   knownSpeakers, // [{ id, name, dotClass }] — joriy bubble spikeri ISTISNO qilingan
   audioError,
   onSelectSpeaker, // (targetSpeaker: number | "new") => void
@@ -63,6 +65,11 @@ export default function DialogBubble({
   const cancelNameEdit = () => {
     setIsEditingName(false);
   };
+
+  // Tarjima: DeepL (asosiy) + NLLB-600M (zaxira) — qaysi provayder shu
+  // bubble'ni tarjima qilgani juda kichik kulrang belgi bilan ko'rsatiladi.
+  const PROVIDER_LABELS = { deepl: "DeepL", nllb: "lokal" };
+  const providerLabel = PROVIDER_LABELS[mtProvider];
 
   const avatar = (
     <div
@@ -172,7 +179,10 @@ export default function DialogBubble({
         <div className="flex items-start gap-3 pt-3 border-t border-gray-200/50">
           <button
             onClick={onPlayAudio}
-            className="shrink-0 w-9 h-9 rounded-full text-white flex items-center justify-center hover:scale-105 transition-transform bg-purple-400"
+            disabled={translationError}
+            className={`shrink-0 w-9 h-9 rounded-full text-white flex items-center justify-center transition-transform bg-purple-400 ${
+              translationError ? "opacity-40 cursor-not-allowed" : "hover:scale-105"
+            }`}
           >
             {isPlaying ? (
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="white" className="w-4 h-4">
@@ -185,7 +195,18 @@ export default function DialogBubble({
               </svg>
             )}
           </button>
-          <p className="text-base sm:text-lg font-medium text-gray-800">{translatedText}</p>
+          <div className="flex items-baseline gap-2 flex-wrap">
+            {translationError ? (
+              <p className="text-base sm:text-lg text-gray-400 italic">Tarjima vaqtincha mavjud emas</p>
+            ) : (
+              <>
+                <p className="text-base sm:text-lg font-medium text-gray-800">{translatedText}</p>
+                {providerLabel ? (
+                  <span className="text-[10px] text-gray-400 shrink-0">{providerLabel}</span>
+                ) : null}
+              </>
+            )}
+          </div>
         </div>
         {audioError ? (
           <p className="text-xs mt-1 text-red-500">Audio ijro etilmadi — qayta urinib ko'ring.</p>

@@ -20,7 +20,28 @@ ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 
 SUPPORTED_LANGUAGES = ["en", "ru", "ko"]
 
-TRANSLATION_MODEL_NAME = "facebook/nllb-200-distilled-600M"
+# Tarjima: DeepL (API, asosiy) + NLLB-600M (lokal, zaxira — internet yo'q,
+# DeepL xato bergan/limit tugagan hollarda). 1.3B/CTranslate2 yo'li OLIB
+# TASHLANDI (xotira/konvertatsiya muammolari — qarang git tarixi) — NLLB
+# ENDI faqat ZAXIRA, shuning uchun eski, kichik 600M modelga qaytarildi.
+TRANSLATION_MODEL_NAME = os.getenv("TRANSLATION_MODEL_NAME", "facebook/nllb-200-distilled-600M")
+
+# "deepl" (default — DeepL API asosiy, NLLB-600M FAQAT zaxira sifatida) yoki
+# "nllb" (DeepL UMUMAN ishlatilmaydi, FAQAT lokal NLLB-600M). translator.py
+# shu qiymatga qarab tanlaydi — qarang undagi _deepl_attempt()/_translate_nllb().
+MT_PROVIDER = os.getenv("MT_PROVIDER", "deepl")
+
+# .env orqali o'qiladi — repo'ga YOZILMAYDI (backend/.env .gitignore'da).
+# MT_PROVIDER="deepl" bo'lganda kerak (yo'q bo'lsa — FAQAT NLLB ishlatiladi,
+# avtomatik, xatosiz).
+DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")
+
+# true (default) — server ishga tushganda NLLB-600M OLDINDAN yuklanadi
+# (DeepL muvaffaqiyatsiz bo'lgan BIRINCHI turnda ham zaxira DARHOL tayyor
+# bo'lishi uchun, model yuklanishini kutib turmasdan). false — birinchi
+# haqiqiy zaxira-chaqiruvigacha yuklanmaydi (VRAM/vaqtni tejash uchun,
+# masalan DeepL hech qachon ishlamay qolmasligi kutilganda).
+MT_FALLBACK_PRELOAD = os.getenv("MT_FALLBACK_PRELOAD", "true").strip().lower() == "true"
 
 NLLB_LANG_CODES = {
     "en": "eng_Latn",

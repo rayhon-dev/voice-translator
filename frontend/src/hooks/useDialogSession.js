@@ -893,6 +893,15 @@ export function useDialogSession() {
               // — DialogBubble shuni ko'rib yorliq yonida "?" belgisini
               // chiqaradi, foydalanuvchi kerak bo'lsa qo'lda to'g'rilaydi.
               uncertain: Boolean(msg.uncertain),
+              // Tarjima: DeepL (asosiy) + NLLB-600M (zaxira) — "deepl",
+              // "nllb" yoki null (tarjima umuman chaqirilmagan, masalan
+              // source==target). DialogBubble shuni ko'rib juda kichik
+              // "DeepL"/"lokal" belgisini chiqaradi.
+              mtProvider: msg.mt_provider ?? null,
+              // IKKISI HAM (DeepL va NLLB) muvaffaqiyatsiz bo'lsa — true,
+              // DialogBubble tarjima o'rniga kulrang "Tarjima vaqtincha
+              // mavjud emas" matnini ko'rsatadi.
+              translationError: Boolean(msg.translation_error),
             };
             const existingIdx = prev.findIndex((m) => m.seq === msg.seq);
             const next =

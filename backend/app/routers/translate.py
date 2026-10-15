@@ -25,7 +25,7 @@ def translate(request: TranslateRequest):
     # `def` (async emas) qilib qo'yilsa, Starlette buni avtomatik alohida
     # threadpool'da ishga tushiradi, event loop bo'sh qoladi.
     t0 = time.perf_counter()
-    translation = translate_text(request.text, request.target_lang, request.source_lang)
-    logger.info(f"[/translate] {request.source_lang!r} -> {request.target_lang!r} "
+    translation, mt_provider = translate_text(request.text, request.target_lang, request.source_lang)
+    logger.info(f"[/translate] provider={mt_provider} {request.source_lang!r} -> {request.target_lang!r} "
         f"{len(request.text)} chars in {time.perf_counter() - t0:.2f}s")
-    return {"translation": translation}
+    return {"translation": translation, "mt_provider": mt_provider}

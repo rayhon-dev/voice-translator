@@ -393,6 +393,8 @@ export default function DialogSessionView({ onBack }) {
                   lightBgClass={palette.light}
                   grouped={grouped}
                   uncertain={msg.uncertain}
+                  mtProvider={msg.mtProvider}
+                  translationError={msg.translationError}
                   knownSpeakers={knownSpeakers.filter((s) => s.id !== msg.speaker)}
                   isPlaying={playingId === msg.seq}
                   audioError={audioErrors[msg.seq]}

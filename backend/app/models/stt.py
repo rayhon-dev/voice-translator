@@ -55,6 +55,26 @@ MIN_PAIR_MASS = float(os.environ.get("MIN_PAIR_MASS", "0.65"))
 # shu ma'noda ishlatadi.
 MIN_LANG_PROB = float(os.environ.get("MIN_LANG_PROB", "0.75"))
 
+# ARALASH TILLAR (A1): turn darajasidagi pair_mass (yuqoridagi ikkisi —
+# MIN_PAIR_MASS/MIN_LANG_PROB — allaqachon o'tgan, ya'ni turn UMUMAN rad
+# etilmagan) shu qiymatdan PAST bo'lsa, turn "aralash" (asosiy til + ichida
+# begona til qismi bor) ko'rinishda hisoblanadi va HAR BIR segment uchun
+# ALOHIDA til tekshiruvi ishga tushadi (qarang _segment_language_filter).
+# Toza EN/RU turnlarda (pair_mass odatda 0.97+) bu qo'shimcha (GPU talab
+# qiladigan) bosqich UMUMAN ishlamaydi — tezlikka ta'sir qilmaydi.
+SEG_LANG_CHECK_BELOW = float(os.environ.get("SEG_LANG_CHECK_BELOW", "0.97"))
+# Shundan QISQAROQ segment tekshirilmaydi (bitta so'z/atama bo'lishi mumkin
+# — "gap ichidagi alohida begona so'zlar aytilganicha qolsin" talabi shu
+# orqali ta'minlanadi, A2'dagi initial_prompt bilan birgalikda).
+SEG_LANG_MIN_S = float(os.environ.get("SEG_LANG_MIN_S", "1.0"))
+# Shundan PAST segment pair_mass'i — segment ikki sessiya tilidan ALOHIDA,
+# BEGONA til (masalan o'zbekcha) deb hisoblanadi va tashlab yuboriladi.
+# Turn darajasidagi MIN_PAIR_MASS'dan (0.65) PASTROQ ataylab — segment
+# o'zi qisqa bo'lgani uchun Whisper'ning langID boshi tabiiy ravishda
+# kamroq ishonchli, qattiqroq chegara haqiqiy (lekin qisqa) EN/RU
+# segmentlarni ham noto'g'ri tashlab yuborishi mumkin edi.
+SEG_MIN_PAIR_MASS = float(os.environ.get("SEG_MIN_PAIR_MASS", "0.5"))
+
 # OpenAI Whisper'ning o'zining standart qiymati (compression_ratio_threshold=2.4)
 # — segment matni g'ayrioddiy "siqiladigan" (ya'ni bir xil so'z/ibora ko'p marta
 # takrorlangan) bo'lsa, bu odatda gallyutsinatsiya/stuck-loop belgisi (REPETITION_
@@ -126,6 +146,32 @@ WHISPER_TEMPERATURE = float(os.environ.get("WHISPER_TEMPERATURE", "0.0"))
 WHISPER_CONDITION_ON_PREVIOUS_TEXT = (
     os.environ.get("WHISPER_CONDITION_ON_PREVIOUS_TEXT", "false").strip().lower() == "true"
 )
+
+# ARALASH TILLAR (A2): "begona so'zlarni aytilganicha saqlash". Whisper'ga
+# decode TILI ALLAQACHON ma'lum bo'lganda (detected_lang — restricted
+# candidate yo'lida, yoki aniq `language` berilganda) shu tilga mos
+# initial_prompt beriladi — bu Whisper'ga "asosiy til shu, lekin ichida
+# boshqa til so'zlari bo'lishi mumkin, ularni TARJIMA qilmasdan, AYTILGANICHA
+# yoz" deb "ko'rsatma" beradi (initial_prompt — Whisper decode'ni majburlamaydi,
+# faqat KONTEKST sifatida ta'sir qiladi). .env orqali O'CHIRISH mumkin —
+# initial_prompt ba'zan (ayniqsa qisqa/notinch audio'da) gallyutsinatsiyani
+# KUCHAYTIRISHI ham mumkin, shuning uchun A/B solishtirish uchun tezkor
+# yoqish/o'chirish kaliti sifatida qoldirildi.
+WHISPER_INITIAL_PROMPT_ENABLED = (
+    os.environ.get("WHISPER_INITIAL_PROMPT_ENABLED", "true").strip().lower() == "true"
+)
+WHISPER_INITIAL_PROMPTS = {
+    "en": os.environ.get(
+        "WHISPER_INITIAL_PROMPT_EN",
+        "The speaker mainly speaks English but may use some Russian or Uzbek words. "
+        "Write those words exactly as spoken, without translating them.",
+    ),
+    "ru": os.environ.get(
+        "WHISPER_INITIAL_PROMPT_RU",
+        "Говорящий в основном говорит по-русски, но может использовать отдельные "
+        "английские или узбекские слова. Записывай их так, как они произнесены, без перевода.",
+    ),
+}
 
 # Uzun (10-13s) kesmalarda Whisper ba'zan BIR XIL jumlani 10-20 marta ketma-ket
 # takrorlab chiqarishi (decode "tutilib qolishi") kuzatildi — condition_on_previous_text
@@ -286,10 +332,16 @@ def _write_wav(path: str, wav: np.ndarray) -> None:
     sf.write(path, wav, SAMPLE_RATE)
 
 
-def _run_transcribe(model, source, language: str | None, use_vad: bool):
+def _run_transcribe(model, source, language: str | None, use_vad: bool, initial_prompt: str | None = None):
     """model.transcribe() ni chaqiradi; vad_filter xato bersa (masalan qisqa
     audio'da faster-whisper'ning ichki til aniqlash kodi bo'sh to'plamda max()
-    chaqirishi mumkin) — VAD'siz BITTA marta qayta uriniladi."""
+    chaqirishi mumkin) — VAD'siz BITTA marta qayta uriniladi.
+
+    `initial_prompt` — A2 (begona so'zlarni aytilganicha saqlash): chaqiruvchi
+    (`_transcribe_audio_whisper`) tomonidan, decode tili ALLAQACHON ma'lum
+    bo'lganda WHISPER_INITIAL_PROMPTS'dan tanlab beriladi (qarang yuqoridagi
+    izoh) — WHISPER_INITIAL_PROMPT_ENABLED=false bo'lsa yoki til noma'lum
+    bo'lsa, `None` sifatida uzatiladi (Whisper'ning standart xatti-harakati)."""
     t0 = time.perf_counter()
     try:
         segments, info = model.transcribe(
@@ -301,6 +353,7 @@ def _run_transcribe(model, source, language: str | None, use_vad: bool):
             beam_size=WHISPER_BEAM_SIZE,
             repetition_penalty=REPETITION_PENALTY,
             no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+            initial_prompt=initial_prompt,
         )
         return list(segments), info
     except Exception as e:
@@ -319,6 +372,7 @@ def _run_transcribe(model, source, language: str | None, use_vad: bool):
             beam_size=WHISPER_BEAM_SIZE,
             repetition_penalty=REPETITION_PENALTY,
             no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+            initial_prompt=initial_prompt,
         )
         seg_list = list(segments)
         logger.info(f"[STT][VAD_RETRY] retry (no VAD) took {time.perf_counter() - t_retry0:.2f}s "
@@ -398,6 +452,47 @@ def _detect_language_restricted(
     return best_lang, cand_probs[best_lang] / total, diagnostics
 
 
+def _segment_language_filter(
+    model, audio: np.ndarray, seg_list, candidates: list[str]
+) -> tuple[list[bool], list[dict | None]]:
+    """A1 — ARALASH TILLAR: turn darajasidagi pair_mass yetarli past bo'lib
+    (qarang SEG_LANG_CHECK_BELOW) turn "aralash" ko'ringanda chaqiriladi —
+    HAR BIR segment uchun ALOHIDA, shu segmentning O'Z audio qismi bo'yicha
+    til ehtimolligi hisoblanadi (xuddi _detect_language_restricted kabi,
+    lekin butun turn emas, bitta segment uchun).
+
+    SEG_LANG_MIN_S'dan QISQA segmentlar TEKSHIRILMAYDI (bitta so'z/atama
+    bo'lishi mumkin — "gap ichidagi alohida begona so'zlar aytilganicha
+    qolsin" talabi shu orqali, A2'dagi initial_prompt bilan birgalikda,
+    ta'minlanadi).
+
+    Qaytaradi: (foreign_flags, diagnostics) — ikkisi ham `seg_list` bilan
+    BIR XIL uzunlik/tartibda. `foreign_flags[i] = True` — shu segment
+    pair_mass'i SEG_MIN_PAIR_MASS'dan past, ya'ni ikki sessiya tilidan
+    ALOHIDA, BEGONA til (masalan uzun o'zbekcha bo'lak) bo'lib chiqdi
+    degani — chaqiruvchi (`_transcribe_audio_whisper`dagi asosiy filtrlash
+    tsikli) buni "foreign_segment" sababi bilan tashlab yuboradi."""
+    foreign = [False] * len(seg_list)
+    diagnostics: list[dict | None] = [None] * len(seg_list)
+    for i, seg in enumerate(seg_list):
+        seg_start_s = getattr(seg, "start", None)
+        seg_end_s = getattr(seg, "end", None)
+        if seg_start_s is None or seg_end_s is None:
+            continue
+        if seg_end_s - seg_start_s < SEG_LANG_MIN_S:
+            continue
+        start_idx = max(0, int(seg_start_s * SAMPLE_RATE))
+        end_idx = min(audio.size, int(seg_end_s * SAMPLE_RATE))
+        if end_idx <= start_idx:
+            continue
+        seg_audio = audio[start_idx:end_idx]
+        _, _, seg_diag = _detect_language_restricted(model, seg_audio, candidates)
+        diagnostics[i] = seg_diag
+        if seg_diag["pair_mass"] < SEG_MIN_PAIR_MASS:
+            foreign[i] = True
+    return foreign, diagnostics
+
+
 def _fast_vad_speech_duration(audio: np.ndarray) -> float:
     """Silero VAD (faster_whisper.vad.get_speech_timestamps) orqali audio'dagi
     JAMI nutq davomiyligini (soniyada) hisoblaydi — model.encode()/transcribe()
@@ -418,11 +513,15 @@ def transcribe_audio(
     audio_path: str,
     language: str | None = None,
     candidate_languages: list[str] | None = None,
-) -> tuple[str, str | None, float, bool]:
+) -> tuple[str, str | None, float, bool, dict]:
     """config.STT_PROVIDER'ga qarab Whisper (lokal) yoki ElevenLabs Scribe v2
     (API) orqali transkripsiya qiladi — har doim BIR XIL (text, detected_lang,
-    lang_prob, unsupported_language) formatini qaytaradi, shuning uchun
-    dialog.py/speaker_diart.py provayderdan QAT'IY NAZAR o'zgarishsiz ishlaydi.
+    lang_prob, unsupported_language, stt_diag) formatini qaytaradi, shuning
+    uchun dialog.py/speaker_diart.py provayderdan QAT'IY NAZAR o'zgarishsiz
+    ishlaydi. `stt_diag` — {"seg_lang_check": bool, "seg_lang_check_ms": float}
+    (A1, qarang _segment_language_filter) — ElevenLabs yo'lida va segment
+    tekshiruvi ishlamagan hollarda doim {"seg_lang_check": False,
+    "seg_lang_check_ms": 0.0}, dialog.py buni [TURN] logiga qo'shadi.
     `unsupported_language=True` — `candidate_languages` berilgan (Dialog
     rejimi) VA haqiqiy nutq ikkalasidan ham BOSHQA tilda bo'lgani (yetarlicha
     ishonch bilan) aniqlangan holatda; chaqiruvchi bu holda speaker/tarjima
@@ -455,7 +554,7 @@ def transcribe_audio(
                     f"[STT][VAD] speech={speech_s:.2f}s — skipped in "
                     f"{(time.perf_counter() - t_vad0) * 1000:.0f}ms"
                 )
-                return "", None, 0.0, False
+                return "", None, 0.0, False, {"seg_lang_check": False, "seg_lang_check_ms": 0.0}
 
     if STT_PROVIDER == "elevenlabs":
         return transcribe_audio_elevenlabs(audio_path, language_hint=language, candidate_languages=candidate_languages)
@@ -466,11 +565,21 @@ def transcribe_audio_elevenlabs(
     audio_path: str,
     language_hint: str | None = None,
     candidate_languages: list[str] | None = None,
-) -> tuple[str, str | None, float, bool]:
+) -> tuple[str, str | None, float, bool, dict]:
     """ElevenLabs Scribe v2 ("Create transcript", POST /v1/speech-to-text)
     orqali transkripsiya qiladi. Natija transcribe_audio() bilan BIR XIL
-    (text, detected_lang, lang_prob, unsupported_language) formatiga
+    (text, detected_lang, lang_prob, unsupported_language, stt_diag) formatiga
     moslashtiriladi.
+
+    A3 — ARALASH TILLAR, ElevenLabs yo'li: rasmiy hujjat (SpeechToTextWordResponseModel,
+    elevenlabs.io/docs/api-reference/speech-to-text) tekshirildi — `words`
+    massividagi har bir elementda FAQAT `text`/`type`/`logprob`/`start`/`end`/
+    `speaker_id`/`channel_index` bor, SO'Z DARAJASIDA til kodi YO'Q. Til
+    (`language_code`/`language_probability`) FAQAT BUTUN transkript/chunk
+    uchun BIR MARTA qaytariladi. Demak A1'dagi (Whisper yo'li) segment-
+    darajasidagi til-tekshiruv mantig'ini bu yo'lda TAKRORLASH IMKONSIZ —
+    shuning uchun bu yerga QO'SHILMAGAN, `stt_diag` doim
+    {"seg_lang_check": False, "seg_lang_check_ms": 0.0} qaytaradi.
 
     ESLATMA (2-band, unsupported_language): ElevenLabs API'si Whisper'ning
     language-ID boshi kabi TO'LIQ (~99 tilli) XOM taqsimot qaytarmaydi —
@@ -490,10 +599,12 @@ def transcribe_audio_elevenlabs(
     tekshiruvi) buni allaqachon bo'sh transkripsiya sifatida to'g'ri
     boshqaradi — xatolik va "haqiqatan ham jim/shovqin" holati bir xil
     (xavfsiz) natija bilan yakunlanadi."""
+    empty_diag = {"seg_lang_check": False, "seg_lang_check_ms": 0.0}
+
     if not ELEVENLABS_API_KEY:
         logger.info("[STT][ELEVENLABS] ELEVENLABS_API_KEY sozlanmagan (.env'ni tekshiring) — "
             "bo'sh natija qaytarilyapti")
-        return "", None, 0.0, False
+        return "", None, 0.0, False, empty_diag
 
     # Whisper yo'lidagi kabi: butunlay jim/shovqin audio uchun tarmoq
     # so'rovini umuman yubormaslik (API chaqiruvini/kreditni tejash uchun).
@@ -503,7 +614,7 @@ def transcribe_audio_elevenlabs(
         if rms < RMS_SILENCE_THRESHOLD:
             logger.info(f"[STT][ELEVENLABS] audio below RMS threshold (rms={rms:.5f} < "
                 f"{RMS_SILENCE_THRESHOLD}) — skipping transcription")
-            return "", None, 0.0, False
+            return "", None, 0.0, False, empty_diag
 
     t0 = time.perf_counter()
     try:
@@ -524,7 +635,7 @@ def transcribe_audio_elevenlabs(
     except Exception as e:
         logger.info(f"[STT][ELEVENLABS] so'rov muvaffaqiyatsiz bo'ldi: {e!r} — bo'sh natija "
             f"qaytarilyapti (tizim davom etadi)")
-        return "", None, 0.0, False
+        return "", None, 0.0, False, empty_diag
 
     # SHOVQINLI MUHIT TUZATISHI: Whisper yo'lida (_transcribe_audio_whisper)
     # qo'llanilgan segment-darajasidagi far_field filtri BU YERDA (hozircha)
@@ -626,23 +737,32 @@ def transcribe_audio_elevenlabs(
     elapsed = time.perf_counter() - t0
     logger.info(f"[STT][ELEVENLABS] {len(text)} chars in {elapsed:.2f}s "
         f"detected_lang={detected_lang} (raw={raw_lang_code!r}) ({lang_prob:.2f})")
-    return text, detected_lang, lang_prob, unsupported_language
+    return text, detected_lang, lang_prob, unsupported_language, empty_diag
 
 
 def _transcribe_audio_whisper(
     audio_path: str,
     language: str | None = None,
     candidate_languages: list[str] | None = None,
-) -> tuple[str, str | None, float, bool]:
+) -> tuple[str, str | None, float, bool, dict]:
     """`candidate_languages` berilsa (va `language` berilmagan bo'lsa), Whisper'ning
     ~99 tilli avtomatik aniqlashi o'rniga faqat shu ro'yxatdagi tillar orasida
     (Whisper'ning language-ID boshi orqali) tanlanadi, so'ng transkripsiya shu
     bitta tanlangan til bilan majburlanadi. Dialog rejimida so'zlovchilar tilini
     oldindan tanlagani uchun bu — qisqa/shovqinli navbatlarda avtomatik aniqlash
     tasodifiy boshqa tilni (masalan gruzincha yoki bengalcha) tanlab qo'yishining
-    oldini oladi."""
+    oldini oladi.
+
+    A1/A2 (ARALASH TILLAR): turn "aralash" ko'ringanda (pair_mass past, qarang
+    SEG_LANG_CHECK_BELOW) segment-darajasida qo'shimcha til tekshiruvi
+    o'tkaziladi (qarang _segment_language_filter) va decode'ga asosiy tilga
+    mos initial_prompt beriladi (WHISPER_INITIAL_PROMPTS) — begona (masalan
+    ruscha/o'zbekcha) ALOHIDA so'zlar tarjima qilinmasdan, aytilganicha
+    saqlanishi uchun."""
 
     model = get_model()
+
+    empty_diag = {"seg_lang_check": False, "seg_lang_check_ms": 0.0}
 
     audio = _decode_waveform(audio_path)
     rms = None
@@ -650,7 +770,7 @@ def _transcribe_audio_whisper(
         rms = float(np.sqrt(np.mean(np.square(audio.astype(np.float64)))))
         if rms < RMS_SILENCE_THRESHOLD:
             logger.info(f"[STT] audio below RMS threshold (rms={rms:.5f} < {RMS_SILENCE_THRESHOLD}) — skipping transcription")
-            return "", None, 0.0, False
+            return "", None, 0.0, False, empty_diag
 
 
     source = audio if (audio is not None and audio.size) else audio_path
@@ -687,7 +807,7 @@ def _transcribe_audio_whisper(
                 f"< {MIN_PAIR_MASS} raw_top={raw_top_lang!r}({raw_top_prob:.3f}) "
                 f"pair=({','.join(candidates)}) — turn tashlab yuborildi"
             )
-            return "", None, 0.0, True
+            return "", None, 0.0, True, empty_diag
 
         # IKKINCHI, MUSTAQIL TESHIK (qarang MIN_LANG_PROB izohi yuqorida):
         # pair_mass yetarli bo'lsa ham, ikki nomzod orasidagi QAYTA
@@ -699,15 +819,51 @@ def _transcribe_audio_whisper(
                 f"< {MIN_LANG_PROB} detected_lang={detected_lang!r} pair_mass={pair_mass:.3f} "
                 f"pair=({','.join(candidates)}) — turn tashlab yuborildi"
             )
-            return "", None, 0.0, True
+            return "", None, 0.0, True, empty_diag
 
-        seg_list, info = _run_transcribe(model, source, detected_lang, use_vad)
+        # A1: shu turn uchun "aralash-til tekshiruvi" kerak-kerakmasligini
+        # keyinroq (seg_list tayyor bo'lgandan keyin) hal qilish uchun
+        # saqlanadi — toza EN/RU turnlarda (pair_mass yuqori) `None` bo'lib
+        # qolib, pastdagi tekshiruv UMUMAN ishlamaydi.
+        turn_pair_mass = pair_mass
+        # A2: decode tili ALLAQACHON ma'lum (`detected_lang`) — shu tilga
+        # mos "begona so'zlarni aytilganicha saqla" ko'rsatmasi beriladi.
+        initial_prompt = WHISPER_INITIAL_PROMPTS.get(detected_lang) if WHISPER_INITIAL_PROMPT_ENABLED else None
+        seg_list, info = _run_transcribe(model, source, detected_lang, use_vad, initial_prompt=initial_prompt)
     else:
-        seg_list, info = _run_transcribe(model, source, language, use_vad)
+        turn_pair_mass = None
+        initial_prompt = (
+            WHISPER_INITIAL_PROMPTS.get(language) if (WHISPER_INITIAL_PROMPT_ENABLED and language) else None
+        )
+        seg_list, info = _run_transcribe(model, source, language, use_vad, initial_prompt=initial_prompt)
         detected_lang = getattr(info, "language", None)
         lang_prob = float(getattr(info, "language_probability", 0.0) or 0.0)
 
     elapsed = time.perf_counter() - t0
+
+    # A1: turn "aralash" ko'ringanda (pair_mass past) HAR BIR segment uchun
+    # ALOHIDA til tekshiruvi — qarang _segment_language_filter va
+    # SEG_LANG_CHECK_BELOW izohi. Toza EN/RU turnlarda (`turn_pair_mass`
+    # None YOKI yuqori) bu GPU talab qiladigan bosqich UMUMAN ishlamaydi.
+    seg_foreign: list[bool] = [False] * len(seg_list)
+    seg_lang_diag: list[dict | None] = [None] * len(seg_list)
+    seg_lang_check_performed = False
+    seg_lang_check_ms = 0.0
+    if (
+        turn_pair_mass is not None
+        and turn_pair_mass < SEG_LANG_CHECK_BELOW
+        and audio is not None
+        and audio.size
+    ):
+        t_seg0 = time.perf_counter()
+        seg_foreign, seg_lang_diag = _segment_language_filter(model, audio, seg_list, candidates)
+        seg_lang_check_performed = True
+        seg_lang_check_ms = (time.perf_counter() - t_seg0) * 1000
+        if any(seg_foreign):
+            logger.info(
+                f"[STT][LANG] seg_lang_check turn_pair_mass={turn_pair_mass:.3f} "
+                f"dropped {sum(seg_foreign)}/{len(seg_list)} segment(s) in {seg_lang_check_ms:.1f}ms"
+            )
 
     # SHOVQINLI MUHIT TUZATISHI: turn ichidagi HAR BIR segmentning o'z RMS'i
     # oldindan hisoblanadi — pastdagi asosiy tsiklda har bir segment shu
@@ -750,7 +906,7 @@ def _transcribe_audio_whisper(
     # ularni qayta tiklash kerak degani emas.
     fallback_candidates = []
     dropped = 0
-    for seg, seg_rms in zip(seg_list, seg_rms_list):
+    for idx, (seg, seg_rms) in enumerate(zip(seg_list, seg_rms_list)):
         nsp = getattr(seg, "no_speech_prob", 0.0)
         alp = getattr(seg, "avg_logprob", 0.0)
         cr = getattr(seg, "compression_ratio", 0.0)
@@ -774,6 +930,22 @@ def _transcribe_audio_whisper(
             logger.info(
                 f"[STT][DROP] reason=far_field text={seg_text!r} rms={seg_rms:.4f} "
                 f"max_rms={max_seg_rms:.4f} start={seg_start} end={seg_end}"
+            )
+            dropped += 1
+            continue
+
+        # A1: ARALASH TILLAR — shu segment (yetarlicha uzun bo'lsa)
+        # _segment_language_filter orqali ikki sessiya tilidan ALOHIDA,
+        # BEGONA til deb aniqlangan bo'lsa, far_field'dan KEYINGI eng
+        # BIRINCHI sabab sifatida tashlab yuboriladi (fallback'ga ham
+        # KIRMAYDI — qisman noto'g'ri bo'lsa ham, begona til matnini
+        # "fallback" sifatida qayta tiklash ma'nosiz).
+        if seg_foreign[idx]:
+            seg_diag = seg_lang_diag[idx] or {}
+            logger.info(
+                f"[STT][DROP] reason=foreign_segment text={seg_text!r} "
+                f"seg_pair_mass={seg_diag.get('pair_mass', 0.0):.3f} "
+                f"raw_top={seg_diag.get('raw_top_lang')!r}({seg_diag.get('raw_top_prob', 0.0):.3f})"
             )
             dropped += 1
             continue
@@ -830,6 +1002,27 @@ def _transcribe_audio_whisper(
                 logger.info("[STT][DEBUG] fallback used: all segments filtered, using raw transcript")
             text = fallback_text
 
+    # A1: agar natijada hali ham hech narsa qolmagan bo'lsa VA buning
+    # sababi (kamida qisman) begona-til segmentlari bo'lsa — bu "shovqin"
+    # emas, BUTUN turn chindan begona tilda bo'lib chiqdi degani (turn
+    # darajasidagi tekshiruv buni ko'rolmagan, chunki pair_mass yetarli
+    # EDI, lekin segmentlarning HAMMASI, alohida tekshirilganda, begona
+    # bo'lib chiqdi). `fallback_candidates` begona segmentlarni ATAYLAB
+    # o'z ichiga OLMAYDI (yuqoridagi `continue`), shuning uchun bu yerga
+    # faqat haqiqatan ham "qolgan hech narsa yo'q" holatida yetib keladi.
+    if not text and seg_lang_check_performed and any(seg_foreign):
+        logger.info(
+            f"[STT][LANG] unsupported_language reason=all_segments_foreign "
+            f"pair=({','.join(candidates)}) — turn tashlab yuborildi"
+        )
+        return (
+            "",
+            None,
+            0.0,
+            True,
+            {"seg_lang_check": seg_lang_check_performed, "seg_lang_check_ms": seg_lang_check_ms},
+        )
+
     # Yuqoridagi `_is_phantom_phrase` tekshiruvi HAR BIR SEGMENT uchun
     # alohida ishlaydi — agar fantom ibora Whisper tomonidan IKKI segmentga
     # bo'lib yuborilgan bo'lsa (masalan "Thank you" + " for watching"), har
@@ -843,10 +1036,19 @@ def _transcribe_audio_whisper(
 
     msg = f"[STT] {len(text)} chars in {elapsed:.2f}s detected_lang={detected_lang} ({lang_prob:.2f})"
     if dropped:
-        # `dropped` endi low-confidence/compression/phantom BILAN BIRGA
-        # far_field (fon-segment) sabablarini ham o'z ichiga oladi — har
-        # birining ANIQ sababi yuqoridagi [STT][DROP] qatorlarida ko'rinadi.
+        # `dropped` endi low-confidence/compression/phantom/foreign_segment
+        # BILAN BIRGA far_field (fon-segment) sabablarini ham o'z ichiga
+        # oladi — har birining ANIQ sababi yuqoridagi [STT][DROP] qatorlarida
+        # ko'rinadi.
         msg += f" ({dropped} segment(s) filtered)"
+    if seg_lang_check_performed:
+        msg += f" seg_lang_check={seg_lang_check_ms:.1f}ms"
     logger.info(msg)
 
-    return text, detected_lang, lang_prob, False
+    return (
+        text,
+        detected_lang,
+        lang_prob,
+        False,
+        {"seg_lang_check": seg_lang_check_performed, "seg_lang_check_ms": seg_lang_check_ms},
+    )

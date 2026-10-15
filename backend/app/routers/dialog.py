@@ -160,6 +160,12 @@ async def websocket_dialog(websocket: WebSocket):
             source_lang=entry["source_lang"],
             target_lang=entry["target_lang"],
             uncertain=entry.get("uncertain", False),
+            # Tarjima: DeepL (asosiy) + NLLB-600M (zaxira) — frontend shuni
+            # ko'rib tarjima yonida juda kichik "DeepL"/"lokal" belgisini
+            # (yoki IKKISI HAM muvaffaqiyatsiz bo'lsa — "Tarjima vaqtincha
+            # mavjud emas" kulrang matnini) ko'rsatadi.
+            mt_provider=entry.get("mt_provider"),
+            translation_error=entry.get("mt_provider") == "error",
         )
 
 
@@ -215,7 +221,7 @@ async def websocket_dialog(websocket: WebSocket):
         t_stt0 = time.perf_counter()
         try:
             try:
-                text, detected_lang, lang_prob, unsupported_language = await loop.run_in_executor(
+                text, detected_lang, lang_prob, unsupported_language, stt_diag = await loop.run_in_executor(
                     None, transcribe_audio, temp_filename, None, SESSION_LANGS
                 )
             except Exception as e:
@@ -327,6 +333,7 @@ async def websocket_dialog(websocket: WebSocket):
             out_wav = wav
             merged_seqs = [out_seq]
 
+        mt_provider = None
         if source_lang == target_lang:
             # Nazariy jihatdan amalda bo'lmasligi kerak (SESSION_LANGS ikki
             # XIL til), lekin xavfsizlik uchun saqlanadi.
@@ -342,13 +349,18 @@ async def websocket_dialog(websocket: WebSocket):
         else:
             t_mt0 = time.perf_counter()
             try:
-                translation = await loop.run_in_executor(
+                translation, mt_provider = await loop.run_in_executor(
                     None, translate_text, out_text, target_lang, source_lang
                 )
             except Exception as e:
+                # Tarjima: DeepL (asosiy) + NLLB-600M (zaxira) — IKKISI HAM
+                # muvaffaqiyatsiz bo'lsa ham (yoki kutilmagan xato chiqsa)
+                # turn SKIP QILINMAYDI, foydalanuvchiga baribir ko'rsatiladi
+                # (bo'sh tarjima + "Tarjima vaqtincha mavjud emas" bayrog'i
+                # bilan) — qarang _resend_turn'dagi translation_error.
                 logger.error(f"[/ws/dialog] translation failed: {e!r}")
-                await send_status("turn_skipped", reason="translation_error")
-                return
+                translation = ""
+                mt_provider = "error"
             mt_elapsed = time.perf_counter() - t_mt0
 
         state["turn_history"][out_seq] = {
@@ -361,6 +373,9 @@ async def websocket_dialog(websocket: WebSocket):
             "uncertain": uncertain,
             # correct_speaker/delete_turn uchun — qarang yuqoridagi izoh.
             "merged_seqs": merged_seqs,
+            # DeepL (asosiy)/NLLB-600M (zaxira)/None (tarjima umuman
+            # chaqirilmagan, masalan source==target) — qarang _resend_turn.
+            "mt_provider": mt_provider,
         }
         _trim_turn_history()
 
@@ -377,7 +392,9 @@ async def websocket_dialog(websocket: WebSocket):
             f"[TURN] seq={out_seq} audio={duration_s:.2f}s stt={stt_elapsed:.2f}s "
             f"mt={mt_elapsed:.2f}s total={time.perf_counter() - t_turn_start:.2f}s "
             f"merged={merge_prev_entry is not None} speaker={speaker} uncertain={uncertain} "
-            f"decision={spk_result['decision']}"
+            f"decision={spk_result['decision']} "
+            f"seg_lang_check={stt_diag.get('seg_lang_check', False)}"
+            f"({stt_diag.get('seg_lang_check_ms', 0.0):.1f}ms)"
         )
 
         await _resend_turn(out_seq, state["turn_history"][out_seq])
