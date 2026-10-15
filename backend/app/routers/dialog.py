@@ -17,7 +17,8 @@ from app.models.speaker_diart import (
     create_session,
     identify_speaker,
     apply_speaker_correction,
-    remove_speaker,
+    remove_turn_prototype,
+    merge_speakers_manual,
     has_known_speakers,
     save_turn_label,
 )
@@ -147,10 +148,8 @@ async def websocket_dialog(websocket: WebSocket):
     async def _resend_turn(seq: int, entry: dict) -> None:
         """Mavjud (turn_history'da saqlangan) bir turnni XUDDI SHU seq
         bilan qayta yuboradi — frontend'dagi upsert mantiqi buni yangi
-        bubble emas, mavjudining o'rnini bosuvchi deb qabul qiladi. Yangi
-        spiker nomzodi TASDIQLANGANDA (identify_speaker'dan
-        confirmed_pending_seq) va correct_speaker/ qo'lda tuzatishda
-        ishlatiladi — ikkalasida ham tarjima/matn O'ZGARMAYDI, FAQAT
+        bubble emas, mavjudining o'rnini bosuvchi deb qabul qiladi.
+        correct_speaker'da ishlatiladi — tarjima/matn O'ZGARMAYDI, FAQAT
         spiker/uncertain bayrog'i yangilanadi."""
         await send_status(
             "turn",
@@ -162,6 +161,29 @@ async def websocket_dialog(websocket: WebSocket):
             target_lang=entry["target_lang"],
             uncertain=entry.get("uncertain", False),
         )
+
+
+    async def _apply_merges_and_notify(merges: list[tuple[int, int, float]]) -> None:
+        """speaker_diart.py'dagi identify_speaker/apply_speaker_correction/
+        remove_turn_prototype — har biri avtomatik birlashishlarni
+        ("merges", qarang SPK_MERGE_SIM) qaytarishi mumkin: ikkita ID
+        aslida BITTA odam ekani aniqlanib, kichik raqamligiga birlashtirilgan.
+        Bu yerda ular KETMA-KET (zanjir bo'lsa ham to'g'ri) qo'llaniladi:
+        turn_history'dagi BARCHA mos yozuvlar (shu jumladan avvalgi
+        qadamlarda ALLAQACHON yangilanganlar — shu sababli zanjir to'g'ri
+        "ta'qib qilinadi") qayta tayinlanadi, so'ng frontendga
+        "speakers_merged" yuboriladi — u o'z navbatida BARCHA "from"
+        bubble'larini "into"ga ko'chiradi."""
+        for frm, into, sim in merges:
+            for entry in state["turn_history"].values():
+                if entry["speaker"] == frm:
+                    entry["speaker"] = into
+            frm_last = state["last_turn_by_speaker"].pop(frm, None)
+            if frm_last is not None:
+                into_last = state["last_turn_by_speaker"].get(into)
+                if into_last is None or frm_last["sent_at"] > into_last["sent_at"]:
+                    state["last_turn_by_speaker"][into] = frm_last
+            await send_status("speakers_merged", **{"from": frm, "into": into})
 
 
     async def process_turn(wav, seq: int):
@@ -240,6 +262,14 @@ async def websocket_dialog(websocket: WebSocket):
         speaker = spk_result["speaker"]
         uncertain = spk_result["uncertain"]
 
+        # Shu turnni qayta ishlash davomida ikkita (yoki zanjir bo'lsa
+        # undan ko'p) spiker AVTOMATIK bitta spikerga birlashtirilgan
+        # bo'lishi mumkin (qarang speaker_diart.SPK_MERGE_SIM) — eski
+        # turn_history yozuvlari va frontend shu yerda yangilanadi.
+        # `speaker` o'zi identify_speaker ICHIDA ALLAQACHON remap qilingan
+        # (post-merge, yakuniy ID).
+        await _apply_merges_and_notify(spk_result.get("merges", []))
+
         save_turn_label(debug_label.get("wav_filename"), speaker=speaker, lang=detected_lang, text=text)
 
         # Tarjima yo'nalishi ENDI spiker/sessiya tiliga EMAS, FAQAT shu
@@ -277,6 +307,16 @@ async def websocket_dialog(websocket: WebSocket):
             out_seq = merge_seq
             out_text = f"{merge_prev_entry['text']} {text}".strip()
             out_wav = np.concatenate([merge_prev_entry["wav"], wav])
+            # REAL TESTDA TOPILGAN XATO: bu yozuv asosiy seq (`merge_seq`)
+            # TEGI bilan qoladi, lekin shu `seq` ham (identify_speaker ichida)
+            # O'ZINING prototipini qo'shgan bo'lishi mumkin edi — shu
+            # prototip ESKI, asosiy seq bilan hech qanday bog'liqligi
+            # bo'lmagani uchun correct_speaker/delete_turn uni topolmay,
+            # eski spikerda "osilib qolardi". Shu sababli bubble'ga
+            # tegishli BARCHA seq'lar (zanjir bo'lsa ham) shu yerda
+            # to'planadi.
+            merged_seqs = list(merge_prev_entry.get("merged_seqs", [out_seq]))
+            merged_seqs.append(seq)
             logger.info(
                 f"[/ws/dialog] retro-merging seq={seq} into seq={out_seq} "
                 f"(speaker={speaker} lang={source_lang})"
@@ -285,6 +325,7 @@ async def websocket_dialog(websocket: WebSocket):
             out_seq = seq
             out_text = text
             out_wav = wav
+            merged_seqs = [out_seq]
 
         if source_lang == target_lang:
             # Nazariy jihatdan amalda bo'lmasligi kerak (SESSION_LANGS ikki
@@ -318,6 +359,8 @@ async def websocket_dialog(websocket: WebSocket):
             "source_lang": source_lang,
             "target_lang": target_lang,
             "uncertain": uncertain,
+            # correct_speaker/delete_turn uchun — qarang yuqoridagi izoh.
+            "merged_seqs": merged_seqs,
         }
         _trim_turn_history()
 
@@ -329,24 +372,6 @@ async def websocket_dialog(websocket: WebSocket):
             "lang": source_lang,
             "sent_at": time.monotonic(),
         }
-
-        # YANGI SPIKER NOMZODI TASDIQLANDI (identify_speaker'ning
-        # "confirm_new" qarori) — ESKI (pending) turn ENDI haqiqiy spiker
-        # bilan, uncertain=False holda qayta yuboriladi. `result_speaker`
-        # confirm_new holatida ESKI pending turn'da ko'rsatilgan bilan
-        # XUDDI SHU raqam (tentative_id) bo'lgani uchun — faqat uncertain
-        # bayrog'i o'zgaradi.
-        confirmed_pending_seq = spk_result.get("confirmed_pending_seq")
-        if confirmed_pending_seq is not None:
-            old_entry = state["turn_history"].get(confirmed_pending_seq)
-            if old_entry is not None:
-                old_entry["uncertain"] = False
-                old_entry["speaker"] = speaker
-                await _resend_turn(confirmed_pending_seq, old_entry)
-                logger.info(
-                    f"[/ws/dialog] pending speaker nomzodi TASDIQLANDI: seq={confirmed_pending_seq} "
-                    f"speaker={speaker} (joriy turn seq={seq} orqali)"
-                )
 
         logger.info(
             f"[TURN] seq={out_seq} audio={duration_s:.2f}s stt={stt_elapsed:.2f}s "
@@ -566,9 +591,27 @@ async def websocket_dialog(websocket: WebSocket):
                 return
 
             old_speaker = entry["speaker"]
-            new_speaker = await loop.run_in_executor(
-                None, apply_speaker_correction, state["speaker_session"], entry["wav"], SAMPLE_RATE, target_speaker
+            if target_speaker == old_speaker:
+                # Foydalanuvchi joriy spikerning o'ziga "tuzatish" yuborgan
+                # — frontend menyusi buni allaqachon ko'rsatmasligi kerak
+                # (joriy spiker ro'yxatdan chiqarib tashlangan), lekin
+                # himoya sifatida bu yerda ham no-op.
+                logger.info(f"[/ws/dialog] correct_speaker: seq={seq} target == joriy spiker ({old_speaker}) — no-op")
+                return
+
+            merged_seqs = entry.get("merged_seqs", [seq])
+            result = await loop.run_in_executor(
+                None,
+                apply_speaker_correction,
+                state["speaker_session"],
+                entry["wav"],
+                SAMPLE_RATE,
+                merged_seqs,
+                old_speaker,
+                target_speaker,
             )
+            new_speaker = result["speaker"]
+            removed_speaker = result.get("removed_speaker")
 
             entry["speaker"] = new_speaker
             entry["uncertain"] = False
@@ -580,15 +623,20 @@ async def websocket_dialog(websocket: WebSocket):
                 "sent_at": time.monotonic(),
             }
             logger.info(f"[/ws/dialog] correct_speaker: seq={seq} {old_speaker} -> {new_speaker}")
+
+            await _apply_merges_and_notify(result.get("merges", []))
+            if removed_speaker is not None:
+                state["last_turn_by_speaker"].pop(removed_speaker, None)
+                await send_status("speaker_removed", speaker=removed_speaker)
             await _resend_turn(seq, entry)
 
         elif action == "delete_turn" and state["phase"] == "listening":
             # Har bir bubble'dagi 🗑 tugmasi — turn butunlay o'chiriladi.
-            # Agar shu turn (yagona namunasi sifatida) biror spikerni
-            # "ochgan" bo'lsa VA endi boshqa hech qanday turn shu spikerga
-            # tegishli bo'lmasa — spiker profili ham o'chiriladi (aks holda
-            # "hech kimga tegishli bo'lmagan" spiker sessiya oxirigacha
-            # xotirada osilib qolardi).
+            # Agar shu turn ovoz profiliga prototip QO'SHGAN bo'lsa, o'sha
+            # AYNAN O'ZI (seq bo'yicha) olib tashlanadi — spikerda ENDI
+            # birorta ham prototip qolmasa, spiker profilining o'zi ham
+            # o'chiriladi (aks holda "hech qanday ovoz namunasiga ega
+            # bo'lmagan" spiker sessiya oxirigacha xotirada osilib qolardi).
             seq = msg.get("seq")
             entry = state["turn_history"].pop(seq, None)
             if entry is None:
@@ -596,18 +644,63 @@ async def websocket_dialog(websocket: WebSocket):
                 return
 
             deleted_speaker = entry["speaker"]
-            still_used = any(e["speaker"] == deleted_speaker for e in state["turn_history"].values())
-            if not still_used:
-                await loop.run_in_executor(None, remove_speaker, state["speaker_session"], deleted_speaker)
+            merged_seqs = entry.get("merged_seqs", [seq])
+            result = await loop.run_in_executor(
+                None, remove_turn_prototype, state["speaker_session"], deleted_speaker, merged_seqs
+            )
+            removed_speaker = result.get("removed_speaker")
 
             if state["last_turn_by_speaker"].get(deleted_speaker, {}).get("seq") == seq:
                 del state["last_turn_by_speaker"][deleted_speaker]
 
             logger.info(
                 f"[/ws/dialog] delete_turn: seq={seq} speaker={deleted_speaker} "
-                f"speaker_removed={not still_used}"
+                f"speaker_removed={removed_speaker is not None}"
             )
+
+            await _apply_merges_and_notify(result.get("merges", []))
+            if removed_speaker is not None:
+                state["last_turn_by_speaker"].pop(removed_speaker, None)
+                await send_status("speaker_removed", speaker=removed_speaker)
             await send_status("turn_deleted", seq=seq)
+
+        elif action == "rename_speaker":
+            # Frontend'dagi ✏️ tahrirlash — spiker ismlari FAQAT frontend
+            # holatida (speaker ID -> ism xaritasi) saqlanadi, backend
+            # mantig'iga (identify_speaker/klasterlash qaroriga) HECH QANDAY
+            # ta'sir qilmaydi. Bu yerda FAQAT diagnostika uchun log
+            # qilinadi — shu orqali [SPK] loglaridagi spiker ID'larni
+            # keyinroq (masalan chegaralarni sozlashda) inson ismiga
+            # bog'lash mumkin bo'ladi.
+            speaker = msg.get("speaker")
+            name = msg.get("name")
+            logger.info(f"[/ws/dialog] rename_speaker: speaker={speaker} name={name!r}")
+
+        elif action == "merge_speakers" and state["phase"] == "listening":
+            # Frontend (DialogSessionView.jsx) foydalanuvchi ikkita spikerga
+            # BIR XIL ism bergandan va "bitta odam sifatida birlashtiraymi?"
+            # so'roviga "Ha" deb javob berganidan keyin yuboradi. `from` —
+            # endi tahrirlangan spiker, `into` — ismi ALLAQACHON mavjud
+            # bo'lgan spiker. Avtomatik birlashtirishdan (SPK_MERGE_SIM)
+            # farqli — bu yerda o'xshashlik chegarasi TEKSHIRILMAYDI,
+            # foydalanuvchi ANIQ tasdiqlagan.
+            from_speaker = msg.get("from")
+            into_speaker = msg.get("into")
+            if from_speaker is None or into_speaker is None or from_speaker == into_speaker:
+                logger.info(
+                    f"[/ws/dialog] merge_speakers: noto'g'ri so'rov from={from_speaker} into={into_speaker}"
+                )
+                return
+
+            result = await loop.run_in_executor(
+                None, merge_speakers_manual, state["speaker_session"], from_speaker, into_speaker
+            )
+            if result.get("merged"):
+                await _apply_merges_and_notify(result.get("merges", []))
+            else:
+                logger.info(
+                    f"[/ws/dialog] merge_speakers: no-op (from={from_speaker} into={into_speaker} topilmadi?)"
+                )
 
 
     await send_status("listening_started")

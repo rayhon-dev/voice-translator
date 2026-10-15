@@ -253,6 +253,36 @@ function _mergeFloat32Chunks(chunks) {
 export function useDialogSession() {
   const [phase, setPhase] = useState("idle"); // idle | listening | ended | error
   const [messages, setMessages] = useState([]);
+  // Backend'ning avtomatik spiker-birlashtirish ("speakers_merged") va
+  // spiker-o'chirish ("speaker_removed") voqealari — DialogSessionView.jsx
+  // o'zining spiker ism xaritasini (speakerNames) shu orqali yangilaydi
+  // (qarang undagi useEffect). Append-only ro'yxat — eski voqealar
+  // sessiya davomida saqlanadi, chunki DialogSessionView ularni allaqachon
+  // qayta ishlangan deb kuzatib boradi (indeks orqali), shuning uchun
+  // bu yerda cheklov/tozalash shart emas (sessiyaning o'zi uzoq davom
+  // etmaydi).
+  const [speakerEvents, setSpeakerEvents] = useState([]);
+  // Spiker rangi UZLUKSIZ saqlanishi uchun: {speakerId: order} — har bir
+  // spiker ID birinchi marta "turn" statusida ko'ringanda shu yerga
+  // navbatdagi BUTUN SON ("order") bilan QO'SHILADI va keyin HECH QACHON
+  // o'zgartirilmaydi/qayta hisoblanmaydi (DialogSessionView.jsx shu
+  // order'ni `% palette.length` orqali aniq rangga aylantiradi). ESKI
+  // yondashuv — har render'da `messages` massividan "kim birinchi
+  // uchraganini" qayta hisoblash — bubble o'chirilganda/birlashtirilganda
+  // qolgan spikerlarning NISBIY tartibi (demak rangi) siljib ketishi
+  // MUMKIN edi (masalan ikkita spiker orasidagi "ko'prik" bubble
+  // o'chirilsa). Bu yerda, aksincha, tayinlash FAQAT bitta joyda —
+  // handleServerMessage'dagi "turn" case'ida, YANGI (hali xaritada yo'q)
+  // ID birinchi ko'ringanda — sodir bo'ladi, shuning uchun keyingi HECH
+  // QANDAY o'chirish/birlashtirish buni qayta tartiblay olmaydi.
+  const [speakerColorOrder, setSpeakerColorOrder] = useState({});
+  // React state YANGILANISHI asinxron bo'lgani uchun (bir nechta "turn"
+  // xabari bitta render oynasida ketma-ket kelsa, `speakerColorOrder`ning
+  // "eski" qiymatiga tayanib ikkinchi marta BIR XIL order'ni berib
+  // qo'yish xavfi bor edi) — "keyingi band bo'lmagan order" alohida,
+  // SINXRON ref'da yuritiladi (bu ref FAQAT event-handler ichida, render
+  // vaqtida EMAS, o'qiladi/yangilanadi — React hook qoidalariga mos).
+  const nextSpeakerColorOrderRef = useRef(0);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null); // vaqtinchalik "eshitilmadi" kabi xabarlar uchun, error state'dan alohida
   const [audioLevel, setAudioLevel] = useState(0);
@@ -872,6 +902,17 @@ export function useDialogSession() {
             next.sort((a, b) => a.seq - b.seq);
             return next;
           });
+
+          // Rangni UZLUKSIZ saqlash uchun: shu spiker ID birinchi marta
+          // ko'rinishi — qarang `speakerColorOrder` izohi yuqorida. Agar
+          // ID ALLAQACHON xaritada bo'lsa (odatiy hol — mavjud spiker
+          // yana gapirdi) hech narsa qilinmaydi, order O'ZGARMAYDI.
+          setSpeakerColorOrder((prev) => {
+            if (msg.speaker in prev) return prev;
+            const order = nextSpeakerColorOrderRef.current;
+            nextSpeakerColorOrderRef.current += 1;
+            return { ...prev, [msg.speaker]: order };
+          });
           break;
 
         case "turn_deleted":
@@ -879,6 +920,27 @@ export function useDialogSession() {
           // o'chirgandan keyin shu statusni yuboradi, bubble ekrandan
           // olib tashlanadi.
           setMessages((prev) => prev.filter((m) => m.seq !== msg.seq));
+          break;
+
+        case "speakers_merged": {
+          // Backend ikkita spikerni (prototiplari juda o'xshash chiqqani
+          // uchun) AVTOMATIK bitta spikerga birlashtirgan — BARCHA "from"
+          // bubble'lari darhol "into"ga ko'chiriladi. Ism/rang meros olish
+          // qarori (DialogSessionView.jsx'dagi speakerNames xaritasi) shu
+          // voqeani kuzatib turgan useEffect orqali hal qilinadi.
+          const { from, into } = msg;
+          setMessages((prev) => prev.map((m) => (m.speaker === from ? { ...m, speaker: into } : m)));
+          setSpeakerEvents((prev) => [...prev, { type: "merged", from, into }]);
+          break;
+        }
+
+        case "speaker_removed":
+          // Bitta spikerning YAGONA ovoz namunasi tuzatish/o'chirish orqali
+          // olib tashlangandan keyin backend shu spiker profilini butunlay
+          // o'chiradi — DialogSessionView.jsx shu spikerning ismini/
+          // ro'yxatini o'z xaritasidan tozalaydi (bubble'larning o'zi
+          // ekranda QOLADI, faqat endi default ism/rang bilan).
+          setSpeakerEvents((prev) => [...prev, { type: "removed", speaker: msg.speaker }]);
           break;
 
         case "turn_skipped":
@@ -908,6 +970,12 @@ export function useDialogSession() {
 
     setError(null);
     setMessages([]);
+    // Yangi suhbat — rang tayinlovi ham nol'dan boshlanishi SHART, aks
+    // holda oldingi sessiyadagi spiker ID'lar bilan "band" bo'lgan order
+    // qiymatlari yangi sessiyada ham saqlanib qolib, birinchi spiker
+    // palitra boshidan EMAS, o'rtasidan rang olishi mumkin edi.
+    setSpeakerColorOrder({});
+    nextSpeakerColorOrderRef.current = 0;
     stoppedRef.current = false;
 
     try {
@@ -1025,6 +1093,37 @@ export function useDialogSession() {
     }
   }, []);
 
+  // Spiker ismlarini tahrirlash (✏️) — ism o'zi FAQAT frontend holatida
+  // (DialogSessionView.jsx'dagi speakerNames xaritasi) saqlanadi, backend
+  // mantig'iga ta'sir qilmaydi. Shunga qaramay backend'ga xabar beriladi —
+  // FAQAT [/ws/dialog] loglarida spiker ID'sini inson ismiga bog'lab
+  // qo'yish uchun (diagnostika).
+  const renameSpeaker = useCallback((speaker, name) => {
+    try {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ action: "rename_speaker", speaker, name }));
+      }
+    } catch (err) {
+      console.error("[useDialogSession] error sending rename_speaker", err);
+    }
+  }, []);
+
+  // Foydalanuvchi ikkita spikerga BIR XIL ism bergandan va "bitta odam
+  // sifatida birlashtiraymi?" so'roviga "Ha" deb javob berganidan keyin
+  // chaqiriladi (DialogSessionView.jsx) — backend shu ikki spikerning
+  // ovoz profillarini birlashtiradi (dialog.py, `merge_speakers` action)
+  // va natijada "speakers_merged" statusi qaytadi (handleServerMessage
+  // shuni ko'rib bubble'larni ko'chiradi).
+  const mergeSpeakers = useCallback((from, into) => {
+    try {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ action: "merge_speakers", from, into }));
+      }
+    } catch (err) {
+      console.error("[useDialogSession] error sending merge_speakers", err);
+    }
+  }, []);
+
   const stopDialog = useCallback(() => {
     stoppedRef.current = true;
 
@@ -1062,6 +1161,8 @@ export function useDialogSession() {
   return {
     phase,
     messages,
+    speakerEvents,
+    speakerColorOrder,
     error,
     notice,
     audioLevel,
@@ -1070,6 +1171,8 @@ export function useDialogSession() {
     stopDialog,
     correctSpeaker,
     deleteTurn,
+    renameSpeaker,
+    mergeSpeakers,
     // C5: DialogSessionView.jsx TTS pleybek boshlanishi/tugashiga ulaydi.
     pauseMic,
     resumeMic,

@@ -69,14 +69,35 @@ _embedding_load_lock = threading.Lock()
 # (nearest-neighbor, emotsiya/intonatsiya bo'yicha ovoz o'zgarishiga
 # chidamliroq). Barcha qiymatlar .env orqali sozlanadi — real suhbat
 # loglaridan ([SPK] qatoriga qarang) moslashtirish uchun.
+#
+# REAL TESTDA TOPILGAN 2 XATO (ikkisi ham shu versiyada TUZATILDI):
+#   1. Eski "pending/tasdiqlash" nomzod mexanizmi (yangi spikerni DARHOL
+#      ochish o'rniga, keyingi turn tasdiqlashini kutish) `next_id`ni FAQAT
+#      tasdiqlangandan keyin oshirardi — agar TASDIQLANMAGAN nomzoddan
+#      keyin BOSHQA (mos kelmaydigan) odam gapirsa, ikkinchisi xuddi SHU
+#      (hali band qilinmagan) raqamli YANGI nomzod sifatida ochilib,
+#      birinchisining o'rnini bosib ketardi — ikki xil odam bitta raqamga
+#      "sig'ib" qolardi. Mexanizm BUTUNLAY olib tashlandi: endi
+#      `best < SPK_NEW` va nutq yetarli uzun bo'lsa, YANGI spiker DARHOL
+#      (tasdiqlashsiz) ochiladi.
+#   2. Profilga YANGI prototip qo'shish uchun chegara (SPK_ENROLL_MIN_SIM)
+#      spiker hali EMAS/kam sonli prototiplarga ega bo'lgandayam baland
+#      edi — bitta "qiyin" founding namunadan keyin profil uzoq vaqt
+#      o'smay qolishi mumkin edi. SPK_BOOTSTRAP_PROTOTYPES soni (default 3)
+#      prototiplar yetib kelmaguncha, SPK_ACCEPT'dan yuqori HAR QANDAY
+#      turn profilni to'ldirishga yordam beradi — shundan keyin ANIQ
+#      SPK_ENROLL_MIN_SIM chegarasi amal qiladi.
 # ---------------------------------------------------------------------------
 
 # Shu va undan yuqori o'xshashlikda turn SHU spikerga ANIQ tegishli deb
 # qabul qilinadi.
 SPK_ACCEPT = float(os.environ.get("SPK_ACCEPT", "0.55"))
 # Shundan past o'xshashlikda turn HECH QANDAY mavjud spikerga tegishli
-# EMAS deb hisoblanadi (yangi ovoz nomzodi).
-SPK_NEW = float(os.environ.get("SPK_NEW", "0.35"))
+# EMAS deb hisoblanadi (yangi ovoz nomzodi). Real logdan: bir xil odamning
+# ENG PAST o'xshashligi 0.66, TURLI odamlarniki ENG KO'PI 0.33 edi — 0.35
+# bu ikkisi orasida juda chekka (deyarli turli-odam tomonga yopishgan)
+# turardi, 0.40'ga ko'tarildi.
+SPK_NEW = float(os.environ.get("SPK_NEW", "0.40"))
 # Yangi spiker (yoki yangi prototip) uchun "nutq" (trim qilingandan keyingi,
 # haqiqiy ovoz bo'lgan) davomiyligi kamida shuncha bo'lishi SHART — qisqa
 # namunalar ovoz profilini "ifloslantirishi" (noaniq/past-sifatli embedding)
@@ -97,6 +118,44 @@ SPK_SHORT_TURN_S = float(os.environ.get("SPK_SHORT_TURN_S", "1.5"))
 # prototiplardan biriga "deyarli bir xil" (takroriy namuna), qo'shishning
 # hojati yo'q.
 SPK_DUPLICATE_PROTOTYPE_SIM = 0.95
+
+# REAL TESTDA TOPILGAN MUAMMO: ilgari SPK_ACCEPT (0.55)dan yuqori HAR
+# QANDAY turn (hatto chegaraga yaqin, masalan 0.56) ham yangi prototip
+# sifatida qo'shilardi — agar bu turn aslida XATO qabul qilingan bo'lsa
+# (masalan boshqa odam SPK_ACCEPT'ni arang o'tib ketsa), noto'g'ri
+# prototip profilni "ifloslantirib", keyingi turnlar uchun aniqlikni
+# yomonlashtirardi. Endi prototip qo'shish uchun ANCHA qattiqroq, alohida
+# chegara — SPK_ACCEPT'dan yuqori bo'lsa ham, SPK_ENROLL_MIN_SIM'dan past
+# o'xshashlik FAQAT spikerga TAYINLASH uchun yetarli, lekin ovoz profilini
+# YANGILASH uchun YETARLI EMAS deb hisoblanadi. BUNING YAGONA ISTISNOSI —
+# pastdagi SPK_BOOTSTRAP_PROTOTYPES (profil hali YETARLICHA prototipga ega
+# bo'lmaganda, bu chegara vaqtincha qo'llanmaydi).
+SPK_ENROLL_MIN_SIM = float(os.environ.get("SPK_ENROLL_MIN_SIM", "0.65"))
+
+# REAL TESTDA TOPILGAN MUAMMO: spiker hali FAQAT 1 ta ("founding")
+# prototipga ega bo'lganda, agar o'sha YAGONA namuna tasodifan "qiyin"
+# (odamning o'z ovoz diapazonidagi chekka holatini aks ettiruvchi) bo'lsa,
+# SPK_ENROLL_MIN_SIM (0.65) talabi KEYINGI haqiqiy namunalar tomonidan
+# ham uzoq vaqt qondirilmay qolishi mumkin edi — profil "qotib" qolardi
+# (1 ta prototipdan o'smasdi). Shu sababli: profilda SPK_BOOTSTRAP_
+# PROTOTYPES'dan KAM prototip bo'lsa, SPK_ACCEPT'dan yuqori HAR QANDAY
+# turn (SPK_ENROLL_MIN_SIM'ni tekshirmasdan) profilni to'ldirishga
+# yordam beradi — shu dastlabki bosqichdan keyin ANIQ SPK_ENROLL_MIN_SIM
+# chegarasi amal qiladi.
+SPK_BOOTSTRAP_PROTOTYPES = int(os.environ.get("SPK_BOOTSTRAP_PROTOTYPES", "3"))
+
+# REAL TESTDA TOPILGAN MUAMMO: yuqoridagi tuzatishlardan OLDIN, bitta
+# tuzatish (correct_speaker) xato spikerga qilingandan keyin ("Bir xil
+# spikerga tuzatish profilni ifloslantirgan") ikki TURLI raqamli spiker
+# (masalan 2 va 3) AMALDA bir xil odamning ovozi bo'lib qolgan edi
+# (sims={2:0.83, 3:0.83}). Bunday holatlarni AVTOMATIK tuzatish uchun:
+# har bir enrollment/tuzatishdan KEYIN, ixtiyoriy ikki spiker prototiplari
+# orasidagi ENG KATTA o'xshashlik shu chegaradan yuqori bo'lsa, ikkisi
+# BITTA spikerga (kichik raqamliga) birlashtiriladi (qarang
+# _check_and_merge). Bu — profilni "tozalab turadigan" xavfsizlik to'ri,
+# yuqoridagi tuzatishlar asosiy sabablarni yo'qotgandan keyin ham foydali
+# (masalan foydalanuvchi qo'lda noto'g'ri tuzatish qilsa).
+SPK_MERGE_SIM = float(os.environ.get("SPK_MERGE_SIM", "0.65"))
 
 
 def _trim_trailing_silence(wav: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -272,17 +331,18 @@ def warmup(run_inference: bool = True) -> None:
 
 def create_session():
     return {
-        # speaker_id(int) -> {"prototypes": [np.ndarray, ...]} — birinchi
-        # (index 0) prototip "founding" namuna, HECH QACHON FIFO orqali
-        # olib tashlanmaydi (qarang _add_prototype).
+        # speaker_id(int) -> {"prototypes": [{"seq": int, "embedding": np.ndarray}, ...]}
+        # — har bir prototip AYNAN qaysi turn (seq) orqali qo'shilganini
+        # eslab turadi (correct_speaker/delete_turn shu orqali, aynan
+        # O'ZI qo'shgan namunani topib olib tashlashi uchun). Birinchi
+        # (index 0) prototip "founding" namuna — SPK_MAX_PROTOTYPES'dan
+        # oshganda avtomatik FIFO orqali olib tashlanmaydi (qarang
+        # _add_prototype), lekin aniq seq(lar) bo'yicha (_pop_prototypes_by_seqs)
+        # BOSHQA har qanday prototip kabi olib tashlanishi mumkin.
         "speakers": {},
-        # Hali TASDIQLANMAGAN yangi-spiker nomzodi: {"tentative_id":,
-        # "embedding":, "speech_s":, "seq":} yoki None. Bir vaqtning
-        # o'zida FAQAT bitta nomzod kuzatiladi (qarang identify_speaker).
-        "pending_candidate": None,
         "next_id": 1,
         # SPK_SHORT_TURN_S'dan qisqa, noaniq turnlar uchun fallback —
-        # eng SO'NGGI qaytarilgan (pending/uncertain ham) spiker.
+        # eng SO'NGGI qaytarilgan (uncertain ham) spiker.
         "last_speaker": None,
         "lock": threading.Lock(),
     }
@@ -317,15 +377,98 @@ def _speaker_best_sim(profile: dict, embedding: np.ndarray) -> float:
     yaratilgan "zaxira" spiker) — hech qachon moslashmaydigan -1.0."""
     if not profile["prototypes"]:
         return -1.0
-    return max(_cosine_sim(embedding, proto) for proto in profile["prototypes"])
+    return max(_cosine_sim(embedding, p["embedding"]) for p in profile["prototypes"])
 
 
-def _add_prototype(profile: dict, embedding: np.ndarray) -> None:
-    profile["prototypes"].append(embedding)
+def _add_prototype(profile: dict, embedding: np.ndarray, seq: int) -> None:
+    profile["prototypes"].append({"seq": seq, "embedding": embedding})
     if len(profile["prototypes"]) > SPK_MAX_PROTOTYPES:
-        # index 0 — "founding" prototip, HAR DOIM saqlanadi; eng ESKI
-        # (lekin founding EMAS) prototip index 1'da turadi.
+        # index 0 — "founding" prototip, FIFO orqali HECH QACHON olib
+        # tashlanmaydi; eng ESKI (lekin founding EMAS) prototip index
+        # 1'da turadi.
         del profile["prototypes"][1]
+
+
+def _pop_prototypes_by_seqs(profile: dict, seqs) -> list[dict]:
+    """`seqs` (bitta bubble'ga tegishli BARCHA seq'lar — qarang dialog.py'dagi
+    `merged_seqs`, RETROAKTIV BIRLASHTIRISH orqali bitta bubble bir nechta
+    audio bo'lagidan — har biri O'ZINING prototipini qo'shgan bo'lishi
+    mumkin — tashkil topgan bo'lishi mumkin) bilan TEGLANGAN prototiplarni
+    ro'yxatdan olib tashlaydi va ularni ({"seq", "embedding"} lug'atlari
+    ro'yxati sifatida, ASL seq tegi bilan) qaytaradi — correct_speaker
+    shu tegni SAQLAB qolib, target spikerga qo'shadi.
+
+    REAL TESTDA TOPILGAN XATO: ilgari FAQAT bitta (asosiy) seq bo'yicha
+    qidirilardi — agar davom bo'lagi (masalan seq=10) ALLAQACHON o'z
+    prototipini (seq=10 tegi bilan) qo'shgan bo'lsa, u ESKI spikerda
+    saqlanib qolardi (tuzatish FAQAT seq=9 tegli prototipni ko'chirardi).
+
+    Bu yerda "founding" himoyasi YO'Q (FIFO'dan farqli) — foydalanuvchi
+    ANIQ shu bubble'ni o'chirish/tuzatishni so'ragan, demak bu DELIBERATE
+    harakat."""
+    seqs_set = set(seqs)
+    popped = [proto for proto in profile["prototypes"] if proto["seq"] in seqs_set]
+    profile["prototypes"] = [proto for proto in profile["prototypes"] if proto["seq"] not in seqs_set]
+    return popped
+
+
+def _max_cross_sim(profile_a: dict, profile_b: dict) -> float:
+    best = -1.0
+    for pa in profile_a["prototypes"]:
+        for pb in profile_b["prototypes"]:
+            sim = _cosine_sim(pa["embedding"], pb["embedding"])
+            if sim > best:
+                best = sim
+    return best
+
+
+def _merge_profile_into(target_profile: dict, source_profile: dict) -> None:
+    target_profile["prototypes"].extend(source_profile["prototypes"])
+    while len(target_profile["prototypes"]) > SPK_MAX_PROTOTYPES:
+        del target_profile["prototypes"][1]
+
+
+def _check_and_merge(session) -> list[tuple[int, int, float]]:
+    """`session["lock"]` ALLAQACHON ushlab turilgan paytda chaqirilishi
+    SHART (identify_speaker/apply_speaker_correction/remove_turn_prototype
+    ICHIDAN). Ixtiyoriy ikki spikerning prototiplari orasidagi ENG KATTA
+    o'xshashlik SPK_MERGE_SIM'dan yuqori bo'lsa, ikkisini KICHIK raqamli
+    spikerga birlashtiradi (prototiplar qo'shiladi, SPK_MAX_PROTOTYPES
+    qoidasi bilan) — bir nechta birlashish ZANJIRI (masalan 3->2, keyin
+    2->1) bo'lsa, HAMMASI bitta chaqiruvda hal qilinadi (`while changed`).
+
+    Qaytaradi: [(from_id, into_id, sim), ...] — AMALGA OSHGAN birlashishlar
+    ro'yxati, SODIR BO'LGAN tartibda (chaqiruvchi shu tartibda ketma-ket
+    qo'llab, zanjirlarni to'g'ri "kuzatib borishi" mumkin — qarang
+    dialog.py'dagi _apply_merges_and_notify)."""
+    events: list[tuple[int, int, float]] = []
+    changed = True
+    while changed:
+        changed = False
+        ids = sorted(session["speakers"].keys())
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = ids[i], ids[j]
+                sim = _max_cross_sim(session["speakers"][a], session["speakers"][b])
+                if sim >= SPK_MERGE_SIM:
+                    _merge_profile_into(session["speakers"][a], session["speakers"][b])
+                    del session["speakers"][b]
+                    events.append((b, a, sim))
+                    logger.info(f"[SPK][MERGE] from={b} into={a} sim={sim:.3f}")
+                    changed = True
+                    break
+            if changed:
+                break
+    return events
+
+
+def _apply_remap(speaker_id, merges: list[tuple[int, int, float]]):
+    """Berilgan spiker ID'ni, `merges` ro'yxatidagi (ketma-ket, zanjir
+    bo'lishi mumkin) birlashishlardan KEYINGI YAKUNIY ID'ga aylantiradi."""
+    for frm, into, _ in merges:
+        if speaker_id == frm:
+            speaker_id = into
+    return speaker_id
 
 
 def identify_speaker(
@@ -341,15 +484,14 @@ def identify_speaker(
     FAQAT [SPK] logiga chiqarish uchun — qarorga HECH QANDAY ta'sir
     qilmaydi, tarjima yo'nalishi dialog.py'da mustaqil hal qilinadi).
 
-    Qaytaradi: {"speaker": int, "uncertain": bool, "pending": bool,
-    "decision": str, "confirmed_pending_seq": int|None}.
+    Qaytaradi: {"speaker": int, "uncertain": bool, "decision": str,
+    "merges": [(from_id, into_id, sim), ...]}.
 
-        "confirmed_pending_seq" — agar bu chaqiruv ILGARI "pending" deb
-        belgilangan nomzodni HAQIQIY yangi spiker sifatida TASDIQLASA,
-        o'sha ESKI turn'ning seq'i shu yerda qaytadi — dialog.py shu
-        seq'ni YANGI spiker ID bilan qayta yuborishi (upsert) kerak,
-        aks holda o'sha bubble abadiy "pending/uncertain" holatda qolib
-        ketadi.
+        "merges" — enrollment natijasida ixtiyoriy ikki spiker BIR ODAM
+        ekani aniqlanib AVTOMATIK birlashtirilgan bo'lsa (qarang
+        _check_and_merge), shu voqealar ro'yxati — dialog.py buni frontendga
+        "speakers_merged" sifatida uzatishi va o'zining turn_history/
+        last_turn_by_speaker holatini mos ravishda yangilashi SHART.
 
     Qaror daraxti (batafsil — [SPK] logiga qarang, chegaralarni real
     suhbat loglaridan sozlash uchun):
@@ -362,24 +504,18 @@ def identify_speaker(
           javoblarda ovoz-profil ishonchsiz).
       3b. best >= SPK_ACCEPT → shu spiker. Agar NUTQ (trim qilingan)
           >= SPK_MIN_ENROLL_SPEECH_S VA best < SPK_DUPLICATE_PROTOTYPE_SIM
-          (ya'ni bu aynan takroriy namuna EMAS) — YANGI prototip
-          qo'shiladi (SPK_MAX_PROTOTYPES'dan oshsa, eng eskisi — founding
-          BUNDAN MUSTASNO — olib tashlanadi).
+          (ya'ni bu aynan takroriy namuna EMAS) VA (profilda hali
+          SPK_BOOTSTRAP_PROTOTYPES'dan KAM prototip BOR YOKI best >=
+          SPK_ENROLL_MIN_SIM) — YANGI prototip qo'shiladi.
       3c. SPK_NEW <= best < SPK_ACCEPT → eng yaqin spikerga, uncertain=True,
           prototip QO'SHILMAYDI.
       3d. best < SPK_NEW (yoki hali spiker yo'q):
-          - nutq >= SPK_MIN_ENROLL_SPEECH_S:
-            - spiker UMUMAN yo'q bo'lsa → BIRINCHI spiker sifatida
-              DARHOL ochiladi (tasdiqlash shart emas — taqqoslaydigan
-              hech kim yo'q).
-            - aks holda, agar ALLAQACHON pending nomzod bo'lsa VA shu
-              nomzod bilan o'xshashlik >= SPK_ACCEPT → nomzod TASDIQLANADI
-              (haqiqiy, keyingi raqamli spiker bo'ladi;
-              confirmed_pending_seq orqali eski turn ham yangilanadi).
-            - aks holda → YANGI nomzod ochiladi (pending=True,
-              uncertain=True), hali HAQIQIY spiker emas.
+          - nutq >= SPK_MIN_ENROLL_SPEECH_S → YANGI spiker DARHOL ochiladi
+            (keyingi raqam, decision="new", uncertain=False) — "tasdiqlash"
+            bosqichi YO'Q (bu eski, xato mexanizm edi — qarang fayl boshidagi
+            izoh).
           - nutq qisqa → eng yaqin spikerga (bor bo'lsa) uncertain=True,
-            yangi spiker/nomzod OCHILMAYDI."""
+            yangi spiker OCHILMAYDI."""
     t0 = time.perf_counter()
     trimmed = _trim_trailing_silence(wav, sample_rate)
     trim_ms = (time.perf_counter() - t0) * 1000
@@ -407,11 +543,6 @@ def identify_speaker(
                 for sid, profile in speakers.items():
                     sims[sid] = _speaker_best_sim(profile, embedding)
 
-            cand_sim = None
-            pending_candidate = session["pending_candidate"]
-            if embedding is not None and pending_candidate is not None:
-                cand_sim = _cosine_sim(embedding, pending_candidate["embedding"])
-
             if sims:
                 best_id = max(sims, key=sims.get)
                 best_sim = sims[best_id]
@@ -422,8 +553,6 @@ def identify_speaker(
             decision: str
             result_speaker = None
             uncertain = False
-            pending = False
-            confirmed_pending_seq = None
 
             if embedding is None:
                 # Audio juda qisqa/jim — hech qanday ovoz dalili yo'q.
@@ -450,12 +579,24 @@ def identify_speaker(
                 result_speaker = best_id
                 profile = speakers[best_id]
                 if speech_s >= SPK_MIN_ENROLL_SPEECH_S and best_sim < SPK_DUPLICATE_PROTOTYPE_SIM:
-                    _add_prototype(profile, embedding)
-                    logger.info(
-                        f"[SPK][ENROLL] speaker={best_id} yangi prototip qo'shildi "
-                        f"(sim={best_sim:.3f} < {SPK_DUPLICATE_PROTOTYPE_SIM}) — "
-                        f"jami prototiplar={len(profile['prototypes'])}"
-                    )
+                    is_bootstrap = len(profile["prototypes"]) < SPK_BOOTSTRAP_PROTOTYPES
+                    if is_bootstrap or best_sim >= SPK_ENROLL_MIN_SIM:
+                        _add_prototype(profile, embedding, seq)
+                        logger.info(
+                            f"[SPK][ENROLL] speaker={best_id} yangi prototip qo'shildi "
+                            f"(sim={best_sim:.3f}{' bootstrap' if is_bootstrap else ''}) — "
+                            f"jami prototiplar={len(profile['prototypes'])}"
+                        )
+                    else:
+                        # Turn SPK_ACCEPT'ni o'tdi (spikerga TAYINLANDI), lekin
+                        # SPK_ENROLL_MIN_SIM'dan past — profilga XATO (noto'g'ri
+                        # qabul qilingan bo'lishi mumkin) namuna qo'shib,
+                        # ifloslantirish xavfidan saqlanish uchun prototip
+                        # QO'SHILMAYDI.
+                        logger.info(
+                            f"[SPK][ENROLL] skipped sim={best_sim:.3f} < {SPK_ENROLL_MIN_SIM} "
+                            f"speaker={best_id}"
+                        )
 
             elif best_id is not None and SPK_NEW <= best_sim < SPK_ACCEPT:
                 decision = "uncertain"
@@ -463,40 +604,14 @@ def identify_speaker(
                 uncertain = True
 
             elif speech_s >= SPK_MIN_ENROLL_SPEECH_S:
-                if not speakers:
-                    new_id = session["next_id"]
-                    session["next_id"] += 1
-                    speakers[new_id] = {"prototypes": [embedding]}
-                    decision = "new"
-                    result_speaker = new_id
-                elif pending_candidate is not None and cand_sim is not None and cand_sim >= SPK_ACCEPT:
-                    new_id = pending_candidate["tentative_id"]
-                    speakers[new_id] = {"prototypes": [pending_candidate["embedding"]]}
-                    if speech_s >= SPK_MIN_ENROLL_SPEECH_S and cand_sim < SPK_DUPLICATE_PROTOTYPE_SIM:
-                        _add_prototype(speakers[new_id], embedding)
-                    decision = "confirm_new"
-                    result_speaker = new_id
-                    confirmed_pending_seq = pending_candidate["seq"]
-                    session["pending_candidate"] = None
-                    # MUHIM: tentative_id ENDI haqiqiy spiker sifatida
-                    # "iste'mol qilindi" — next_id shuni hisobga olib
-                    # oldinga surilishi SHART, aks holda keyingi pending
-                    # nomzod xuddi shu ID'ni qayta ishlatib, ENDI MAVJUD
-                    # spikerning prototiplarini ustiga YOZIB yuborgan
-                    # bo'lardi (real testda topilgan xato).
-                    session["next_id"] = max(session["next_id"], new_id + 1)
-                else:
-                    tentative_id = session["next_id"]
-                    session["pending_candidate"] = {
-                        "tentative_id": tentative_id,
-                        "embedding": embedding,
-                        "speech_s": speech_s,
-                        "seq": seq,
-                    }
-                    decision = "pending"
-                    result_speaker = tentative_id
-                    uncertain = True
-                    pending = True
+                # best < SPK_NEW (yoki hali spiker yo'q) VA nutq yetarli
+                # uzun — YANGI spiker DARHOL ochiladi, tasdiqlash YO'Q.
+                new_id = session["next_id"]
+                session["next_id"] += 1
+                speakers[new_id] = {"prototypes": [{"seq": seq, "embedding": embedding}]}
+                decision = "new"
+                result_speaker = new_id
+
             else:
                 # best < SPK_NEW (yoki spiker yo'q) VA nutq qisqa.
                 if best_id is not None:
@@ -516,12 +631,15 @@ def identify_speaker(
                     result_speaker = new_id
                     uncertain = True
 
+            # Har bir enrollment/yangi-spikerdan KEYIN — ixtiyoriy ikki
+            # spiker aslida bitta odam bo'lib qolmaganini tekshiramiz
+            # (qarang SPK_MERGE_SIM izohi yuqorida).
+            merges = _check_and_merge(session)
+            result_speaker = _apply_remap(result_speaker, merges)
+
             session["last_speaker"] = result_speaker
 
             sims_str = ", ".join(f"{sid}:{sim:.2f}" for sid, sim in sims.items())
-            if cand_sim is not None:
-                sims_str = f"{sims_str}, " if sims_str else ""
-                sims_str += f"cand:{cand_sim:.2f}"
             best_str = f"{best_id}({best_sim:.2f})" if best_id is not None else "none"
             proto_str = ", ".join(f"{sid}:{len(p['prototypes'])}" for sid, p in speakers.items())
             logger.info(
@@ -540,9 +658,8 @@ def identify_speaker(
             return {
                 "speaker": result_speaker,
                 "uncertain": uncertain,
-                "pending": pending,
                 "decision": decision,
-                "confirmed_pending_seq": confirmed_pending_seq,
+                "merges": merges,
             }
     except Exception as e:
         logger.error(f"[SPK][ERROR] identify_speaker raised {e!r}")
@@ -554,25 +671,38 @@ def has_known_speakers(session) -> bool:
     profili allaqachon mavjud bo'lsa, juda qisqa/juda past-energiyali
     (frontend VAD'ning past chegarasi tufayli shovqindan ham "nutq" deb
     yuborilgan bo'lishi mumkin bo'lgan) audio bo'laklarini STT/embedding'ga
-    yubormasdan oldin saralab tashlash mumkin. Eski (A/B ikki slot
-    to'lgan-to'lmaganini tekshiruvchi) `both_slots_bound()`dan farqli —
-    endi spikerlar soni cheklanmagani uchun "kamida bitta spiker bor"
-    yetarli signal."""
+    yubormasdan oldin saralab tashlash mumkin."""
     with session["lock"]:
         return len(session["speakers"]) > 0
 
 
-def apply_speaker_correction(session, wav: np.ndarray, sample_rate: int, target_speaker) -> int:
+def apply_speaker_correction(
+    session, wav: np.ndarray, sample_rate: int, seqs: list[int], old_speaker, target_speaker
+) -> dict:
     """Har bir bubble'dagi "spikerni almashtirish" menyusi uchun —
     foydalanuvchi mavjud spikerlardan birini YOKI "Yangi spiker"ni
     tanlaganda chaqiriladi (dialog.py, `correct_speaker` action).
     `target_speaker` — mavjud spiker ID (int) yoki literal `"new"` satri.
+    (`target_speaker == old_speaker` holati dialog.py tarafida ALLAQACHON
+    no-op sifatida ushlanadi — bu funksiyaga umuman yetib kelmaydi.)
 
-    Foydalanuvchining o'zi tasdiqlagani — identify_speaker()dagi avtomatik
-    qarordan HAM ishonchli signal, shuning uchun hech qanday o'xshashlik
-    chegarasi tekshirilmasdan, embedding to'g'ridan-to'g'ri TO'G'RI
-    spikerning prototiplariga qo'shiladi. Qaytaradi: YAKUNIY spiker ID
-    (target_speaker="new" bo'lsa, yangi ajratilgan ID)."""
+    `seqs` — shu BUBBLE'ga tegishli BARCHA seq'lar (dialog.py'dagi
+    `merged_seqs`: RETROAKTIV BIRLASHTIRISH orqali bir nechta audio
+    bo'lagi, HAR BIRI o'zining prototipini qo'shgan bo'lishi mumkin, bitta
+    bubble'ga birlashtirilgan bo'lishi mumkin). ESKI spikerga (`old_speaker`)
+    shu seq'larning BIRI orqali qo'shilgan BARCHA prototiplar topib olib
+    tashlanadi (REAL TESTDA TOPILGAN XATO: ilgari FAQAT asosiy seq
+    tekshirilardi — davom bo'lagi tegli prototip eski spikerda saqlanib
+    qolib, "Speaker 3 o'chmadi va o'sha odamning ovozini saqlab qoldi"
+    degan holatga olib kelardi). Keyin O'SHA (ASL seq teglari bilan, yoki,
+    agar hech qaysi seq prototip qo'shmagan bo'lsa, yangidan hisoblangan va
+    birinchi seq bilan teglangan) embedding(lar) TARGET spikerga qo'shiladi.
+
+    Qaytaradi: {"speaker": int, "removed_speaker": int|None,
+    "merges": [...]}. `removed_speaker` — ESKI spikerda ENDI birorta ham
+    prototip qolmasa (shu bubble uning YAGONA namunasi bo'lgan ekan),
+    shu spikerning o'zi butunlay o'chiriladi va ID'si shu yerda qaytadi —
+    dialog.py buni frontendga "speaker_removed" sifatida uzatishi kerak."""
     trimmed = _trim_trailing_silence(wav, sample_rate)
     duration_s = len(trimmed) / sample_rate
     original_duration_s = len(wav) / sample_rate
@@ -580,45 +710,127 @@ def apply_speaker_correction(session, wav: np.ndarray, sample_rate: int, target_
         trimmed = wav
         duration_s = original_duration_s
 
+    primary_seq = seqs[0]
+
     with session["lock"]:
+        removed_speaker = None
+
+        old_profile = session["speakers"].get(old_speaker)
+        moved_protos: list[dict] = []
+        if old_profile is not None:
+            moved_protos = _pop_prototypes_by_seqs(old_profile, seqs)
+            if not old_profile["prototypes"]:
+                del session["speakers"][old_speaker]
+                removed_speaker = old_speaker
+                if session["last_speaker"] == old_speaker:
+                    session["last_speaker"] = None
+
         if target_speaker == "new":
             target_speaker = session["next_id"]
             session["next_id"] += 1
 
-        if duration_s < MIN_TRIMMED_DURATION_S:
-            logger.info(
-                f"[SPK][CORRECT] audio juda qisqa ({duration_s:.2f}s) — speaker={target_speaker} "
-                f"uchun prototip QO'SHILMADI"
-            )
-            if target_speaker not in session["speakers"]:
-                session["speakers"][target_speaker] = {"prototypes": []}
-            session["last_speaker"] = target_speaker
-            return target_speaker
+        # Qo'shiladigan embedding(lar): agar bu bubble ALLAQACHON bir yoki
+        # bir nechta prototip ("moved_protos") qo'shgan bo'lsa, AYNAN
+        # O'SHALARNI (ASL seq teglari bilan) qayta ishlatamiz (qayta
+        # hisoblash shart emas) — aks holda, agar audio yetarlicha uzun
+        # bo'lsa, yangidan hisoblab, `primary_seq` bilan teglaymiz.
+        # Foydalanuvchi TASDIQLAGANI uchun hech qanday o'xshashlik chegarasi
+        # (SPK_ACCEPT/SPK_ENROLL_MIN_SIM) bu yerda tekshirilmaydi.
+        if not moved_protos and duration_s >= MIN_TRIMMED_DURATION_S:
+            moved_protos = [{"seq": primary_seq, "embedding": _embed(trimmed, sample_rate)}]
 
-        embedding = _embed(trimmed, sample_rate)
-        profile = session["speakers"].get(target_speaker)
-        if profile is None:
-            session["speakers"][target_speaker] = {"prototypes": [embedding]}
-        else:
-            _add_prototype(profile, embedding)
+        if moved_protos:
+            profile = session["speakers"].get(target_speaker)
+            if profile is None:
+                session["speakers"][target_speaker] = {"prototypes": []}
+                profile = session["speakers"][target_speaker]
+            for proto in moved_protos:
+                _add_prototype(profile, proto["embedding"], proto["seq"])
+        elif target_speaker not in session["speakers"]:
+            session["speakers"][target_speaker] = {"prototypes": []}
+
         session["last_speaker"] = target_speaker
 
-    logger.info(f"[SPK][CORRECT] speaker={target_speaker} — foydalanuvchi tuzatishi orqali prototip qo'shildi")
-    return target_speaker
+        merges = _check_and_merge(session)
+        target_speaker = _apply_remap(target_speaker, merges)
+
+    logger.info(
+        f"[SPK][CORRECT] seqs={seqs} {old_speaker} -> {target_speaker}"
+        + (f" (speaker={removed_speaker} prototip qolmagani uchun o'chirildi)" if removed_speaker is not None else "")
+    )
+    return {"speaker": target_speaker, "removed_speaker": removed_speaker, "merges": merges}
 
 
-def remove_speaker(session, speaker_id) -> None:
-    """delete_turn uchun — dialog.py, shu spikerni "ochgan" (yagona) turn
-    o'chirilganda, shu spikerning ENDI hech qanday turn'ga tegishli
-    emasligini tekshirgandan KEYIN chaqiradi. Spiker profilini, agar u
-    hozirgi `pending_candidate`/`last_speaker` bo'lsa, shu holatlardan ham
-    tozalaydi — aks holda o'chirilgan spiker "jim" holda sessiya holatida
-    osilib qolgan bo'lardi."""
+def remove_turn_prototype(session, speaker_id, seqs: list[int]) -> dict:
+    """delete_turn uchun — shu bubble'ga tegishli BARCHA seq'lar (`seqs`,
+    qarang dialog.py'dagi `merged_seqs`) `speaker_id`ga QO'SHGAN BARCHA
+    prototiplar (agar bo'lsa) olib tashlanadi. Agar shu spikerda ENDI
+    birorta ham prototip qolmasa, spiker profilining o'zi butunlay
+    o'chiriladi.
+
+    Qaytaradi: {"removed_speaker": int|None, "merges": [...]} — dialog.py
+    buni correct_speaker bilan BIR XIL tarzda frontendga uzatadi."""
     with session["lock"]:
-        if speaker_id in session["speakers"]:
-            del session["speakers"][speaker_id]
-            logger.info(f"[SPK][DELETE] speaker={speaker_id} profili o'chirildi")
-        if session["last_speaker"] == speaker_id:
-            session["last_speaker"] = None
-        if session["pending_candidate"] is not None and session["pending_candidate"]["tentative_id"] == speaker_id:
-            session["pending_candidate"] = None
+        removed_speaker = None
+        profile = session["speakers"].get(speaker_id)
+        if profile is not None:
+            popped = _pop_prototypes_by_seqs(profile, seqs)
+            if popped and not profile["prototypes"]:
+                del session["speakers"][speaker_id]
+                removed_speaker = speaker_id
+                if session["last_speaker"] == speaker_id:
+                    session["last_speaker"] = None
+
+        merges = _check_and_merge(session)
+
+    if removed_speaker is not None:
+        logger.info(
+            f"[SPK][DELETE] speaker={speaker_id} profili o'chirildi "
+            f"(turn seqs={seqs} o'chirilgandan keyin prototip qolmadi)"
+        )
+    return {"removed_speaker": removed_speaker, "merges": merges}
+
+
+def merge_speakers_manual(session, from_speaker, into_speaker) -> dict:
+    """Foydalanuvchi ikkita spikerga BIR XIL ism bergandan keyin — frontend
+    (DialogSessionView.jsx) "bitta odam sifatida birlashtiraymi?" so'rovini
+    tasdiqlagach — chaqiriladi (dialog.py, `merge_speakers` action).
+    `from_speaker`ning BARCHA prototiplari `into_speaker`ga ko'chiriladi
+    (SPK_MAX_PROTOTYPES qoidasi — birinchi/"founding" prototiplar
+    saqlanib qolishi — bilan, qarang _merge_profile_into), so'ng
+    `from_speaker` profili butunlay o'chiriladi.
+
+    REAL TESTDA TOPILGAN MUAMMO: avtomatik birlashtirish (_check_and_merge,
+    SPK_MERGE_SIM=0.65) bu holatni ushlay olmagan edi (sims={3:0.72,
+    4:0.61} — 0.61 < 0.65), chunki ikki spiker profili HALI yetarlicha
+    o'xshash emas edi, garchi ism bo'yicha BITTA odam ekani aniq bo'lsa
+    ham — shu sababli foydalanuvchi QO'LDA tasdiqlagan birlashtirish kerak.
+
+    Qaytaradi: {"merged": bool, "merges": [(from, into, 1.0), ...]} —
+    birinchi element shu AYNAN so'ralgan birlashtirish, qolganlari (agar
+    bo'lsa) shu amaldan KEYIN avtomatik aniqlangan ZANJIRDAGI qo'shimcha
+    birlashtirishlar (_check_and_merge)."""
+    with session["lock"]:
+        if from_speaker == into_speaker:
+            return {"merged": False, "merges": []}
+        from_profile = session["speakers"].get(from_speaker)
+        into_profile = session["speakers"].get(into_speaker)
+        if from_profile is None or into_profile is None:
+            return {"merged": False, "merges": []}
+
+        _merge_profile_into(into_profile, from_profile)
+        del session["speakers"][from_speaker]
+        if session["last_speaker"] == from_speaker:
+            session["last_speaker"] = into_speaker
+
+        # `chain_merges` — shu AMALDAN KEYIN (masalan natijada endi 2 va 5
+        # ham o'xshash chiqib qolsa) ANIQLANGAN qo'shimcha birlashtirishlar.
+        # Qaytariladigan ro'yxatning BIRINCHI elementi har doim ASL
+        # (remap qilinmagan) `into_speaker`ga ishora qilishi SHART — dialog.py
+        # _apply_merges_and_notify() ularni shu TARTIBDA ketma-ket qo'llaydi
+        # (avval from->into, keyin zanjirni "ta'qib qiladi").
+        chain_merges = _check_and_merge(session)
+
+    final_into = _apply_remap(into_speaker, chain_merges)
+    logger.info(f"[SPK][MERGE] reason=user from={from_speaker} into={final_into}")
+    return {"merged": True, "merges": [(from_speaker, into_speaker, 1.0)] + chain_merges}
