@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getSileroModel, SILERO_FRAME_SAMPLES } from "../lib/sileroVad";
 
 const WS_URL = "ws://localhost:8000/ws/dialog";
 
@@ -126,14 +127,38 @@ const SPEECH_LEVEL_EMA_ALPHA = 0.1; // sekin EMA — bir martalik baland fon-imp
 // yuqori bo'lgandagina turn RASMAN boshlanadi. PRE_ROLL_MS (300ms) bu
 // qiymatdan katta bo'lishi SHART — shunda tasdiqlash davridagi audio ham
 // (preRoll orqali) yo'qolmaydi, alohida bufer kerak emas.
-const MIN_SPEECH_START_MS = 150;
+//
+// Mentor demo'da topilgan 1-muammo tuzatishi: avval 150ms edi, Silero
+// VAD (pastga qarang) uchun ANIQ talab qilingan 200ms'ga oshirildi — bitta
+// umumiy "tasdiqlash oynasi" sifatida fallback (energiya) yo'lida ham
+// ishlatiladi, ikkisini alohida ushlab turish shart emas.
+const MIN_SPEECH_START_MS = 200;
 
-// Muqobil/qo'shimcha variant (bu bosqichda ISHLATILMAGAN, faqat
-// hujjatlashtirilgan — qarang fayl oxiridagi "@ricky0123/vad-web" izohi):
-// Silero VAD (@ricky0123/vad-web) neyron-tarmoq asosidagi, shovqinga
-// chidamliroq nutq aniqlashni taqdim etadi, lekin alohida model
-// yuklanishini (WASM+ONNX, ~1-2MB) va butunlay boshqa integratsiya
-// modelini talab qiladi.
+// --- Mentor demo'da topilgan 1-muammo: Silero (neyron-tarmoq) VAD ---
+// Energiya (RMS) chegarasi shovqinli xonada noiseFloor'ga qarab ko'tarilib
+// ketadi — oddiy ovozda gapirilganda "Tinglanmoqda…" holatida qotib qoladi,
+// faqat baland gapirganda ishlaydi. Silero VAD (@ricky0123/vad-web,
+// onnxruntime-web/WASM orqali) shovqin turiga unchalik bog'liq bo'lmagan,
+// o'rgatilgan nutq-ehtimollik modeli — endi ASOSIY manba, energiya chegarasi
+// FAQAT model yuklanmagan/xato bergan holatlar uchun zaxira (qarang
+// sileroReadyRef/handleWorkletChunk pastda). D1'dagi near-field (nisbiy RMS)
+// qoidasi ikkala holatda ham QO'SHIMCHA shart sifatida saqlanadi — Silero
+// "nutq" desa ham, ovoz joriy spiker darajasining NEAR_FIELD_RATIO
+// ulushidan past bo'lsa, fon (orqadagi gap) deb hisoblanadi.
+//
+// Gisterezis: start uchun >= VAD_POS_THRESHOLD, lekin tugash uchun ANDUN
+// pastroq VAD_NEG_THRESHOLD ishlatiladi (oraliqdagi ehtimollik qiymatlari
+// "oldingi holatni davom ettiradi") — shu bilan chegara atrofida
+// bir martalik tasodifiy tebranish turn boshi/oxirini "chayqalib" ketishiga
+// yo'l qo'yilmaydi.
+const VAD_POS_THRESHOLD = 0.5;
+const VAD_NEG_THRESHOLD = 0.35;
+// @ricky0123/vad-web FAQAT past-darajali `Silero` model klassi orqali
+// ishlatiladi (qarang src/lib/sileroVad.js) — kutubxonaning yuqori-darajali
+// `MicVAD`'i (o'ZI alohida getUserMedia() chaqiradi) ATAYLAB ISHLATILMAGAN,
+// aks holda ikkita mustaqil mikrofon ulanishi bo'lardi. Freymlar shu
+// yerdagi MAVJUD AudioWorklet PCM oqimidan (handleWorkletChunk) push
+// qilinadi — qarang feedSilero() pastda.
 
 // TARIX (1100 → 1400 → 2000ms): bu qiymat ilgari asta-sekin oshirilgan edi,
 // chunki ikkinchi tilda gapirayotgan odam ko'pincha gap O'RTASIDA 1.4-2s
@@ -177,9 +202,15 @@ const PRE_ROLL_CHUNK_COUNT = Math.ceil(PRE_ROLL_MS / CHUNK_DURATION_MS);
 // HECH QACHON bir vaqtda ishlamaydi. Agar hech qanday pauza (hatto qisqa ham) umuman
 // bo'lmasa, HARD_CUT_MAX_MS'da baribir majburan kesiladi — cheksiz
 // cho'zilib ketmasligi uchun oxirgi chora.
-const SOFT_CUT_AFTER_MS = 15000;
+// Mentor demo'da topilgan 2-muammo tuzatishi: uzluksiz suhbatda natijalar
+// KAM tez-tez chiqardi (avval 15s/18s) — endi ANCHA qisqartirilgan (8s/10s),
+// natijalar tez-tez chiqishi uchun. Bitta uzun gap shu sabab bilan bir
+// nechta bo'lakka bo'linib ketishi mumkin, lekin backend'dagi RETROAKTIV
+// birlashtirish (dialog.py, RETRO_MERGE_WINDOW_S) BIR XIL spiker/til
+// bo'lsa buni avtomatik qayta qo'shib, qayta tarjima qiladi.
+const SOFT_CUT_AFTER_MS = 8000;
 const SOFT_CUT_PAUSE_MS = 300;
-const HARD_CUT_MAX_MS = 18000;
+const HARD_CUT_MAX_MS = 10000;
 
 const AUDIO_LEVEL_RMS_MAX = 0.15; // shu RMS qiymatida audioLevel = 1 ga yetadi
 const AUDIO_LEVEL_SMOOTHING = 0.4; // 0..1, kattaroq = tezroq (kamroq silliqlash)
@@ -283,6 +314,17 @@ export function useDialogSession() {
   // SINXRON ref'da yuritiladi (bu ref FAQAT event-handler ichida, render
   // vaqtida EMAS, o'qiladi/yangilanadi — React hook qoidalariga mos).
   const nextSpeakerColorOrderRef = useRef(0);
+  // Mentor demo'da topilgan 4-muammo: backend'ning HAQIQIY `seq`'i audio
+  // QABUL QILINGANDA (va ba'zan faqat navbatga QO'YILGANDA) tayinlanadi —
+  // frontend audio YUBORILGAN payt buni hali bilmaydi, lekin aynan shu
+  // paytda placeholder ("…") bubble ko'rsatishi kerak. Shu sababli
+  // frontend o'zining MUSTAQIL, faqat o'sishib boruvchi `clientSeq`
+  // hisoblagichini yuritadi (qarang sendTurnAudio) va uni `turn_meta`
+  // xabarida backend'ga yuboradi — backend buni "turn"/"turn_skipped"
+  // bilan AYNAN o'zi qaytaradi (dialog.py, `client_seqs`), shunda
+  // handleServerMessage mos placeholder(lar)ni topib almashtira
+  // oladi/o'chira oladi.
+  const nextClientSeqRef = useRef(1);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null); // vaqtinchalik "eshitilmadi" kabi xabarlar uchun, error state'dan alohida
   const [audioLevel, setAudioLevel] = useState(0);
@@ -323,6 +365,29 @@ export function useDialogSession() {
   // ochilmaydi (qarang handleWorkletChunk). `null` = hozir nomzod yo'q.
   const pendingSpeechStartAtRef = useRef(null);
   const preRollChunksRef = useRef([]);
+
+  // --- Mentor demo'da topilgan 1-muammo: Silero VAD holati ---
+  // `sileroModelRef` — yuklangan model instansiyasi (yoki hali/hech qachon
+  // yuklanmagan bo'lsa `null`). `sileroReadyRef` FAQAT model MUVAFFAQIYATLI
+  // yuklanganda true — shu bayroq false bo'lsa handleWorkletChunk energiya
+  // (RMS) chegarasiga avtomatik qaytadi (qarang pastdagi komment).
+  const sileroModelRef = useRef(null);
+  const sileroReadyRef = useRef(false);
+  // Oxirgi protsess qilingan 512-namunali freymning "nutq" ehtimolligi —
+  // diagnostika logi uchun ham ishlatiladi.
+  const sileroProbRef = useRef(0);
+  // Gisterezis holati (qarang VAD_POS_THRESHOLD/VAD_NEG_THRESHOLD izohi) —
+  // bu "speaking" signalining Silero manbasi.
+  const sileroSpeakingRef = useRef(false);
+  // Worklet chunk'lari (2048 namuna) Silero freym o'lchamiga (512 namuna)
+  // teng bo'linmagani uchun — qoldiq keyingi chunk bilan birlashtiriladi.
+  const sileroLeftoverRef = useRef(new Float32Array(0));
+  // Model inference'lari KETMA-KET (bir martada bittadan) bajarilishi
+  // SHART — Silero klassi ichki RNN holatini (`_state`/`_context`)
+  // freymlar orasida saqlaydi, parallel chaqiruvlar buni poyga holatiga
+  // olib kelardi. Shu promise-zanjir shart-sharoitni ta'minlaydi, MAIN
+  // thread/worklet oqimini esa HECH QACHON bloklamaydi (fire-and-forget).
+  const sileroChainRef = useRef(Promise.resolve());
   const turnChunksRef = useRef(null); // null = hozir faol turn yo'q
   const turnStartedAtRef = useRef(null);
   const silenceStartedAtRef = useRef(null);
@@ -332,6 +397,41 @@ export function useDialogSession() {
   // Diagnostika: har DIAG_LOG_INTERVAL_MSda bir marta holatni "[VAD]" bilan
   // konsolga chiqarish uchun.
   const lastDiagLogAtRef = useRef(0);
+
+  // Mentor demo'da topilgan 1-muammo: Silero model yuklanishi hook
+  // MOUNT bo'lganda (mikrofon ruxsati/WebSocket ulanishidan MUSTAQIL,
+  // ulardan OLDIN) boshlanadi — shu bilan foydalanuvchi "Suhbatni
+  // boshlash"ni bosguncha model odatda ALLAQACHON tayyor bo'ladi. Model
+  // (va onnxruntime-web/WASM) butun sahifa umri davomida bitta marta
+  // yuklanib keshlanadi (qarang getSileroModel() — modul darajasidagi
+  // singleton promise), shuning uchun keyingi suhbat sessiyalari uni
+  // qayta yuklamaydi.
+  //
+  // MUHIM: yuklanish MUVAFFAQIYATSIZ bo'lsa (masalan WASM/model fayllari
+  // topilmadi, yoki brauzer ONNX WASM'ni qo'llamaydi) — `sileroReadyRef`
+  // false'da QOLADI va handleWorkletChunk doimiy ravishda energiya (RMS)
+  // chegarasiga qaytadi; bu yerda FAQAT bitta ogohlantirish konsolga
+  // chiqariladi, foydalanuvchiga ko'rinadigan xato KO'RSATILMAYDI (VAD
+  // ikkinchi, mustaqil yo'l bilan baribir ishlayveradi).
+  useEffect(() => {
+    let cancelled = false;
+    getSileroModel()
+      .then((model) => {
+        if (cancelled) return;
+        sileroModelRef.current = model;
+        sileroReadyRef.current = true;
+        console.log("[useDialogSession] Silero VAD modeli yuklandi — energiya VAD zaxiraga o'tkazildi");
+      })
+      .catch((err) => {
+        console.warn(
+          "[useDialogSession] Silero VAD modelini yuklab bo'lmadi — energiya (RMS) VAD'ga qaytildi",
+          err
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const cleanupMedia = useCallback(() => {
     if (streamRef.current) {
@@ -368,6 +468,16 @@ export function useDialogSession() {
     turnStartedAtRef.current = null;
     silenceStartedAtRef.current = null;
     micPausedRef.current = false;
+    sileroProbRef.current = 0;
+    sileroSpeakingRef.current = false;
+    sileroLeftoverRef.current = new Float32Array(0);
+    if (sileroModelRef.current) {
+      try {
+        sileroModelRef.current.reset_state();
+      } catch (err) {
+        console.error("[useDialogSession] Silero reset_state failed", err);
+      }
+    }
   }, []);
 
   const stopListenLoop = useCallback(() => {
@@ -418,15 +528,40 @@ export function useDialogSession() {
     ) {
       try {
         const wireReason = _categorizeFinalizeReason(reason);
+        const clientSeq = nextClientSeqRef.current++;
         // Backend (dialog.py'dagi handle_client_message, action="turn_meta")
         // buni AYNAN keyingi binary chunk uchun amal qiladi deb kutadi —
         // shuning uchun matnli xabar har doim audio'dan OLDIN yuboriladi
         // (WebSocket bitta ulanishda xabarlarni ketma-ket saqlaydi).
-        wsRef.current.send(JSON.stringify({ action: "turn_meta", reason: wireReason }));
+        // `client_seq` — qarang nextClientSeqRef izohi yuqorida.
+        wsRef.current.send(
+          JSON.stringify({ action: "turn_meta", reason: wireReason, client_seq: clientSeq })
+        );
         wsRef.current.send(float32Array.buffer);
+        // Mentor demo'da topilgan 4-muammo: bo'lak YUBORILGANI bilan
+        // ro'yxat oxirida darhol kulrang "…" placeholder paydo bo'ladi —
+        // natija ("turn") yoki rad ("turn_skipped") kelganda
+        // handleServerMessage shu `clientSeq`ga mos yozuvni (yozuvlarni —
+        // birlashtirish bo'lsa bir nechtasini) topib almashtiradi/o'chiradi.
+        setMessages((prev) => [
+          ...prev,
+          {
+            seq: null,
+            clientSeq,
+            placeholder: true,
+            speaker: null,
+            originalText: "",
+            translation: "",
+            sourceLang: null,
+            targetLang: null,
+            uncertain: false,
+            mtProvider: null,
+            translationError: false,
+          },
+        ]);
         console.log(
           `[VAD] turn SENT to backend durationMs=${durationMs.toFixed(0)} bytes=${bytes} ` +
-            `reason=${reason} wireReason=${wireReason}`
+            `reason=${reason} wireReason=${wireReason} clientSeq=${clientSeq}`
         );
       } catch (err) {
         console.error("[useDialogSession] error sending turn audio", err);
@@ -468,6 +603,53 @@ export function useDialogSession() {
     [sendTurnAudio]
   );
 
+  // Bitta 512-namunali Silero freymini navbatga qo'yadi — qarang
+  // `sileroChainRef` izohi yuqorida (KETMA-KET, blokламасдан).
+  const queueSileroFrame = useCallback((frame) => {
+    sileroChainRef.current = sileroChainRef.current
+      .then(() => sileroModelRef.current.process(frame))
+      .then((probs) => {
+        const prob = probs.isSpeech;
+        sileroProbRef.current = prob;
+        // Gisterezis — qarang VAD_POS_THRESHOLD/VAD_NEG_THRESHOLD izohi.
+        if (!sileroSpeakingRef.current && prob >= VAD_POS_THRESHOLD) {
+          sileroSpeakingRef.current = true;
+        } else if (sileroSpeakingRef.current && prob < VAD_NEG_THRESHOLD) {
+          sileroSpeakingRef.current = false;
+        }
+      })
+      .catch((err) => {
+        console.error(
+          "[useDialogSession] Silero inference xatosi, energiya VAD'ga qaytildi",
+          err
+        );
+        sileroReadyRef.current = false;
+      });
+  }, []);
+
+  // Worklet chunk'ini (ixtiyoriy uzunlik) Silero'ning qat'iy 512-namunali
+  // freymlariga bo'lib, har birini queueSileroFrame()ga yuboradi — qoldiq
+  // (512'ga to'liq bo'linmagan qism) keyingi chaqiruvgacha saqlanadi.
+  const feedSilero = useCallback(
+    (chunk) => {
+      if (!sileroReadyRef.current || !sileroModelRef.current) return;
+      const leftover = sileroLeftoverRef.current;
+      let data = chunk;
+      if (leftover.length > 0) {
+        data = new Float32Array(leftover.length + chunk.length);
+        data.set(leftover, 0);
+        data.set(chunk, leftover.length);
+      }
+      let offset = 0;
+      while (data.length - offset >= SILERO_FRAME_SAMPLES) {
+        queueSileroFrame(data.slice(offset, offset + SILERO_FRAME_SAMPLES));
+        offset += SILERO_FRAME_SAMPLES;
+      }
+      sileroLeftoverRef.current = data.slice(offset);
+    },
+    [queueSileroFrame]
+  );
+
   const handleWorkletChunk = useCallback(
     (chunk) => {
       if (stoppedRef.current) return;
@@ -484,6 +666,13 @@ export function useDialogSession() {
       if (micPausedRef.current) {
         return;
       }
+
+      // Mentor demo'da topilgan 1-muammo: Silero freymlari energiya
+      // kalibratsiyasidan MUSTAQIL ravishda, HAR DOIM (mic pauza bo'lmasa)
+      // push qilinadi — model hech qanday "shovqin kalibratsiyasi"ga
+      // muhtoj emas, pastdagi `speaking` qarori esa (model yuklangan
+      // bo'lsa) shu natijadan foydalanadi.
+      feedSilero(chunk);
 
       // --- C2: fon-shovqin kalibratsiyasi (sessiya boshida bir marta) ---
       // REGRESSIYA TUZATISHI: endi XOM rms'ning o'zi emas, massivga
@@ -522,7 +711,15 @@ export function useDialogSession() {
       smoothedRmsRef.current += VAD_RMS_SMOOTHING_ALPHA * (rms - smoothedRmsRef.current);
 
       const dynamicThreshold = Math.max(MIN_NOISE_FLOOR, noiseFloorRef.current) * NOISE_FLOOR_MULTIPLIER;
-      const speaking = smoothedRmsRef.current >= dynamicThreshold;
+      // Mentor demo'da topilgan 1-muammo tuzatishi: "speaking" endi ASOSAN
+      // Silero ehtimolligi (gisterezis holati, qarang queueSileroFrame)
+      // asosida qaror qabul qilinadi — energiya chegarasi FAQAT model hali
+      // yuklanmagan/xato bergan holatda (sileroReadyRef=false) zaxira
+      // sifatida ishlatiladi.
+      const vadSource = sileroReadyRef.current ? "silero" : "energy";
+      const speaking = sileroReadyRef.current
+        ? sileroSpeakingRef.current
+        : smoothedRmsRef.current >= dynamicThreshold;
       const hasActiveTurn = turnChunksRef.current !== null;
 
       // --- D1: nisbiy (near-field) VAD — qarang NEAR_FIELD_RATIO izohi
@@ -551,6 +748,7 @@ export function useDialogSession() {
           `[VAD] status rms=${rms.toFixed(5)} smoothedRms=${smoothedRmsRef.current.toFixed(5)} ` +
             `noiseFloor=${noiseFloorRef.current.toFixed(5)} threshold=${dynamicThreshold.toFixed(5)} ` +
             `speechLevel=${speechLevelRef.current.toFixed(5)} nearThreshold=${nearThreshold.toFixed(5)} ` +
+            `prob=${sileroProbRef.current.toFixed(3)} vadSource=${vadSource} ` +
             `frame=${nearFieldSpeaking ? "speech" : "silence"}(${silenceReason}) ` +
             `turn=${hasActiveTurn ? "recording" : "idle"}`
         );
@@ -592,6 +790,7 @@ export function useDialogSession() {
           `[VAD-DEBUG] rms=${rms.toFixed(5)} smoothedRms=${smoothedRmsRef.current.toFixed(5)} ` +
             `noiseFloor=${noiseFloorRef.current.toFixed(5)} threshold=${dynamicThreshold.toFixed(5)} ` +
             `speechLevel=${speechLevelRef.current.toFixed(5)} nearThreshold=${nearThreshold.toFixed(5)} ` +
+            `prob=${sileroProbRef.current.toFixed(3)} vadSource=${vadSource} ` +
             `speaking=${speaking} nearFieldSpeaking=${nearFieldSpeaking} activeTurn=${hasActiveTurn}`
         );
       }
@@ -630,6 +829,7 @@ export function useDialogSession() {
             console.log(
               `[VAD] speech STARTED at=${new Date(now).toISOString()} rms=${rms.toFixed(5)} ` +
                 `smoothedRms=${smoothedRmsRef.current.toFixed(5)} threshold=${dynamicThreshold.toFixed(5)} ` +
+                `prob=${sileroProbRef.current.toFixed(3)} vadSource=${vadSource} ` +
                 `confirmedAfterMs=${pendingElapsedMs.toFixed(0)}`
             );
             if (DEBUG_VAD) {
@@ -672,7 +872,7 @@ export function useDialogSession() {
         finalizeTurn("hard_cut_max_duration");
       }
     },
-    [finalizeTurn]
+    [finalizeTurn, feedSilero]
   );
 
   const startListenLoop = useCallback(async () => {
@@ -801,6 +1001,18 @@ export function useDialogSession() {
   // boshlanganda pauseMic()ni, tugaganda resumeMic()ni chaqiradi — shunda
   // karnaydan chiqayotgan tarjima ovozi mikrofon orqali yangi turn
   // sifatida qayta eshitilib ketmaydi.
+  //
+  // Mentor demo'da topilgan 3-muammo (kafolat): mikrofon/VAD/yozib olish
+  // FAQAT shu `micPausedRef` (ya'ni FAQAT TTS ijrosi) orqali to'xtaydi.
+  // Backend navbatning necha bo'lagi "processing" holatida ekani
+  // (isProcessing) handleWorkletChunk/finalizeTurn/sendTurnAudio'ning
+  // HECH BIRIGA ta'sir qilmaydi — har bir yangi turn backend oldingisini
+  // qayta ishlab TUGATISHINI kutmasdan, darhol WebSocket orqali yuboriladi
+  // (sendTurnAudio — sinxron, blokланмайдиган `ws.send()`), backend
+  // tarafda esa bitta cheksiz FIFO navbat (dialog.py, `turn_queue`)
+  // bir vaqtda qancha bo'lak kelsa ham qabul qilib, ularni KETMA-KET
+  // qayta ishlaydi — shuning uchun bir nechta bo'lak navbatda bir vaqtda
+  // tura oladi, mikrofon esa shu orada uzluksiz yozishda davom etadi.
   const pauseMic = useCallback(
     (reason = "unknown") => {
       if (micPausedRef.current) {
@@ -827,6 +1039,21 @@ export function useDialogSession() {
       console.log(`[VAD] resumeMic called while not paused reason=${reason}`);
     }
     micPausedRef.current = false;
+    // Pauza paytida Silero'ga HECH QANDAY freym yuborilmagan (feedSilero
+    // micPausedRef tekshiruvidan keyin chaqiriladi), lekin qoldiq/ehtimollik
+    // holati "eski" bo'lib qolmasligi uchun shu yerda tozalanadi — model
+    // ichki RNN holati (`_state`/`_context`) ham reset qilinadi, aks holda
+    // pauzadan OLDINGI nutqning "izi" keyingi freymlarga ta'sir qilardi.
+    sileroLeftoverRef.current = new Float32Array(0);
+    sileroProbRef.current = 0;
+    sileroSpeakingRef.current = false;
+    if (sileroModelRef.current) {
+      try {
+        sileroModelRef.current.reset_state();
+      } catch (err) {
+        console.error("[useDialogSession] Silero reset_state failed", err);
+      }
+    }
     console.log(`[VAD] resumeMic reason=${reason} at=${new Date().toISOString()}`);
   }, []);
 
@@ -878,8 +1105,19 @@ export function useDialogSession() {
           // XUDDI SHU seq bilan qayta "turn" yuboradi) — yangi bubble
           // qo'shish o'rniga MAVJUDINI almashtiramiz (upsert).
           setMessages((prev) => {
+            // Mentor demo'da topilgan 4-muammo: shu turnga tegishli
+            // BARCHA placeholder'lar (merge/retro-merge bo'lsa bir nechtasi
+            // bo'lishi mumkin — qarang backend dialog.py'dagi
+            // `client_seqs`) haqiqiy bubble bilan almashtirish OLDIDAN
+            // ro'yxatdan olib tashlanadi.
+            const clientSeqSet = new Set(Array.isArray(msg.client_seqs) ? msg.client_seqs : []);
+            const withoutPlaceholders = prev.filter(
+              (m) => !(m.placeholder && clientSeqSet.has(m.clientSeq))
+            );
             const entry = {
               seq: msg.seq,
+              clientSeq: null,
+              placeholder: false,
               // Spiker endi A/B emas, cheklanmagan sonli butun son ID
               // (speaker_diart.py'dagi onlayn klasterlash) — DialogSessionView
               // shuni "N-spiker" deb formatlab, rangli yorliq bilan ko'rsatadi.
@@ -903,12 +1141,21 @@ export function useDialogSession() {
               // mavjud emas" matnini ko'rsatadi.
               translationError: Boolean(msg.translation_error),
             };
-            const existingIdx = prev.findIndex((m) => m.seq === msg.seq);
+            const existingIdx = withoutPlaceholders.findIndex((m) => m.seq === msg.seq);
             const next =
               existingIdx === -1
-                ? [...prev, entry]
-                : prev.map((m, i) => (i === existingIdx ? entry : m));
-            next.sort((a, b) => a.seq - b.seq);
+                ? [...withoutPlaceholders, entry]
+                : withoutPlaceholders.map((m, i) => (i === existingIdx ? entry : m));
+            // Haqiqiy bubble'lar `seq` bo'yicha, hali kelmagan
+            // placeholder'lar esa (ro'yxat OXIRIDA, "…" bo'lib) o'z
+            // `clientSeq`i bo'yicha saralanadi — qarang sendTurnAudio
+            // izohi (4-muammo).
+            next.sort((a, b) => {
+              if (a.placeholder && b.placeholder) return a.clientSeq - b.clientSeq;
+              if (a.placeholder) return 1;
+              if (b.placeholder) return -1;
+              return a.seq - b.seq;
+            });
             return next;
           });
 
@@ -952,9 +1199,18 @@ export function useDialogSession() {
           setSpeakerEvents((prev) => [...prev, { type: "removed", speaker: msg.speaker }]);
           break;
 
-        case "turn_skipped":
+        case "turn_skipped": {
           console.warn("[useDialogSession] turn skipped", msg.reason);
           setIsProcessing(false);
+          // Mentor demo'da topilgan 4-muammo: rad etilgan bo'lak(lar)ning
+          // placeholder'i ro'yxatdan butunlay olib tashlanadi (hech qanday
+          // bubble qolmaydi) — qarang sendTurnAudio/"turn" case'idagi izoh.
+          const skippedClientSeqSet = new Set(
+            Array.isArray(msg.client_seqs) ? msg.client_seqs : []
+          );
+          setMessages((prev) =>
+            prev.filter((m) => !(m.placeholder && skippedClientSeqSet.has(m.clientSeq)))
+          );
           setNotice(SKIP_REASON_MESSAGES[msg.reason] || SKIP_REASON_DEFAULT);
           if (noticeTimeoutRef.current) {
             clearTimeout(noticeTimeoutRef.current);
@@ -964,6 +1220,7 @@ export function useDialogSession() {
             noticeTimeoutRef.current = null;
           }, 3000);
           break;
+        }
 
         default:
           console.warn("[useDialogSession] unknown status", msg);
@@ -985,6 +1242,7 @@ export function useDialogSession() {
     // palitra boshidan EMAS, o'rtasidan rang olishi mumkin edi.
     setSpeakerColorOrder({});
     nextSpeakerColorOrderRef.current = 0;
+    nextClientSeqRef.current = 1;
     stoppedRef.current = false;
 
     try {

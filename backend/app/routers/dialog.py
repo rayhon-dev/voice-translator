@@ -166,6 +166,13 @@ async def websocket_dialog(websocket: WebSocket):
             # mavjud emas" kulrang matnini) ko'rsatadi.
             mt_provider=entry.get("mt_provider"),
             translation_error=entry.get("mt_provider") == "error",
+            # Mentor demo'da topilgan 4-muammo: frontend har bir yuborilgan
+            # audio bo'lagi uchun o'zining `client_seq`ini kuzatib,
+            # yuborilgani bilan darhol "…" placeholder ko'rsatadi — bu
+            # yerda shu bo'lak(lar)ga mos client_seq'lar ("merge"/retro-merge
+            # bo'lsa bir nechtasi) qaytarilib, frontend mos placeholder(lar)ni
+            # haqiqiy bubble bilan almashtira oladi (useDialogSession.js).
+            client_seqs=entry.get("client_seqs", []),
         )
 
 
@@ -192,7 +199,14 @@ async def websocket_dialog(websocket: WebSocket):
             await send_status("speakers_merged", **{"from": frm, "into": into})
 
 
-    async def process_turn(wav, seq: int):
+    async def process_turn(wav, seq: int, client_seqs: list | None = None):
+        # Mentor demo'da topilgan 4-muammo: shu turnga tegishli frontend
+        # `client_seq`lar (bitta bo'lak — bitta qiymat, merge/retro-merge
+        # bo'lsa bir nechtasi) — HAR BIR qaytariladigan "turn"/"turn_skipped"
+        # xabariga qo'shiladi, frontend shu orqali mos placeholder(lar)ni
+        # topadi (qarang _resend_turn va pastdagi send_status chaqiruvlari).
+        client_seqs = client_seqs or []
+
         # TEZLIK TUZATISHI (6-band): butun navbatning "audio keldi ->
         # frontendga natija yuborildi" vaqtini o'lchash uchun — pastdagi
         # yakuniy [TURN] logiga qarang.
@@ -203,7 +217,7 @@ async def websocket_dialog(websocket: WebSocket):
         duration_s = wav.size / SAMPLE_RATE
         if duration_s < MIN_TURN_SECONDS:
             logger.info(f"[/ws/dialog] turn skipped (too short: {duration_s:.2f}s)")
-            await send_status("turn_skipped", reason="too_short")
+            await send_status("turn_skipped", reason="too_short", client_seqs=client_seqs)
             return
 
         if duration_s < FAST_PATH_MAX_DURATION_S and has_known_speakers(state["speaker_session"]):
@@ -212,7 +226,7 @@ async def websocket_dialog(websocket: WebSocket):
                 logger.info(f"[/ws/dialog] turn skipped (fast_path_noise: duration={duration_s:.2f}s "
                     f"rms={rms:.4f} < {FAST_PATH_MAX_RMS}, kamida bitta spiker allaqachon ma'lum) — "
                     f"STT/embedding chaqirilmadi")
-                await send_status("turn_skipped", reason="unknown_speaker")
+                await send_status("turn_skipped", reason="unknown_speaker", client_seqs=client_seqs)
                 return
 
         temp_filename = f"/tmp/{uuid.uuid4()}_turn.wav"
@@ -226,7 +240,7 @@ async def websocket_dialog(websocket: WebSocket):
                 )
             except Exception as e:
                 logger.error(f"[/ws/dialog] turn processing failed: {e!r}")
-                await send_status("turn_skipped", reason="processing_error")
+                await send_status("turn_skipped", reason="processing_error", client_seqs=client_seqs)
                 return
         finally:
             if os.path.exists(temp_filename):
@@ -241,13 +255,13 @@ async def websocket_dialog(websocket: WebSocket):
         # spiker profili bu turndan ta'sirlanmaydi.
         if unsupported_language:
             logger.info(f"[/ws/dialog] turn skipped (unsupported_language: session_langs={SESSION_LANGS})")
-            await send_status("turn_skipped", reason="unsupported_language")
+            await send_status("turn_skipped", reason="unsupported_language", client_seqs=client_seqs)
             return
 
         text = (text or "").strip()
         if not text:
             logger.info("[/ws/dialog] turn skipped (empty transcription)")
-            await send_status("turn_skipped", reason="empty_transcription")
+            await send_status("turn_skipped", reason="empty_transcription", client_seqs=client_seqs)
             return
 
         # SPIKER ANIQLASH — endi FAQAT ovoz asosida, cheklanmagan sonli
@@ -323,6 +337,11 @@ async def websocket_dialog(websocket: WebSocket):
             # to'planadi.
             merged_seqs = list(merge_prev_entry.get("merged_seqs", [out_seq]))
             merged_seqs.append(seq)
+            # Mentor demo'da topilgan 4-muammo: retro-birlashtirilgan
+            # bo'lakning OWN client_seq'lari ham oldingi bubble'ning
+            # ro'yxatiga qo'shiladi — shu bo'lak uchun alohida yuborilgan
+            # placeholder ham ENDI shu (eski) bubble bilan birga yopiladi.
+            out_client_seqs = list(merge_prev_entry.get("client_seqs", [])) + client_seqs
             logger.info(
                 f"[/ws/dialog] retro-merging seq={seq} into seq={out_seq} "
                 f"(speaker={speaker} lang={source_lang})"
@@ -332,6 +351,7 @@ async def websocket_dialog(websocket: WebSocket):
             out_text = text
             out_wav = wav
             merged_seqs = [out_seq]
+            out_client_seqs = client_seqs
 
         mt_provider = None
         if source_lang == target_lang:
@@ -376,6 +396,9 @@ async def websocket_dialog(websocket: WebSocket):
             # DeepL (asosiy)/NLLB-600M (zaxira)/None (tarjima umuman
             # chaqirilmagan, masalan source==target) — qarang _resend_turn.
             "mt_provider": mt_provider,
+            # Mentor demo'da topilgan 4-muammo: frontend placeholder'larini
+            # topish uchun — qarang _resend_turn.
+            "client_seqs": out_client_seqs,
         }
         _trim_turn_history()
 
@@ -418,7 +441,7 @@ async def websocket_dialog(websocket: WebSocket):
             try:
                 if item is None:
                     break
-                wav, seq = item
+                wav, seq, client_seqs = item
                 # DIALOG_PLAN.md 4-bosqich: frontend shu statusni ko'rib
                 # "Qayta ishlanmoqda…" deb ko'rsatadi (qarang
                 # useDialogSession.js) — STT/tarjima bir necha soniya
@@ -428,7 +451,7 @@ async def websocket_dialog(websocket: WebSocket):
                 # "turn_skipped" bilan) shu holatni frontend tarafda
                 # avtomatik tugatadi.
                 await send_status("processing")
-                await process_turn(wav, seq)
+                await process_turn(wav, seq, client_seqs)
             except Exception as e:
                 logger.error(f"[/ws/dialog] turn_worker: process_turn raised unexpectedly: {e!r}")
             finally:
@@ -452,7 +475,7 @@ async def websocket_dialog(websocket: WebSocket):
             f"[MERGE] seq={pending['seq']} reason={pending.get('reason')} "
             f"waited={waited_s:.2f}s merged={pending.get('merge_count', 0) > 0}"
         )
-        turn_queue.put_nowait((pending["wav"], pending["seq"]))
+        turn_queue.put_nowait((pending["wav"], pending["seq"], pending.get("client_seqs", [])))
 
     async def dispatch_after_delay(seq):
         try:
@@ -469,7 +492,13 @@ async def websocket_dialog(websocket: WebSocket):
             return
         dispatch_pending_now(waited_s=MERGE_GAP_S)
 
-    async def handle_audio_chunk(data: bytes, reason: str | None):
+    async def handle_audio_chunk(data: bytes, reason: str | None, client_seq=None):
+        # Mentor demo'da topilgan 4-muammo: frontend shu bo'lak uchun
+        # o'zining `client_seq`ini yuboradi (useDialogSession.js,
+        # sendTurnAudio) — pastda pending/navbat bo'yicha to'planib,
+        # oxir-oqibat "turn"/"turn_skipped" bilan birga qaytariladi.
+        client_seqs_for_chunk = [client_seq] if client_seq is not None else []
+
         # DIALOG_PLAN.md 3-bosqich (C3): endi xom Float32 PCM (frontend
         # AudioWorkletNode orqali yuboradi) — webm/ffmpeg decode shart
         # emas, shuning uchun bu sinxron, tezkor chaqiruv executor'ga
@@ -478,7 +507,7 @@ async def websocket_dialog(websocket: WebSocket):
         wav = _decode_pcm_bytes(data)
         if wav is None or wav.size == 0:
             logger.info("[/ws/dialog] turn skipped (empty audio)")
-            await send_status("turn_skipped", reason="empty_audio")
+            await send_status("turn_skipped", reason="empty_audio", client_seqs=client_seqs_for_chunk)
             return
 
         duration_s = wav.size / SAMPLE_RATE
@@ -498,11 +527,16 @@ async def websocket_dialog(websocket: WebSocket):
             merged_wav = np.concatenate([pending["wav"], wav])
             seq = pending["seq"]
             merge_count = pending.get("merge_count", 0) + 1
+            # Shu davomiy bo'lakning client_seq'i ham ASOSIY (pending)
+            # yozuvning ro'yxatiga qo'shiladi — qarang client_seqs_for_chunk
+            # izohi yuqorida.
+            client_seqs = pending.get("client_seqs", []) + client_seqs_for_chunk
             logger.info(f"[/ws/dialog] merged short continuation (dur={duration_s:.2f}s) "
                 f"into pending turn seq={seq} (new total dur="
                 f"{merged_wav.size / SAMPLE_RATE:.2f}s)")
         else:
             merged_wav = wav
+            client_seqs = client_seqs_for_chunk
             # Seq SHU YERDA (audio qabul qilingan paytda, dispatch qilinishidan
             # OLDIN) beriladi — bu WebSocket orqali audio kelish tartibi, ya'ni
             # aytilish tartibi. Navbatlar endi turn_worker() tomonidan shu
@@ -533,6 +567,7 @@ async def websocket_dialog(websocket: WebSocket):
                 "dispatch_task": None,
                 "reason": reason,
                 "merge_count": merge_count,
+                "client_seqs": client_seqs,
             }
             dispatch_pending_now(waited_s=0.0)
         else:
@@ -543,6 +578,7 @@ async def websocket_dialog(websocket: WebSocket):
                 "dispatch_task": dispatch_task,
                 "reason": reason,
                 "merge_count": merge_count,
+                "client_seqs": client_seqs,
             }
 
     async def receiver():
@@ -562,7 +598,8 @@ async def websocket_dialog(websocket: WebSocket):
                     # sababni `state["pending_turn_reason"]`ga allaqachon
                     # yozib qo'ygan bo'ladi.
                     reason = state.pop("pending_turn_reason", None)
-                    await handle_audio_chunk(data, reason)
+                    client_seq = state.pop("pending_turn_client_seq", None)
+                    await handle_audio_chunk(data, reason, client_seq)
                 continue
 
             text = message.get("text")
@@ -583,8 +620,12 @@ async def websocket_dialog(websocket: WebSocket):
             # yuboradi (useDialogSession.js'dagi sendTurnAudio) — keyingi
             # binary chunk uchun "reason" (silence/max_duration) shu yerda
             # vaqtincha saqlanadi, receiver() uni handle_audio_chunk()ga
-            # uzatishdan oldin o'qib oladi.
+            # uzatishdan oldin o'qib oladi. Mentor demo'da topilgan
+            # 4-muammo: `client_seq` ham xuddi shunday — frontend
+            # placeholder'ini keyinroq "turn"/"turn_skipped" bilan
+            # topish uchun (qarang handle_audio_chunk/_resend_turn).
             state["pending_turn_reason"] = msg.get("reason")
+            state["pending_turn_client_seq"] = msg.get("client_seq")
 
         elif action == "stop_dialog":
             await websocket.close()

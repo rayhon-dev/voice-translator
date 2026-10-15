@@ -39,6 +39,10 @@ function defaultSpeakerName(speakerId) {
 // skroll qilgan" deb hisoblanadi — avtomatik skroll to'xtaydi va "Yangi
 // xabarlar" tugmasi chiqadi.
 const AUTO_SCROLL_THRESHOLD_PX = 150;
+// Mentor demo'da topilgan 5-muammo: foydalanuvchi qo'lda yuqoriga skroll
+// qilgandan keyin avtoskroll shuncha millisoniyaga to'xtaydi — shundan
+// keyin (yoki "↓ Yangi xabarlar" tugmasi bosilganda) qayta yoqiladi.
+const AUTO_SCROLL_RESUME_MS = 5000;
 
 export default function DialogSessionView({ onBack }) {
   const {
@@ -89,7 +93,13 @@ export default function DialogSessionView({ onBack }) {
   );
 
   const knownSpeakers = useMemo(() => {
-    const ids = [...new Set(messages.map((m) => m.speaker))].sort((a, b) => a - b);
+    // Placeholder bubble'lar (qarang sendTurnAudio) spiker bilan hali
+    // bog'lanmagan (speaker=null) — "spikerni almashtirish" menyusiga
+    // noto'g'ri "null-spiker" yozuvi sifatida kirib ketmasligi uchun
+    // bu yerda chiqarib tashlanadi.
+    const ids = [...new Set(messages.map((m) => m.speaker))]
+      .filter((id) => id !== null)
+      .sort((a, b) => a - b);
     return ids.map((id) => ({
       id,
       name: speakerNames[id] || defaultSpeakerName(id),
@@ -194,42 +204,103 @@ export default function DialogSessionView({ onBack }) {
     processedEventCountRef.current = speakerEvents.length;
   }, [speakerEvents]);
 
-  // --- Avtomatik skroll (3-band) ---
+  // --- Avtomatik skroll (3-band, mentor demo'da topilgan 5-muammo) ---
+  // Mentor demo'dagi eski xatti-harakat: `onScroll` HAR safar (shu
+  // jumladan dastur O'ZI chaqirgan `scrollTo()` paytida ham) ishga
+  // tushib, foydalanuvchi hech narsa qilmagan bo'lsa ham auto-skrollni
+  // "sinab" to'xtatib qo'yardi — bu yerda endi dastur o'zi boshlagan
+  // skroll alohida bayroq (`programmaticScrollRef`) bilan ANIQ ajratiladi
+  // va onScroll shu paytda butunlay e'tiborsiz qoldiriladi.
   const scrollContainerRef = useRef(null);
   // Ref, state EMAS — har scroll-hodisasida o'zgaradi, re-render shart
   // emas (faqat keyingi auto-skroll qarori uchun o'qiladi).
   const autoFollowRef = useRef(true);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
+  // `scrollToBottom()`ning O'ZI chaqirgan `scroll` hodisasini foydalanuvchi
+  // skrolli deb hisoblamaslik uchun — qarang handleUserScroll.
+  const programmaticScrollRef = useRef(false);
+  const programmaticScrollTimeoutRef = useRef(null);
+  // Foydalanuvchi qo'lda yuqoriga skroll qilgandan keyin avtoskroll shuncha
+  // millisoniyaga to'xtaydi (keyin — yoki "Yangi xabarlar" tugmasi
+  // bosilganda — avtomatik qayta yoqiladi).
+  const resumeTimeoutRef = useRef(null);
 
-  const handleScroll = useCallback(() => {
+  const scrollToBottom = useCallback((behavior = "smooth") => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    programmaticScrollRef.current = true;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+    if (programmaticScrollTimeoutRef.current) {
+      clearTimeout(programmaticScrollTimeoutRef.current);
+    }
+    // Silliq skroll animatsiyasi tugaguncha (taxminan) kutiladi — shu
+    // oraliqdagi barcha `scroll` hodisalari dastur o'zi chaqirgani deb
+    // belgilanadi.
+    programmaticScrollTimeoutRef.current = setTimeout(() => {
+      programmaticScrollRef.current = false;
+    }, 600);
+  }, []);
+
+  const resumeAutoFollow = useCallback(() => {
+    autoFollowRef.current = true;
+    setShowJumpToBottom(false);
+    if (resumeTimeoutRef.current) {
+      clearTimeout(resumeTimeoutRef.current);
+      resumeTimeoutRef.current = null;
+    }
+    scrollToBottom();
+  }, [scrollToBottom]);
+
+  const pauseAutoFollow = useCallback(() => {
+    autoFollowRef.current = false;
+    setShowJumpToBottom(true);
+    if (resumeTimeoutRef.current) {
+      clearTimeout(resumeTimeoutRef.current);
+    }
+    resumeTimeoutRef.current = setTimeout(() => {
+      resumeTimeoutRef.current = null;
+      resumeAutoFollow();
+    }, AUTO_SCROLL_RESUME_MS);
+  }, [resumeAutoFollow]);
+
+  // `onScroll` — wheel, touch va scrollbar-sudrash HAMMASI shu bitta
+  // native hodisaga olib keladi, shuning uchun alohida listener kerak
+  // emas; FAQAT dastur o'zi chaqirgan skrollni (`programmaticScrollRef`)
+  // ajratib tashlash muhim.
+  const handleUserScroll = useCallback(() => {
+    if (programmaticScrollRef.current) return;
     const el = scrollContainerRef.current;
     if (!el) return;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    const nearBottom = distanceFromBottom <= AUTO_SCROLL_THRESHOLD_PX;
-    autoFollowRef.current = nearBottom;
-    setShowJumpToBottom(!nearBottom);
-  }, []);
+    if (distanceFromBottom > AUTO_SCROLL_THRESHOLD_PX) {
+      if (autoFollowRef.current) {
+        pauseAutoFollow();
+      }
+    } else if (!autoFollowRef.current) {
+      // Foydalanuvchi qo'lda pastga qaytdi.
+      resumeAutoFollow();
+    }
+  }, [pauseAutoFollow, resumeAutoFollow]);
 
-  // Yangi xabar (yoki "Yozmoqda…" ko'rsatkichi) qo'shilganda — FAQAT
-  // foydalanuvchi hozir pastda (auto-follow yoqilgan) bo'lsa — pastga
-  // silliq skroll qilinadi. Mavjud bubble (tuzatish/retro-merge) shunchaki
-  // YANGILANSA ham shu effekt qayta ishga tushadi, lekin foydalanuvchi
-  // yuqoriga skroll qilgan bo'lsa (autoFollowRef=false) HECH NARSA
-  // qilinmaydi — sahifa sakrab ketmaydi.
+  // Yangi bubble/placeholder, natija yangilanishi ("…" haqiqiy bubble
+  // bilan almashishi) yoki "Yozmoqda…" ko'rsatkichi — FAQAT foydalanuvchi
+  // hozir pastda (auto-follow yoqilgan) bo'lsa — pastga silliq skroll
+  // qilinadi.
   useEffect(() => {
     if (!autoFollowRef.current) return;
-    const el = scrollContainerRef.current;
-    if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-  }, [messages, isProcessing]);
+    scrollToBottom();
+  }, [messages, isProcessing, scrollToBottom]);
+
+  useEffect(() => {
+    return () => {
+      if (programmaticScrollTimeoutRef.current) clearTimeout(programmaticScrollTimeoutRef.current);
+      if (resumeTimeoutRef.current) clearTimeout(resumeTimeoutRef.current);
+    };
+  }, []);
 
   const jumpToBottom = useCallback(() => {
-    const el = scrollContainerRef.current;
-    if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-    autoFollowRef.current = true;
-    setShowJumpToBottom(false);
-  }, []);
+    resumeAutoFollow();
+  }, [resumeAutoFollow]);
 
   // DIALOG_PLAN.md 3-bosqich (C5): TTS (tarjima ovozi) ijro etilayotganda
   // mikrofon VAD'ini to'xtatamiz — aks holda karnaydan chiqayotgan ovoz
@@ -358,16 +429,30 @@ export default function DialogSessionView({ onBack }) {
       <div className="relative flex-1 min-h-0">
         <div
           ref={scrollContainerRef}
-          onScroll={handleScroll}
+          onScroll={handleUserScroll}
           className="h-full overflow-y-auto"
         >
           <div className="w-full max-w-3xl mx-auto flex flex-col px-3 sm:px-10 py-4 sm:py-8">
             {messages.map((msg, idx) => {
+              // Mentor demo'da topilgan 4-muammo: bo'lak backendga
+              // yuborilgani bilan (natija kelmasdan OLDIN) paydo bo'ladigan
+              // spikersiz, kulrang "…" placeholder — qarang
+              // useDialogSession.js'dagi sendTurnAudio/handleServerMessage.
+              if (msg.placeholder) {
+                return (
+                  <div key={`ph-${msg.clientSeq}`} className="flex justify-start w-full mt-4">
+                    <div className="bg-white/70 backdrop-blur rounded-3xl px-5 py-4 text-gray-400 text-sm">
+                      …
+                    </div>
+                  </div>
+                );
+              }
+
               const prev = messages[idx - 1];
               // Guruhlashni o'chirish: ENDI faqat BO'SHLIQ (margin)ga ta'sir
               // qiladi — avatar/ism/tugmalar HAR BIR bubble'da (grouped
               // bo'lsa ham) ko'rsatiladi, qarang DialogBubble.jsx.
-              const grouped = Boolean(prev && prev.speaker === msg.speaker);
+              const grouped = Boolean(prev && !prev.placeholder && prev.speaker === msg.speaker);
               const palette = colorForSpeaker(msg.speaker);
               const resolvedName = speakerNames[msg.speaker] || defaultSpeakerName(msg.speaker);
               // Toq raqamli spikerlar (1, 3, 5...) chapda, juft raqamlilar
@@ -405,21 +490,6 @@ export default function DialogSessionView({ onBack }) {
                 />
               );
             })}
-
-            {/* "Yozmoqda…" ko'rsatkichi — backend "processing" statusini
-                yuborganda (isProcessing=true) ro'yxat oxirida vaqtinchalik
-                chiqadi, natija ("turn"/"turn_skipped") kelganda yo'qoladi. */}
-            {isProcessing ? (
-              <div className="flex justify-start w-full mt-4">
-                <div className="bg-white/70 backdrop-blur rounded-3xl px-5 py-4">
-                  <span className="flex gap-1">
-                    <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-                    <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-                    <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
-                  </span>
-                </div>
-              </div>
-            ) : null}
           </div>
         </div>
 

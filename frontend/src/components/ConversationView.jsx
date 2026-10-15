@@ -3,6 +3,7 @@ import MicButton from "./MicButton";
 import LanguageSelector from "./LanguageSelector";
 import TranscriptLine from "./TranscriptLine";
 import DialogSessionView from "./DialogSessionView";
+import ErrorBoundary from "./ErrorBoundary";
 import { usePlayAudio } from "../hooks/usePlayAudio";
 import { useLiveTranscription } from "../hooks/useLiveTranscription";
 import { translateText, speakText } from "../services/api";
@@ -15,7 +16,18 @@ export default function ConversationView({ mode, onBack }) {
   // though the lint rule can't verify that invariant statically.
   /* eslint-disable react-hooks/rules-of-hooks */
   if (mode === "dialog") {
-    return <DialogSessionView onBack={onBack} />;
+    // Mentor demo'da topilgan "oq sahifa" nosozligi: Dialog rejimi (Silero
+    // VAD yuklanishi/WebSocket/AudioWorklet kabi ko'p sinxron bo'lmagan
+    // qismlarga ega) ichida kutilmagan xato chiqsa, ErrorBoundary'siz
+    // React butun daraxtni o'chirib, hech narsa ko'rsatmay qoladi. Shu
+    // sababli shu yerda alohida ErrorBoundary bilan o'raladi — xato
+    // bo'lsa foydalanuvchi tushunarli xabar va "Qayta urinish" tugmasini
+    // ko'radi, qolgan ilova (ModeSelector'ga qaytish) ishlashda davom etadi.
+    return (
+      <ErrorBoundary>
+        <DialogSessionView onBack={onBack} />
+      </ErrorBoundary>
+    );
   }
 
   const [sourceLang, setSourceLang] = useState("en");
