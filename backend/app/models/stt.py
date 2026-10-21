@@ -55,6 +55,19 @@ MIN_PAIR_MASS = float(os.environ.get("MIN_PAIR_MASS", "0.65"))
 # shu ma'noda ishlatadi.
 MIN_LANG_PROB = float(os.environ.get("MIN_LANG_PROB", "0.75"))
 
+# Mentor demo'da topilgan 3-muammo (shovqinli xona, fonda o'zbekcha
+# gaplashuv): fondagi begona-til bo'laklarning KO'PI pair_mass=0.15-0.48
+# bilan to'g'ri rad etilgan, lekin BA'ZILARI (seq=18 pair_mass=0.797,
+# seq=21 0.814, seq=13 0.859) MIN_PAIR_MASS (0.65) dan "tasodifan" o'tib
+# ketgan — odatda QISQA (<3.5s) bo'laklar, chunki Whisper'ning langID
+# boshi QISQA audio'da tabiiy ravishda kamroq ishonchli (statistik shovqin
+# ko'proq). Haqiqiy foydalanuvchi gaplari (pair_mass 0.965-0.981) bu
+# qattiqroq chegaradan ham xavfsiz o'tadi — demak qisqa bo'laklar uchun
+# chegarani oshirish haqiqiy nutqni yo'qotish xavfisiz, fondagi "chegaraga
+# yaqin" gallyutsinatsiyani esa qo'shimcha ushlaydi.
+SHORT_TURN_STRICT_S = float(os.environ.get("SHORT_TURN_STRICT_S", "3.0"))
+MIN_PAIR_MASS_SHORT = float(os.environ.get("MIN_PAIR_MASS_SHORT", "0.90"))
+
 # ARALASH TILLAR (A1): turn darajasidagi pair_mass (yuqoridagi ikkisi —
 # MIN_PAIR_MASS/MIN_LANG_PROB — allaqachon o'tgan, ya'ni turn UMUMAN rad
 # etilmagan) shu qiymatdan PAST bo'lsa, turn "aralash" (asosiy til + ichida
@@ -113,6 +126,24 @@ PHANTOM_PHRASES = [
     "редактор субтитров а.семкин",
     "корректор а.egorova",
     "продолжение следует",
+    # Mentor demo'da topilgan 4-muammo: ro'yxat kengaytirildi — bular ham
+    # real testda ko'rilgan, qisqa/past-ishonchli audio'da Whisper'ning
+    # klassik YouTube-stilidagi gallyutsinatsiyalari. "thank you"/"bye"/"you"
+    # BITTA so'z/juda qisqa bo'lgani uchun XAVFLI (haqiqiy, qisqa gap ham
+    # bo'lishi mumkin) — shu sababli pastdagi _is_phantom_phrase_drop()
+    # BU ro'yxatga mos kelishning O'ZI YETARLI emas, deb hisoblaydi: qo'shimcha
+    # ravishda bo'lak QISQA (< PHANTOM_SHORT_TURN_S) YOKI past-ishonchli
+    # (no_speech_prob/avg_logprob) bo'lishi SHART.
+    "thank you",
+    "thank you.",
+    "thanks for watching.",
+    "bye",
+    "bye.",
+    "you",
+    "спасибо",
+    "спасибо за внимание",
+    "благодарю за внимание",
+    "ставьте лайки и подписывайтесь",
 ]
 
 # >= shu qiymatda ikki matn "deyarli bir xil" deb hisoblanadi (difflib
@@ -131,6 +162,53 @@ def _is_phantom_phrase(text: str) -> bool:
     return any(
         difflib.SequenceMatcher(None, normalized, phrase).ratio() >= PHANTOM_PHRASE_FUZZY_THRESHOLD
         for phrase in PHANTOM_PHRASES
+    )
+
+
+# Mentor demo'da topilgan 4-muammo: PHANTOM_PHRASES ro'yxatiga qo'shilgan
+# "thank you"/"bye"/"you" kabi BITTA-SO'ZLI iboralar HAQIQIY, qisqa gap
+# ham bo'lishi mumkin ("Mentorga rahmat aytdi" degan ma'noda chindan
+# "Thank you" deyilgan bo'lishi mumkin) — shu sababli ro'yxatga mos
+# kelishning O'ZI yetarli emas, QO'SHIMCHA mustaqil (hallyutsinatsiyaga
+# xos) signal ham talab qilinadi: bo'lak QISQA (odatda hallyutsinatsiya
+# shovqin/juda qisqa klipda paydo bo'ladi) YOKI Whisper'ning o'zi past
+# ishonchli (yuqori no_speech_prob/past avg_logprob) deb belgilagan.
+PHANTOM_SHORT_TURN_S = float(os.environ.get("PHANTOM_SHORT_TURN_S", "3.0"))
+PHANTOM_NO_SPEECH_PROB_THRESHOLD = float(os.environ.get("PHANTOM_NO_SPEECH_PROB_THRESHOLD", "0.3"))
+PHANTOM_AVG_LOGPROB_THRESHOLD = float(os.environ.get("PHANTOM_AVG_LOGPROB_THRESHOLD", "-0.7"))
+
+
+# Mentor demo'da topilgan 5-muammo: PHANTOM_PHRASES ro'yxatiga KIRMAGAN,
+# lekin baribir gallyutsinatsiyaga xos — JUDA QISQA (1-2 so'z), JUDA QISQA
+# bo'lak va Whisper'ning O'ZI past ishonchli deb belgilagan ("Jesus.",
+# "Okay." kabi tasodifiy artifaktlar) matnlar. PHANTOM_PHRASES'dan farqli
+# o'laroq bu yerda ANIQ ibora RO'YXATI yo'q — shuning uchun chegara
+# ANCHA qattiqroq (avg_logprob < -0.7, PHANTOM_AVG_LOGPROB_THRESHOLD
+# bilan BIR XIL, lekin MUSTAQIL tekshiriladi) va ISHONCHLI qisqa javoblar
+# ("Yes.", "Да.") — avg_logprob odatda -0.5'dan yaxshi — saqlanib qolishi
+# uchun ATAYLAB erkin qoldirilgan (shart QAT'IY <-0.7, "<=-0.5" EMAS).
+LOW_CONF_SHORT_MAX_WORDS = int(os.environ.get("LOW_CONF_SHORT_MAX_WORDS", "2"))
+LOW_CONF_SHORT_MAX_S = float(os.environ.get("LOW_CONF_SHORT_MAX_S", "2.5"))
+LOW_CONF_SHORT_AVG_LOGPROB = float(os.environ.get("LOW_CONF_SHORT_AVG_LOGPROB", "-0.7"))
+
+
+def _is_low_conf_short_drop(text: str, duration_s: float, avg_logprob: float) -> bool:
+    word_count = len(text.strip().split())
+    if word_count == 0 or word_count > LOW_CONF_SHORT_MAX_WORDS:
+        return False
+    return duration_s < LOW_CONF_SHORT_MAX_S and avg_logprob < LOW_CONF_SHORT_AVG_LOGPROB
+
+
+def _is_phantom_drop(text: str, duration_s: float, no_speech_prob: float, avg_logprob: float) -> bool:
+    """`_is_phantom_phrase(text)` TO'G'RI bo'lsa ham, FAQAT hallyutsinatsiyaga
+    xos qo'shimcha signal (qisqa bo'lak YOKI past ishonch) bo'lgandagina
+    `True` qaytaradi — qarang PHANTOM_SHORT_TURN_S izohi yuqorida."""
+    if not _is_phantom_phrase(text):
+        return False
+    return (
+        duration_s < PHANTOM_SHORT_TURN_S
+        or no_speech_prob > PHANTOM_NO_SPEECH_PROB_THRESHOLD
+        or avg_logprob < PHANTOM_AVG_LOGPROB_THRESHOLD
     )
 
 # TEZLIK TUZATISHI (maqsad: gap tugashi -> tarjima ~2s): ILGARI
@@ -509,6 +587,56 @@ def _fast_vad_speech_duration(audio: np.ndarray) -> float:
     return sum(seg["end"] - seg["start"] for seg in segments) / SAMPLE_RATE
 
 
+# Mentor demo'da topilgan 1-muammo (shovqinli xona): bo'lak darajasidagi
+# near-field filtri uchun — qarang dialog.py'dagi FAR_FIELD_TURN_RATIO
+# izohi. Har bir freym SPEECH_RMS_FRAME_MS (50ms) — audio-darajasidagi
+# "undosh/bo'g'in" tovlanishini silliqlashtirish uchun, lekin haligacha
+# butun bo'lakning o'rtacha energiyasidan ko'ra DETALLIROQ. 90-percentil
+# (o'rtacha EMAS) tanlandi — nutqning "eng baland" (odatda unli tovush)
+# qismlariga yaqinroq baho beradi, bu masofaga nisbatan SIGNAL KUCHINING
+# (near-field'ning asl maqsadi) ancha barqaror ko'rsatkichi — nutq
+# ichidagi tabiiy jim/past-energiyali lahzalar (o'rtachani pastga tortib,
+# near/far farqini "yuvib" yuborishi mumkin bo'lgan) bunga unchalik
+# ta'sir qilmaydi.
+SPEECH_RMS_FRAME_MS = 50
+SPEECH_RMS_PERCENTILE = 0.9
+
+
+def compute_speech_rms(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> float | None:
+    """Silero VAD nutq oraliqlari ICHIDAGI (fon-shovqin/jimlik ARALASH-
+    MAYDI) RMS'ni hisoblaydi. `None` — audio bo'sh. Silero hech qanday
+    nutq topa olmasa (yoki VAD mavjud bo'lmasa) — xavfsiz zaxira sifatida
+    BUTUN audio'ning xom RMS'i qaytariladi (near-field filtri UMUMAN
+    ishlamay qolishidan ko'ra xavfsizroq — bu holat amalda juda kam
+    uchraydi, chunki shu funksiya chaqirilgunga qadar MIN_SPEECH_S/
+    MIN_TURN_SECONDS orqali "nutq bor" ekani allaqachon tasdiqlangan)."""
+    if audio is None or audio.size == 0:
+        return None
+    try:
+        spans = get_speech_timestamps(audio)
+    except Exception as e:
+        logger.info(f"[STT][VAD] compute_speech_rms: get_speech_timestamps failed: {e!r}")
+        spans = []
+    if not spans:
+        return float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+
+    frame_len = max(1, int(sample_rate * SPEECH_RMS_FRAME_MS / 1000))
+    frame_rms: list[float] = []
+    for seg in spans:
+        start, end = seg["start"], seg["end"]
+        for f_start in range(start, end, frame_len):
+            f_end = min(f_start + frame_len, end)
+            if f_end <= f_start:
+                continue
+            frame = audio[f_start:f_end]
+            frame_rms.append(float(np.sqrt(np.mean(frame.astype(np.float64) ** 2))))
+    if not frame_rms:
+        return float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+    frame_rms.sort()
+    idx = min(len(frame_rms) - 1, int(len(frame_rms) * SPEECH_RMS_PERCENTILE))
+    return frame_rms[idx]
+
+
 def transcribe_audio(
     audio_path: str,
     language: str | None = None,
@@ -801,10 +929,19 @@ def _transcribe_audio_whisper(
         # o'tkazib yuborilardi. Endi past pair_mass O'ZI YETARLI, mustaqil
         # sabab — `raw_top_lang`ning candidates'da bor-yo'qligi ENDI
         # UMUMAN TEKSHIRILMAYDI.
-        if pair_mass < MIN_PAIR_MASS:
+        # Mentor demo'da topilgan 3-muammo: QISQA bo'lak (< SHORT_TURN_STRICT_S)
+        # uchun ANCHA qattiqroq chegara — qarang MIN_PAIR_MASS_SHORT izohi
+        # yuqorida (fondagi begona-til bo'laklar odatda QISQA bo'lgani
+        # uchun shu yerdan "tasodifan" o'tib ketgan edi).
+        turn_duration_s = audio.size / SAMPLE_RATE
+        is_short_turn = turn_duration_s < SHORT_TURN_STRICT_S
+        effective_min_pair_mass = MIN_PAIR_MASS_SHORT if is_short_turn else MIN_PAIR_MASS
+        if pair_mass < effective_min_pair_mass:
             logger.info(
-                f"[STT][LANG] unsupported_language reason=low_pair_mass pair_mass={pair_mass:.3f} "
-                f"< {MIN_PAIR_MASS} raw_top={raw_top_lang!r}({raw_top_prob:.3f}) "
+                f"[STT][LANG] unsupported_language "
+                f"reason={'low_pair_mass_short' if is_short_turn else 'low_pair_mass'} "
+                f"pair_mass={pair_mass:.3f} < {effective_min_pair_mass} duration={turn_duration_s:.2f}s "
+                f"raw_top={raw_top_lang!r}({raw_top_prob:.3f}) "
                 f"pair=({','.join(candidates)}) — turn tashlab yuborildi"
             )
             return "", None, 0.0, True, empty_diag
@@ -895,6 +1032,7 @@ def _transcribe_audio_whisper(
 
     kept_parts = []
     raw_parts = []
+    last_kept_nsp, last_kept_alp = 0.0, 0.0
     # Pastdagi "hammasi filtrlandi, xomdan foydalanamiz" fallback'i uchun —
     # nsp/alp/compression_ratio asosida filtrlangan segment haqiqiy nutq
     # bo'lib chiqishi mumkin (noto'g'ri-pozitiv), lekin FANTOM ibora HECH
@@ -950,7 +1088,14 @@ def _transcribe_audio_whisper(
             dropped += 1
             continue
 
-        is_phantom = _is_phantom_phrase(seg_text)
+        # Mentor demo'da topilgan 4-muammo: SEGMENT darajasida "qisqa
+        # bo'lak" — AYNAN shu segmentning o'z davomiyligi (butun turn
+        # EMAS, chunki bitta uzun turn ichida bitta QISQA, hallyutsinatsiya
+        # bo'lgan segment bo'lishi mumkin).
+        seg_duration_s = (
+            (seg_end - seg_start) if (seg_start is not None and seg_end is not None) else 0.0
+        )
+        is_phantom = _is_phantom_drop(seg_text, seg_duration_s, nsp, alp)
         if not is_phantom:
             fallback_candidates.append(seg_text)
 
@@ -976,7 +1121,7 @@ def _transcribe_audio_whisper(
             if is_long_compression:
                 reasons.append(f"compression_ratio {cr:.2f} > {COMPRESSION_RATIO_THRESHOLD}")
             if is_phantom:
-                reasons.append("phantom_phrase")
+                reasons.append("phantom")
             # Har doim (DEBUG_STT'dan qat'i nazar) chiqariladi — haqiqiy
             # segmentlar noto'g'ri tashlab yuborilayotganini real ishlatishda
             # ham kuzatib borish uchun.
@@ -992,6 +1137,11 @@ def _transcribe_audio_whisper(
             logger.info(f"[STT][DEBUG] segment KEPT    [{seg_start}-{seg_end}] text={seg_text!r} "
                 f"no_speech_prob={nsp:.3f} avg_logprob={alp:.3f}")
         kept_parts.append(seg_text)
+        # Mentor demo'da topilgan 4-muammo: uzun matn OXIRIGA yopishgan
+        # fantom segmentni (masalan "... great. Thank you.") aniqlash
+        # uchun — pastdagi yakuniy tekshiruv shu OXIRGI saqlangan
+        # segmentning nsp/alp'iga qaraydi.
+        last_kept_nsp, last_kept_alp = nsp, alp
 
     text = "".join(kept_parts).strip()
 
@@ -1020,7 +1170,14 @@ def _transcribe_audio_whisper(
             None,
             0.0,
             True,
-            {"seg_lang_check": seg_lang_check_performed, "seg_lang_check_ms": seg_lang_check_ms},
+            {
+                "seg_lang_check": seg_lang_check_performed,
+                "seg_lang_check_ms": seg_lang_check_ms,
+                # Mentor demo'da topilgan 4-muammo: speaker_diart.py'ga
+                # yangi spiker ochish uchun qo'shimcha dalil sifatida
+                # uzatiladi (qarang dialog.py, SPK_NEW_MIN_PAIR_MASS).
+                "pair_mass": turn_pair_mass,
+            },
         )
 
     # Yuqoridagi `_is_phantom_phrase` tekshiruvi HAR BIR SEGMENT uchun
@@ -1030,8 +1187,28 @@ def _transcribe_audio_whisper(
     # o'tib ketishi mumkin. Shu sababli YAKUNIY (birlashtirilgan) matnga ham
     # qo'shimcha, mustaqil tekshiruv — transcribe_audio_elevenlabs()'dagi
     # yakuniy-matn tekshiruvi bilan BIR XIL maqsadda.
-    if _is_phantom_phrase(text):
-        logger.info(f"[STT] final text is a phantom phrase (text={text!r}) — emptied")
+    # Mentor demo'da topilgan 4-muammo: butun (birlashtirilgan) matn
+    # fantom ibora bilan mos kelsa HAM, qo'shimcha hallyutsinatsiya-signali
+    # (bo'lak qisqa YOKI oxirgi segment past-ishonchli) bo'lmasa — matn
+    # SAQLANIB qoladi (masalan uzoq, aniq gapirilgan "Thank you" haqiqiy
+    # bo'lishi mumkin). `audio.size / SAMPLE_RATE` — butun bo'lakning
+    # davomiyligi, `last_kept_nsp/alp` — OXIRGI saqlangan segmentniki
+    # ("...great. Thank you." kabi oxiriga yopishgan fantomni ushlash uchun).
+    turn_duration_s = (audio.size / SAMPLE_RATE) if (audio is not None and audio.size) else 0.0
+    if _is_phantom_drop(text, turn_duration_s, last_kept_nsp, last_kept_alp):
+        logger.info(
+            f"[STT][DROP] reason=phantom text={text!r} turn_duration={turn_duration_s:.2f}s "
+            f"no_speech_prob={last_kept_nsp:.3f} avg_logprob={last_kept_alp:.3f} — final text emptied"
+        )
+        text = ""
+    elif _is_low_conf_short_drop(text, turn_duration_s, last_kept_alp):
+        # Mentor demo'da topilgan 5-muammo: PHANTOM_PHRASES ro'yxatidagi
+        # aniq iboralarga mos kelmasa ham, juda qisqa+past-ishonchli matn
+        # (qarang _is_low_conf_short_drop izohi yuqorida).
+        logger.info(
+            f"[STT][DROP] reason=low_conf_short text={text!r} turn_duration={turn_duration_s:.2f}s "
+            f"avg_logprob={last_kept_alp:.3f} — final text emptied"
+        )
         text = ""
 
     msg = f"[STT] {len(text)} chars in {elapsed:.2f}s detected_lang={detected_lang} ({lang_prob:.2f})"
@@ -1050,5 +1227,9 @@ def _transcribe_audio_whisper(
         detected_lang,
         lang_prob,
         False,
-        {"seg_lang_check": seg_lang_check_performed, "seg_lang_check_ms": seg_lang_check_ms},
+        {
+            "seg_lang_check": seg_lang_check_performed,
+            "seg_lang_check_ms": seg_lang_check_ms,
+            "pair_mass": turn_pair_mass,
+        },
     )

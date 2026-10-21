@@ -11,6 +11,7 @@ from app.models.stt import (
     transcribe_audio,
     _decode_pcm_bytes,
     _write_wav,
+    compute_speech_rms,
     SAMPLE_RATE,
 )
 from app.models.speaker_diart import (
@@ -23,6 +24,7 @@ from app.models.speaker_diart import (
     save_turn_label,
 )
 from app.models.translator import translate_text
+from app.models.segmenter import segment_turn
 from app.config import MIN_TURN_SECONDS, NLLB_LANG_CODES
 import logging
 
@@ -82,6 +84,19 @@ MERGE_CONTINUATION_MAX_DURATION_S = 3.0
 # bo'lsa) birlashtiriladi.
 RETRO_MERGE_WINDOW_S = 2.5
 
+# Mentor demo'da topilgan 3-muammo: real testda bitta bubble'ga 15+ bo'lak
+# (456 belgi) qo'shilib ketgan edi — retroaktiv birlashtirish hech qanday
+# chegaraga ega emas edi. Ikki mustaqil himoya:
+#   1. uncertain=True YOKI speaker=None ("unknown") bo'lgan HAR QANDAY
+#      tomon (joriy bo'lak HAM, oldingi bubble HAM) uchun birlashtirish
+#      UMUMAN qo'llanmaydi — spiker ANIQ bo'lmagan holatda "bu aynan
+#      shu odamning davomi" degan asos o'zi ham noaniq.
+#   2. Bubble MAX_MERGED_CHARS (matn) yoki MAX_MERGED_AUDIO_S (audio)dan
+#      oshsa — qo'shilmaydi, YANGI bubble boshlanadi (garchi spiker/til/
+#      vaqt oynasi hammasi mos kelsa ham).
+MAX_MERGED_CHARS = int(os.environ.get("MAX_MERGED_CHARS", "300"))
+MAX_MERGED_AUDIO_S = float(os.environ.get("MAX_MERGED_AUDIO_S", "25"))
+
 # Frontend VAD'ning SPEECH_RMS_THRESHOLD'i (useDialogSession.js) gap-oxiri
 # so'zlarini kesib yubormasligi uchun atayin past qo'yilgan — buning oqibati,
 # real suhbatda juda ko'p sonli, past-energiyali shovqin bo'lagi ham "nutq
@@ -101,6 +116,30 @@ FAST_PATH_MAX_RMS = 0.01
 # qancha oxirgi turn xotirada (audio bilan) saqlanadi — uzoq suhbatda
 # xotira cheksiz o'smasligi uchun chegara.
 MAX_TURN_HISTORY = 50
+
+# ---------------------------------------------------------------------------
+# Mentor demo'da topilgan 1-muammo (shovqinli xona, fonda o'zbekcha
+# gaplashuv): Silero VAD fondagi nutqni HAM to'g'ri "nutq" deb tutadi —
+# frontend'dagi near-field qoidasi (useDialogSession.js, NEAR_FIELD_RATIO)
+# FAQAT FAOL TURN ICHIDA ishlaydi (davom etayotgan gapni fon bilan
+# aralashtirmaslik uchun), lekin turn BOSHLANISHIDA (yangi, alohida bo'lak
+# sifatida) hech qanday masofa-filtri yo'q — fondagi gap ham, agar til
+# filtridan tasodifan o'tib ketsa, to'liq bo'lak sifatida qabul qilinardi.
+#
+# Shu sababli BACKEND tarafida IKKINCHI, mustaqil qatlam: sessiya davomida
+# QABUL QILINGAN (spikerga berilgan) bo'laklarning nutq-RMS'lari (qarang
+# compute_speech_rms, stt.py) oxirgi NEAR_REF_MAX_SAMPLES tasi saqlanadi —
+# `near_ref` ularning medianasi, "foydalanuvchining odatiy (mikrofonga
+# yaqin) ovoz darajasi" degani. Yangi bo'lakning nutq-RMS'i shundan
+# FAR_FIELD_TURN_RATIO ulushidan PAST bo'lsa — bu bo'lak (near_ref'ga
+# nisbatan) "uzoqda" turgan, demak fondagi odam, deb hisoblanadi.
+#
+# "Umumiy" talab (sovuq start/fon yo'q holatda eski xatti-harakat
+# o'zgarmasin): kamida NEAR_REF_MIN_TURNS ta namuna to'planmaguncha filtr
+# UMUMAN qo'llanmaydi (pastga qarang).
+NEAR_REF_MIN_TURNS = int(os.environ.get("NEAR_REF_MIN_TURNS", "2"))
+NEAR_REF_MAX_SAMPLES = 20
+FAR_FIELD_TURN_RATIO = float(os.environ.get("FAR_FIELD_TURN_RATIO", "0.35"))
 
 
 @router.websocket("/ws/dialog")
@@ -199,7 +238,66 @@ async def websocket_dialog(websocket: WebSocket):
             await send_status("speakers_merged", **{"from": frm, "into": into})
 
 
-    async def process_turn(wav, seq: int, client_seqs: list | None = None):
+    async def _finish_translation(out_seq, out_text, source_lang, target_lang):
+        """Mentor demo'da topilgan 8-muammo: haqiqiy tarjima chaqiruvi
+        (DeepL — tarmoq, yoki NLLB-600M — GPU) endi turn_worker()ni
+        BLOKlamaydi — _process_subsegment() bu funksiyani `asyncio.
+        create_task()` orqali ishga tushirib, DARHOL qaytadi (navbatdagi
+        bo'lak GPU'ga — STT/embedding — kutilmasdan o'tadi). Natija
+        tayyor bo'lganda shu funksiya turn_history yozuvini to'ldirib,
+        "turn"ni (ENDI haqiqiy tarjima bilan) yuboradi.
+
+        POYGA HOLATI TUZATISHI: shu orada (tarjima kutilayotgan paytda)
+        `out_seq` RETRO-MERGE orqali boshqa matn bilan yangilangan
+        bo'lishi mumkin (_process_subsegment o'zi HAR DOIM yangi matn
+        uchun YANGI tarjima so'rovini boshlaydi) — shu sababli natija
+        qo'llanishidan OLDIN entry["text"] HALI HAM shu funksiya
+        tarjima qilgan AYNAN `out_text`ga teng ekani tekshiriladi;
+        mos kelmasa (matn allaqachon o'zgargan/merge bo'lgan, yoki
+        bubble o'chirilgan) — bu ESKIRGAN natija, qo'llanmaydi (uni
+        allaqachon o'zgartirgan tomon o'ZINING tarjimasiga javobgar)."""
+        t_mt0 = time.perf_counter()
+        try:
+            translation, mt_provider = await loop.run_in_executor(
+                None, translate_text, out_text, target_lang, source_lang
+            )
+        except Exception as e:
+            logger.error(f"[/ws/dialog] translation failed: {e!r}")
+            translation = ""
+            mt_provider = "error"
+        mt_elapsed = time.perf_counter() - t_mt0
+
+        entry = state["turn_history"].get(out_seq)
+        if entry is None or entry.get("text") != out_text:
+            logger.info(
+                f"[/ws/dialog] translation for seq={out_seq} discarded (eskirgan — "
+                f"matn shu orada o'zgargan/o'chirilgan) mt={mt_elapsed:.2f}s"
+            )
+            return
+        entry["translation"] = translation
+        entry["mt_provider"] = mt_provider
+        logger.info(f"[TURN][MT] seq={out_seq} mt={mt_elapsed:.2f}s provider={mt_provider!r}")
+        await _resend_turn(out_seq, entry)
+
+
+    async def _process_subsegment(
+        wav, seq, client_seqs: list, is_multi: bool, purity: float,
+        sub_index: int = 0, sub_total: int = 1,
+    ):
+        """Bitta QISM (sub-segment, qarang segmenter.segment_turn) uchun
+        to'liq quvur — STT, spiker aniqlash, retro-merge, tarjima. Bitta
+        turn FAQAT bitta qismdan iborat bo'lsa (ODDIY, eski holat),
+        process_turn uni AYNAN shu funksiya orqali, bir marta chaqiradi —
+        natija (va vaqt sarfi) 5/6-bandgacha bo'lgan kod bilan bir xil.
+
+        `is_multi` — shu turn bir nechta qismga bo'lingan bo'lsa True
+        (6-band: begona-til skip sababi "foreign_subsegment" bo'ladi,
+        "unsupported_language" o'rniga — frontend buni alohida xabar
+        bilan ko'rsatishi mumkin). `purity` — segment_turn() qaytargan,
+        shu qismning o'ZI qancha "toza" (bitta ovozga tegishli) ekanligi
+        bahosi — 7-band: identify_speaker() shu orqali "iflos" (ehtimol
+        ikki ovoz aralashgan) qismdan profilni YANGI prototip bilan
+        ifloslantirmaydi."""
         # Mentor demo'da topilgan 4-muammo: shu turnga tegishli frontend
         # `client_seq`lar (bitta bo'lak — bitta qiymat, merge/retro-merge
         # bo'lsa bir nechtasi) — HAR BIR qaytariladigan "turn"/"turn_skipped"
@@ -207,12 +305,13 @@ async def websocket_dialog(websocket: WebSocket):
         # topadi (qarang _resend_turn va pastdagi send_status chaqiruvlari).
         client_seqs = client_seqs or []
 
-        # TEZLIK TUZATISHI (6-band): butun navbatning "audio keldi ->
-        # frontendga natija yuborildi" vaqtini o'lchash uchun — pastdagi
-        # yakuniy [TURN] logiga qarang.
+        # TEZLIK TUZATISHI (6-band, ESKI izoh): "audio keldi -> natija
+        # yuborildi" vaqtini o'lchash uchun. Mentor demo'da topilgan
+        # 8-muammo: ENDI bu vaqt tarjima (ayniqsa DeepL tarmoq so'rovi)
+        # vaqtini O'Z ICHIGA OLMAYDI — shu bosqich endi fonda, alohida
+        # task sifatida ishlaydi (qarang _finish_translation).
         t_turn_start = time.perf_counter()
         stt_elapsed = 0.0
-        mt_elapsed = 0.0
 
         duration_s = wav.size / SAMPLE_RATE
         if duration_s < MIN_TURN_SECONDS:
@@ -254,8 +353,15 @@ async def websocket_dialog(websocket: WebSocket):
         # Bu yerda identify_speaker() UMUMAN chaqirilmaydi — demak hech bir
         # spiker profili bu turndan ta'sirlanmaydi.
         if unsupported_language:
-            logger.info(f"[/ws/dialog] turn skipped (unsupported_language: session_langs={SESSION_LANGS})")
-            await send_status("turn_skipped", reason="unsupported_language", client_seqs=client_seqs)
+            # Mentor demo'da topilgan 6-muammo: bitta turn bir nechta
+            # qismga bo'lingan bo'lsa, FAQAT shu (begona tilli) QISM
+            # tashlab yuboriladi — qolgan qismlar MUSTAQIL davom etadi
+            # (process_turn'dagi tsiklga qarang). Shu sababli sabab
+            # nomi ham alohida — frontend buni "butun gap tashlandi"
+            # emas, "bir qismi tashlandi" sifatida talqin qila oladi.
+            reason = "foreign_subsegment" if is_multi else "unsupported_language"
+            logger.info(f"[/ws/dialog] turn skipped (reason={reason}: session_langs={SESSION_LANGS})")
+            await send_status("turn_skipped", reason=reason, client_seqs=client_seqs)
             return
 
         text = (text or "").strip()
@@ -278,6 +384,7 @@ async def websocket_dialog(websocket: WebSocket):
             seq,
             detected_lang,
             debug_label,
+            purity,
         )
         speaker = spk_result["speaker"]
         uncertain = spk_result["uncertain"]
@@ -289,6 +396,30 @@ async def websocket_dialog(websocket: WebSocket):
         # `speaker` o'zi identify_speaker ICHIDA ALLAQACHON remap qilingan
         # (post-merge, yakuniy ID).
         await _apply_merges_and_notify(spk_result.get("merges", []))
+
+        # Mentor demo'da topilgan 1-muammo: "unknown" buferi (speaker_diart.py)
+        # shu chaqiruv ichida BOSHQA (joriy seq'dan tashqari, oldin
+        # "Aniqlanmoqda…" sifatida allaqachon frontendga yuborilgan
+        # bo'lishi mumkin bo'lgan) bo'laklarni ham qayta tayinlagan bo'lishi
+        # mumkin — ularning turn_history yozuvi (bo'lsa) yangilanadi va
+        # "turn" sifatida qayta yuboriladi (xuddi correct_speaker kabi).
+        for r_seq, r_speaker in spk_result.get("reassigned", []):
+            r_entry = state["turn_history"].get(r_seq)
+            if r_entry is None:
+                continue
+            r_entry["speaker"] = r_speaker
+            r_entry["uncertain"] = False
+            # "unknown" turnlar last_turn_by_speaker'ga HECH QACHON
+            # yozilmaydi (pastga qarang) — shuning uchun bu yerda eski
+            # yozuvni tozalash shart emas, faqat YANGI (endi ma'lum)
+            # spiker uchun qo'shiladi.
+            state["last_turn_by_speaker"][r_speaker] = {
+                "seq": r_seq,
+                "lang": r_entry["source_lang"],
+                "sent_at": time.monotonic(),
+            }
+            logger.info(f"[/ws/dialog] unknown buffer reassigned seq={r_seq} -> speaker={r_speaker}")
+            await _resend_turn(r_seq, r_entry)
 
         save_turn_label(debug_label.get("wav_filename"), speaker=speaker, lang=detected_lang, text=text)
 
@@ -312,14 +443,33 @@ async def websocket_dialog(websocket: WebSocket):
         # bilan "turn" sifatida qaytadi.
         merge_seq = None
         merge_prev_entry = None
-        last_turn = state["last_turn_by_speaker"].get(speaker)
+        # Mentor demo'da topilgan 3-muammo: speaker=None ("unknown") uchun
+        # retro-merge UMUMAN ko'rib chiqilmaydi — "aynan shu odamning
+        # davomi" degan asosning o'zi noaniq bo'lgan holatda birlashtirish
+        # ma'nosiz (va xavfli — keyin to'g'ri spikerga ajratish qiyinlashadi).
+        last_turn = state["last_turn_by_speaker"].get(speaker) if speaker is not None else None
         if (
             last_turn is not None
             and last_turn["lang"] == source_lang
             and (time.monotonic() - last_turn["sent_at"]) <= RETRO_MERGE_WINDOW_S
+            # Mentor demo'da topilgan 3-muammo: ikkala tomon ham ANIQ
+            # (uncertain=False) bo'lishi SHART — yoki JORIY bo'lak, yoki
+            # OLDINGI bubble noaniq bo'lsa, "bu aynan shu odam" degan
+            # taxmin o'zi ishonchsiz, birlashtirish xato spikerni
+            # "mustahkamlab" qo'yishi mumkin.
+            and not uncertain
         ):
             candidate_entry = state["turn_history"].get(last_turn["seq"])
-            if candidate_entry is not None:
+            if (
+                candidate_entry is not None
+                and not candidate_entry.get("uncertain", False)
+                # Mentor demo'da topilgan 3-muammo: bubble hajm chegarasi —
+                # MAX_MERGED_CHARS/MAX_MERGED_AUDIO_S'dan oshsa, qo'shish
+                # o'rniga YANGI bubble boshlanadi (bir bubble'ga 15+ bo'lak,
+                # 456 belgi qo'shilib ketgan real-test nosozligi).
+                and len(candidate_entry["text"]) < MAX_MERGED_CHARS
+                and (candidate_entry["wav"].size / SAMPLE_RATE) < MAX_MERGED_AUDIO_S
+            ):
                 merge_seq = last_turn["seq"]
                 merge_prev_entry = candidate_entry
 
@@ -353,7 +503,17 @@ async def websocket_dialog(websocket: WebSocket):
             merged_seqs = [out_seq]
             out_client_seqs = client_seqs
 
+        # Mentor demo'da topilgan 8-muammo: haqiqiy tarjima chaqiruvi
+        # (pastdagi `else` — DeepL tarmoq so'rovi yoki NLLB-600M GPU
+        # inference) ENDI `await` QILINMAYDI — alohida fon-task sifatida
+        # ishga tushiriladi (_finish_translation), shunda turn_worker()
+        # DARHOL navbatdagi bo'lakka o'tadi (GPU bosqichlari — STT,
+        # embedding — bitta worker'da ketma-ket qoladi, FAQAT tarjima
+        # mustaqil). "Tezkor" (tarmoq/GPU chaqiruvisiz) holatlar — til
+        # bir xil, yoki NLLB qo'llamaydigan til, yoki past lang_prob —
+        # BIR ZUMDA ma'lum bo'lgani uchun o'zgarishsiz, sinxron qoladi.
         mt_provider = None
+        translation_pending = False
         if source_lang == target_lang:
             # Nazariy jihatdan amalda bo'lmasligi kerak (SESSION_LANGS ikki
             # XIL til), lekin xavfsizlik uchun saqlanadi.
@@ -367,21 +527,11 @@ async def websocket_dialog(websocket: WebSocket):
                 f"target_lang={target_lang!r} lang_prob={lang_prob:.2f}) — showing original text")
             translation = out_text
         else:
-            t_mt0 = time.perf_counter()
-            try:
-                translation, mt_provider = await loop.run_in_executor(
-                    None, translate_text, out_text, target_lang, source_lang
-                )
-            except Exception as e:
-                # Tarjima: DeepL (asosiy) + NLLB-600M (zaxira) — IKKISI HAM
-                # muvaffaqiyatsiz bo'lsa ham (yoki kutilmagan xato chiqsa)
-                # turn SKIP QILINMAYDI, foydalanuvchiga baribir ko'rsatiladi
-                # (bo'sh tarjima + "Tarjima vaqtincha mavjud emas" bayrog'i
-                # bilan) — qarang _resend_turn'dagi translation_error.
-                logger.error(f"[/ws/dialog] translation failed: {e!r}")
-                translation = ""
-                mt_provider = "error"
-            mt_elapsed = time.perf_counter() - t_mt0
+            # Hali noma'lum — frontend bu seq uchun ALLAQACHON ko'rsatgan
+            # placeholder ("…") shu natija kelgunga qadar davom etadi
+            # (_resend_turn bu yerda ATAYLAB chaqirilMAYDI).
+            translation = None
+            translation_pending = True
 
         state["turn_history"][out_seq] = {
             "wav": out_wav,
@@ -404,23 +554,78 @@ async def websocket_dialog(websocket: WebSocket):
 
         # Keyingi davomlar shu (yangilangan) seq'ga qarab zanjirlansin —
         # 3-chi bo'lak ham 2.5s ichida kelsa, u ham AYNAN shu bubble'ga
-        # qo'shiladi.
-        state["last_turn_by_speaker"][speaker] = {
-            "seq": out_seq,
-            "lang": source_lang,
-            "sent_at": time.monotonic(),
-        }
+        # qo'shiladi. Mentor demo'da topilgan 1/3-muammolar: speaker=None
+        # ("unknown") uchun BU YOZILMAYDI — noaniq spiker hech qachon
+        # "oxirgi gapirgan" fallback manbai ham, retro-merge nishoni ham
+        # bo'lmasligi kerak.
+        if speaker is not None:
+            state["last_turn_by_speaker"][speaker] = {
+                "seq": out_seq,
+                "lang": source_lang,
+                "sent_at": time.monotonic(),
+            }
 
         logger.info(
-            f"[TURN] seq={out_seq} audio={duration_s:.2f}s stt={stt_elapsed:.2f}s "
-            f"mt={mt_elapsed:.2f}s total={time.perf_counter() - t_turn_start:.2f}s "
+            f"[TURN] seq={out_seq} sub={sub_index + 1}/{sub_total} audio={duration_s:.2f}s "
+            f"stt={stt_elapsed:.2f}s mt={'pending' if translation_pending else '0.00'}s "
+            f"total={time.perf_counter() - t_turn_start:.2f}s "
             f"merged={merge_prev_entry is not None} speaker={speaker} uncertain={uncertain} "
-            f"decision={spk_result['decision']} "
+            f"decision={spk_result['decision']} purity={purity:.3f} "
             f"seg_lang_check={stt_diag.get('seg_lang_check', False)}"
             f"({stt_diag.get('seg_lang_check_ms', 0.0):.1f}ms)"
         )
 
-        await _resend_turn(out_seq, state["turn_history"][out_seq])
+        if translation_pending:
+            # Mentor demo'da topilgan 8-muammo: worker shu yerda TO'XTAMAYDI
+            # — tarjima fonda tugaganda _finish_translation o'zi "turn"ni
+            # (haqiqiy tarjima bilan) yuboradi.
+            asyncio.create_task(_finish_translation(out_seq, out_text, source_lang, target_lang))
+        else:
+            await _resend_turn(out_seq, state["turn_history"][out_seq])
+
+
+    async def process_turn(wav, seq: int, client_seqs: list | None = None):
+        """Mentor demo'da topilgan 5/6-muammolar: bitta turn'ning XOM
+        audiosini (kerak bo'lsa) segmenter.segment_turn() orqali bir
+        nechta MUSTAQIL qismga ajratib, HAR BIRINI alohida
+        _process_subsegment() orqali qayta ishlaydi. Bitta qism chiqsa
+        (ODDIY, ko'pchilik holat) — natija AYNAN eski (segmentatsiyasiz)
+        yo'l bilan bir xil (qarang segmenter.py'dagi FAST_PATH_MAX_DURATION_S).
+
+        `seq`/`client_seqs` — FAQAT BIRINCHI qismga tegishli (frontend
+        shu AYNAN shu ikkisi bilan bitta placeholder yuborgan edi, qarang
+        useDialogSession.js'dagi sendTurnAudio). Qolgan qism(lar) uchun
+        YANGI seq kerak — lekin ATAYLAB `state["turn_seq"]`DAN (ya'ni
+        handle_audio_chunk HAR BIR YANGI jismoniy bo'lak kelganda
+        oshiradigan, ARALASH hisoblagich) emas, balki ASOSIY `seq`ning
+        o'zidan KICHIK KASR qo'shib hosil qilinadi (`seq + i*0.001`).
+        SABAB — POYGA HOLATI: turn_worker() navbatlarni KETMA-KET qayta
+        ishlaydi, lekin receiver() YANGI jismoniy bo'laklarni BUNGA
+        qarashmasdan qabul qilib, `state["turn_seq"]`ni OSHIRIB borishda
+        davom etadi — ya'ni shu turnning segmentatsiyasi/qayta ishlanishi
+        DAVOM etayotganda, KEYINGI jismoniy bo'lak ALLAQACHON KATTAROQ
+        seq olgan bo'lishi mumkin. Agar shu umumiy hisoblagichdan foydalansak,
+        2-qism (hali shu ESKI bo'lakka tegishli, demak vaqt bo'yicha
+        OLDINROQ) KEYINGI jismoniy bo'lakdan KATTAROQ seq olib qolishi
+        mumkin edi — "vaqt tartibi" buzilardi. `seq + i*0.001` esa HECH
+        QANDAY umumiy holatga bog'liq emas — har doim `seq < seq+i*0.001
+        < seq+1 <= keyingi_seq` (amalda bir turn hech qachon 999 qismga
+        bo'linmaydi), demak tartib HAR DOIM to'g'ri saqlanadi."""
+        client_seqs = client_seqs or []
+        t_seg0 = time.perf_counter()
+        subsegments = await loop.run_in_executor(None, segment_turn, wav, SAMPLE_RATE, seq)
+        seg_elapsed = time.perf_counter() - t_seg0
+        is_multi = len(subsegments) > 1
+        if is_multi:
+            logger.info(f"[/ws/dialog] seq={seq} {len(subsegments)} qismga bo'lindi (seg took={seg_elapsed * 1000:.1f}ms)")
+
+        for i, sub in enumerate(subsegments):
+            sub_seq = seq if i == 0 else seq + i * 0.001
+            sub_client_seqs = client_seqs if i == 0 else []
+            await _process_subsegment(
+                sub["wav"], sub_seq, sub_client_seqs, is_multi, sub["purity"],
+                sub_index=i, sub_total=len(subsegments),
+            )
 
 
     async def turn_worker():

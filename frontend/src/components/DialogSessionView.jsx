@@ -35,6 +35,21 @@ function defaultSpeakerName(speakerId) {
   return `${speakerId}-spiker`;
 }
 
+// Mentor demo'da topilgan 1-muammo: backend endi ANIQ boshqa ovozli,
+// lekin yangi spiker ochish uchun ham qisqa bo'lgan bo'laklarni darhol
+// (noto'g'ri) biror spikerga "yopishtirmasdan", `speaker: null` bilan
+// "unknown" deb qaytaradi (qarang speaker_diart.py, "unknown" buferi).
+// Bunday bubble kulrang, hech qanday rangga BOG'LANMAGAN neytral
+// ko'rinishda — qarang colorForSpeaker/render pastda.
+const UNKNOWN_SPEAKER_LABEL = "Aniqlanmoqda…";
+const NEUTRAL_PALETTE = {
+  avatar: "bg-gray-300",
+  name: "text-gray-400",
+  dot: "bg-gray-300",
+  border: "border-gray-300",
+  light: "bg-gray-50",
+};
+
 // Pastdan shuncha pikseldan UZOQROQ bo'lsa, foydalanuvchi "o'zi yuqoriga
 // skroll qilgan" deb hisoblanadi — avtomatik skroll to'xtaydi va "Yangi
 // xabarlar" tugmasi chiqadi.
@@ -88,7 +103,10 @@ export default function DialogSessionView({ onBack }) {
   // (delete_turn) yoki birlashtirish (speakers_merged) HECH QANDAY qayta
   // hisoblashga olib kelmaydi, demak qolgan spikerlarning rangi siljimaydi.
   const colorForSpeaker = useCallback(
-    (speakerId) => SPEAKER_PALETTE[(speakerColorOrder[speakerId] ?? 0) % SPEAKER_PALETTE.length],
+    (speakerId) =>
+      speakerId === null
+        ? NEUTRAL_PALETTE
+        : SPEAKER_PALETTE[(speakerColorOrder[speakerId] ?? 0) % SPEAKER_PALETTE.length],
     [speakerColorOrder]
   );
 
@@ -454,12 +472,19 @@ export default function DialogSessionView({ onBack }) {
               // bo'lsa ham) ko'rsatiladi, qarang DialogBubble.jsx.
               const grouped = Boolean(prev && !prev.placeholder && prev.speaker === msg.speaker);
               const palette = colorForSpeaker(msg.speaker);
-              const resolvedName = speakerNames[msg.speaker] || defaultSpeakerName(msg.speaker);
+              // Mentor demo'da topilgan 1-muammo: speaker=null ("unknown")
+              // uchun hali hech qanday barqaror identifikatsiya yo'q —
+              // doimiy ism/avatar/joylashuv o'rniga neytral "Aniqlanmoqda…"
+              // yorlig'i ko'rsatiladi (qarang NEUTRAL_PALETTE yuqorida).
+              const isUnknown = msg.speaker === null;
+              const resolvedName = isUnknown
+                ? UNKNOWN_SPEAKER_LABEL
+                : speakerNames[msg.speaker] || defaultSpeakerName(msg.speaker);
               // Toq raqamli spikerlar (1, 3, 5...) chapda, juft raqamlilar
               // (2, 4...) o'ngda — "Men"/"Bu menman" tushunchasi YO'Q, bu
               // faqat spiker ID'ning juft-toqligiga bog'liq, doimiy
-              // joylashuv.
-              const isRight = Number(msg.speaker) % 2 === 0;
+              // joylashuv. "unknown" doim chapda (hali spikerga bog'lanmagan).
+              const isRight = isUnknown ? false : Number(msg.speaker) % 2 === 0;
               return (
                 <DialogBubble
                   key={msg.seq}
@@ -470,7 +495,7 @@ export default function DialogSessionView({ onBack }) {
                   speakerName={resolvedName}
                   isRight={isRight}
                   avatarLetter={
-                    speakerNames[msg.speaker] ? speakerNames[msg.speaker][0] : String(msg.speaker)
+                    isUnknown ? "?" : speakerNames[msg.speaker] ? speakerNames[msg.speaker][0] : String(msg.speaker)
                   }
                   avatarClass={palette.avatar}
                   nameColorClass={palette.name}
@@ -485,7 +510,12 @@ export default function DialogSessionView({ onBack }) {
                   audioError={audioErrors[msg.seq]}
                   onPlayAudio={() => handlePlayAudio(msg.seq, msg.translation, msg.targetLang)}
                   onSelectSpeaker={(targetSpeaker) => correctSpeaker(msg.seq, targetSpeaker)}
-                  onRename={(newName) => handleRename(msg.speaker, newName)}
+                  onRename={(newName) => {
+                    // "unknown" bubble hali barqaror spiker ID'ga ega
+                    // emas — ism tahrirlash ma'nosiz (qarang isUnknown).
+                    if (isUnknown) return;
+                    handleRename(msg.speaker, newName);
+                  }}
                   onDelete={() => deleteTurn(msg.seq)}
                 />
               );

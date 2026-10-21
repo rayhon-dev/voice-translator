@@ -122,6 +122,46 @@ const VAD_RMS_SMOOTHING_ALPHA = 0.5; // 0..1, kattaroq = tezroq (kamroq silliqla
 const NEAR_FIELD_RATIO = 0.35; // 0..1 — joriy spiker darajasining shuncha ulushidan past freym "fon" deb hisoblanadi
 const SPEECH_LEVEL_EMA_ALPHA = 0.1; // sekin EMA — bir martalik baland fon-impulsi speechLevel'ni darhol ko'tarib yubormasin
 
+// Mentor demo'da topilgan 0-muammo (ENG MUHIM): real testda deyarli HAR
+// BIR bo'lak ≈ PRE_ROLL_MS + MIN_SPEECH_START_MS + SILENCE_DURATION_MS
+// (≈300+200+1200=1700ms, kuzatilgan 1540-1660ms shu bilan mos) uzunlikda
+// kelgan — ya'ni odam gapirishda DAVOM etayotgan bo'lsa ham, turn
+// boshlangandan ko'p o'tmay "jimlik" deb topilib ketgan. Ildiz sabab —
+// ikkita bog'liq xato:
+//   1. `speechLevelRef` turn boshida FAQAT BITTA (aynan shu lahzadagi,
+//      ko'pincha so'z boshidagi "zarba"/eng baland bo'g'in bilan mos
+//      keluvchi) namunaga teng qilib boshlanardi. Inson nutqi tabiiy
+//      ravishda 3x (yoki ko'proq) dinamik diapazonga ega — agar shu
+//      BOSHLANG'ICH namuna tasodifan baland chiqsa, undan keyingi BUTUN
+//      jumla (so'zlar orasi, yumshoq undoshlar) NEAR_FIELD_RATIO (35%)
+//      chegarasidan doimiy PAST qolib, 1.2s ichida "fon" deb yig'ilib,
+//      SILENCE_DURATION_MS'ni to'ldirib yuborardi — garchi bu AYNAN shu
+//      (yaqin) odamning o'zi, uzluksiz gapirayotgan bo'lsa ham.
+//   2. `speechLevelRef` EMA'si FAQAT `nearFieldSpeaking=true` bo'lgandagina
+//      yangilanardi (ya'ni FAQAT o'zi "o'tgan" freymlardan) — demak (1)
+//      xatosi tufayli boshlang'ich qiymat haddan tashqari baland bo'lib
+//      qolsa, EMA HECH QACHON pasayib "to'g'rilana olmaydi" (hech bir
+//      freym bu threshold'dan o'tolmay, EMA'ga ta'sir qila olmaydi) —
+//      o'z-o'zini qondiruvchi qulf, xuddi eski noiseFloor xatosiga o'xshash.
+// Bundan tashqari, near-field tekshiruvi avval FAQAT xom RMS'ga qarardi —
+// Silero "ANIQ hali ham nutq" (prob yuqori) desa HAM butunlay e'tiborsiz
+// qoldirilardi (spec'ga ko'ra ikkisi BIRGALIKDA — "Silero nutq VA near-field"
+// — ishlashi kerak edi).
+//
+// Tuzatish:
+//   a) Birinchi SPEECH_LEVEL_SEED_MS (300ms) davomida near-field filtri
+//      UMUMAN qo'llanmaydi (nearFieldSpeaking = Silero/energiya natijasiga
+//      teng) — bu oynada speechLevel bitta namuna emas, shu vaqt ichidagi
+//      HAMMA freymning O'RTACHASI sifatida hisoblanadi (pastga qarang,
+//      handleWorkletChunk).
+//   b) Shu oynadan keyin EMA endi Silero "nutq" deganda (nearFieldSpeaking
+//      natijasidan QATI'IY NAZAR) yangilanadi — shunda boshlang'ich qiymat
+//      baribir biroz noto'g'ri chiqib qolsa ham, haqiqiy davom etayotgan
+//      nutqdan tez orada o'z-o'zini to'g'rilay oladi (qulf yo'q).
+//   c) nearFieldSpeaking = Silero/energiya natijasi VA near-field RMS
+//      ikkisi BIRGALIKDA (spec talabiga mos).
+const SPEECH_LEVEL_SEED_MS = 300;
+
 // --- D1: turn boshida "fon shovqinidan tasodifan ochilish"ning oldini
 // olish — nutq hech bo'lmasa shuncha millisoniya UZLUKSIZ chegaradan
 // yuqori bo'lgandagina turn RASMAN boshlanadi. PRE_ROLL_MS (300ms) bu
@@ -243,6 +283,11 @@ const SKIP_REASON_MESSAGES = {
   // backend endi buni alohida sabab bilan belgilaydi (stt.py'dagi
   // pair_mass/raw_top_lang tekshiruvi, qarang dialog.py).
   unsupported_language: "Tanlangan tillardan boshqa tilda gapirildi.",
+  // Mentor demo'da topilgan 6-muammo (B-guruh): bitta bo'lak bir nechta
+  // mustaqil qismga bo'lingan bo'lsa (segmenter.py) va FAQAT shu
+  // qismlardan biri begona tilda bo'lsa — butun bo'lak EMAS, FAQAT shu
+  // qism tashlab yuboriladi (qarang dialog.py'dagi `is_multi` izohi).
+  foreign_subsegment: "Shu qismi boshqa tilda edi — tashlab yuborildi.",
 };
 const SKIP_REASON_DEFAULT = "Ovoz aniq eshitilmadi — yana gapirib ko'ring.";
 
@@ -360,6 +405,11 @@ export function useDialogSession() {
   // paytda 0 (neytral — nearThreshold shunda dynamicThreshold bilan
   // bir xil bo'lib qoladi).
   const speechLevelRef = useRef(0);
+  // Mentor demo'da topilgan 0-muammo: speechLevel turn boshida bitta
+  // namuna o'rniga SPEECH_LEVEL_SEED_MS davomidagi O'RTACHA bilan
+  // boshlanishi uchun — qarang SPEECH_LEVEL_SEED_MS izohi yuqorida.
+  const speechLevelSeedSumRef = useRef(0);
+  const speechLevelSeedCountRef = useRef(0);
   // D1: hali RASMIY boshlanmagan ("tasdiqlanmagan") nutq qachon
   // boshlanganini belgilaydi — MIN_SPEECH_START_MS to'lmaguncha turn
   // ochilmaydi (qarang handleWorkletChunk). `null` = hozir nomzod yo'q.
@@ -462,6 +512,8 @@ export function useDialogSession() {
     noiseFloorRef.current = null;
     smoothedRmsRef.current = 0;
     speechLevelRef.current = 0;
+    speechLevelSeedSumRef.current = 0;
+    speechLevelSeedCountRef.current = 0;
     pendingSpeechStartAtRef.current = null;
     preRollChunksRef.current = [];
     turnChunksRef.current = null;
@@ -730,14 +782,33 @@ export function useDialogSession() {
       let nearFieldSpeaking = speaking;
       let silenceReason = speaking ? "above_threshold" : "below_threshold";
       if (hasActiveTurn) {
-        nearThreshold = Math.max(dynamicThreshold, speechLevelRef.current * NEAR_FIELD_RATIO);
-        nearFieldSpeaking = smoothedRmsRef.current >= nearThreshold;
-        silenceReason = nearFieldSpeaking ? "near_field_speech" : "far_field_background";
-        if (nearFieldSpeaking) {
-          // Sekin EMA — joriy ("eng yaqin") spikerning darajasini vaqt
-          // bo'yicha kuzatib boradi, bir martalik baland fon-impulsidan
-          // darhol "aldanib" yuqoriga sirg'alib ketmaydi.
-          speechLevelRef.current += SPEECH_LEVEL_EMA_ALPHA * (smoothedRmsRef.current - speechLevelRef.current);
+        const turnAgeMs = now - turnStartedAtRef.current;
+        if (turnAgeMs < SPEECH_LEVEL_SEED_MS) {
+          // (a) Mentor demo'da topilgan 0-muammo: hali ishonchli boshlang'ich
+          // daraja yo'q — near-field filtrini QO'LLAMAYMIZ (Silero/energiya
+          // natijasiga to'liq ishonamiz), speechLevel esa shu oynadagi
+          // o'rtacha sifatida yig'iladi.
+          speechLevelSeedSumRef.current += smoothedRmsRef.current;
+          speechLevelSeedCountRef.current += 1;
+          speechLevelRef.current = speechLevelSeedSumRef.current / speechLevelSeedCountRef.current;
+          nearThreshold = Math.max(dynamicThreshold, speechLevelRef.current * NEAR_FIELD_RATIO);
+          nearFieldSpeaking = speaking;
+          silenceReason = speaking ? "seeding_speech" : "seeding_silence";
+        } else {
+          nearThreshold = Math.max(dynamicThreshold, speechLevelRef.current * NEAR_FIELD_RATIO);
+          const rmsNearOk = smoothedRmsRef.current >= nearThreshold;
+          // (c) Spec: Silero (yoki energiya) "nutq" DEGANI VA near-field
+          // RMS ikkisi BIRGALIKDA — avval bu yerda FAQAT RMS tekshirilib,
+          // Silero/energiya natijasi butunlay e'tiborsiz qoldirilardi.
+          nearFieldSpeaking = speaking && rmsNearOk;
+          silenceReason = !speaking ? "vad_silence" : rmsNearOk ? "near_field_speech" : "far_field_background";
+          if (speaking) {
+            // (b) EMA endi FAQAT rmsNearOk bo'lgandagina EMAS, speaking
+            // (Silero/energiya "nutq") deganda HAR SAFAR yangilanadi —
+            // aks holda (a)dagi boshlang'ich qiymat biroz noto'g'ri chiqib
+            // qolsa ham, EMA hech qachon pasayib "qulflanib qolardi".
+            speechLevelRef.current += SPEECH_LEVEL_EMA_ALPHA * (smoothedRmsRef.current - speechLevelRef.current);
+          }
         }
       }
 
@@ -824,7 +895,14 @@ export function useDialogSession() {
             turnChunksRef.current = [...preRollChunksRef.current];
             turnStartedAtRef.current = pendingSpeechStartAtRef.current;
             silenceStartedAtRef.current = null;
+            // Mentor demo'da topilgan 0-muammo: BITTA namuna o'rniga
+            // keyingi SPEECH_LEVEL_SEED_MS davomida o'rtacha hisoblanadi
+            // (qarang yuqoridagi near-field blok) — shu boshlang'ich
+            // qiymat FAQAT birinchi freym kelmaguncha ishlatiladigan
+            // zaxira.
             speechLevelRef.current = smoothedRmsRef.current;
+            speechLevelSeedSumRef.current = smoothedRmsRef.current;
+            speechLevelSeedCountRef.current = 1;
             pendingSpeechStartAtRef.current = null;
             console.log(
               `[VAD] speech STARTED at=${new Date(now).toISOString()} rms=${rms.toFixed(5)} ` +
