@@ -10,6 +10,7 @@ import soundfile as sf
 import torch
 
 from app.config import SAVE_DEBUG_AUDIO, DEBUG_AUDIO_DIR
+from app.gpu_lock import GPU_LOCK
 import logging
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,19 @@ _embedding_load_lock = threading.Lock()
 # Shu va undan yuqori o'xshashlikda turn SHU spikerga ANIQ tegishli deb
 # qabul qilinadi.
 SPK_ACCEPT = float(os.environ.get("SPK_ACCEPT", "0.55"))
+
+# REAL TESTDA TOPILGAN MUAMMO (teng/yaqin ikki nomzod): `best_sim >=
+# SPK_ACCEPT` o'zi YETARLI EMAS — agar IKKINCHI eng yaqin spiker ham
+# deyarli XUDDI SHUNDAY o'xshashlikka ega bo'lsa (masalan sims={1:0.58,
+# 3:0.58} — ikkisi TENG), "eng kattasi" shunchaki tasodifiy tanlov bo'lib
+# qoladi, aslida qaysi odam ekani ANIQ EMAS. Shu sababli endi `accept`
+# qarori QO'SHIMCHA shartni talab qiladi: eng yaqin ikki nomzod orasidagi
+# FARQ (margin) kamida shuncha bo'lishi SHART — aks holda spiker
+# "tie_uncertain" (eng yaqinga TAYINLANADI, lekin uncertain=True, prototip
+# QO'SHILMAYDI). Bitta spiker mavjud bo'lganda (ikkinchisi yo'q) margin
+# cheksiz (-1.0'dan farq) hisoblanadi — bitta nomzod bilan "teng taqqoslash"
+# ma'nosiz, chegara UMUMAN qo'llanmaydi.
+SPK_MIN_MARGIN = float(os.environ.get("SPK_MIN_MARGIN", "0.08"))
 # Shundan past o'xshashlikda turn HECH QANDAY mavjud spikerga tegishli
 # EMAS deb hisoblanadi (yangi ovoz nomzodi). Real logdan: bir xil odamning
 # ENG PAST o'xshashligi 0.66, TURLI odamlarniki ENG KO'PI 0.33 edi — 0.35
@@ -103,6 +117,10 @@ SPK_NEW = float(os.environ.get("SPK_NEW", "0.40"))
 # namunalar ovoz profilini "ifloslantirishi" (noaniq/past-sifatli embedding)
 # xavfi yuqori.
 SPK_MIN_ENROLL_SPEECH_S = float(os.environ.get("SPK_MIN_ENROLL_SPEECH_S", "2.0"))
+# Bootstrap can use a confident short answer without relaxing later enrollment.
+SPK_BOOTSTRAP_MIN_SPEECH_S = float(os.environ.get("SPK_BOOTSTRAP_MIN_SPEECH_S", "1.5"))
+SPK_NEW_IMMEDIATE_PAIR_MASS = float(os.environ.get("SPK_NEW_IMMEDIATE_PAIR_MASS", "0.95"))
+SPK_NEW_IMMEDIATE_NEAR_RATIO = float(os.environ.get("SPK_NEW_IMMEDIATE_NEAR_RATIO", "0.75"))
 # Har bir spiker uchun saqlanadigan ENG KO'P prototiplar soni — birinchi
 # ("founding") prototip HAR DOIM saqlanadi, undan oshganda eng ESKI
 # (lekin birinchi EMAS) prototip olib tashlanadi (FIFO).
@@ -143,6 +161,26 @@ SPK_ENROLL_MIN_SIM = float(os.environ.get("SPK_ENROLL_MIN_SIM", "0.65"))
 # yordam beradi — shu dastlabki bosqichdan keyin ANIQ SPK_ENROLL_MIN_SIM
 # chegarasi amal qiladi.
 SPK_BOOTSTRAP_PROTOTYPES = int(os.environ.get("SPK_BOOTSTRAP_PROTOTYPES", "3"))
+# REAL TESTDA TOPILGAN MUAMMO (bitta odam ikki spikerga bo'lindi): 1-spiker
+# 1.57s'lik BITTA "Hello, how are you doing?" namunasidan ochilgan, shu
+# odamning keyingi uzun gaplari esa 0.53/0.49 o'xshashlik bilan "uncertain"
+# bo'lib qolib, profilga HECH QACHON qo'shilmagan — profil 1 prototipda
+# qotib qoldi va keyinroq o'sha odam boshqa (3 prototipli) spikerga
+# tayinlandi. Profil hali bootstrap bosqichida bo'lsa (< SPK_BOOTSTRAP_
+# PROTOTYPES), shu chegaradan yuqori, aniq margin'li, uzun va toza turn
+# qabul qilinadi va prototip sifatida qo'shiladi.
+SPK_BOOTSTRAP_ACCEPT = float(os.environ.get("SPK_BOOTSTRAP_ACCEPT", "0.45"))
+# REAL TESTDA: spikerning QISQA (< SPK_MIN_ENROLL_SPEECH_S) davom gapi
+# (masalan 1.8s "I wish you were different.") embedding'i ishonchsiz
+# bo'lgani uchun o'z spikeriga ham 0.35 o'xshashlik bergan va "Aniqlanmoqda…"
+# bo'lib qolgan, garchi boshqa hamma spikerlardan aniq yaqinroq bo'lsa ham.
+# Eng yaqin spiker OXIRGI gapirgan spiker bo'lsa, margin yetarli bo'lsa va
+# o'xshashlik shundan yuqori bo'lsa — shu spikerga (uncertain, prototip
+# qo'shilmaydi) tayinlanadi.
+SPK_SHORT_CONTINUE_SIM = float(os.environ.get("SPK_SHORT_CONTINUE_SIM", "0.30"))
+# 2.3s'lik "Sheila." ham (oxirgi spikerga 0.39, boshqalarga ≤0.16) shu
+# sababli "Aniqlanmoqda…" bo'lib qolgan — "qisqa" chegarasi 3s.
+SPK_SHORT_CONTINUE_MAX_SPEECH_S = float(os.environ.get("SPK_SHORT_CONTINUE_MAX_SPEECH_S", "3.0"))
 
 # REAL TESTDA TOPILGAN MUAMMO: yuqoridagi tuzatishlardan OLDIN, bitta
 # tuzatish (correct_speaker) xato spikerga qilingandan keyin ("Bir xil
@@ -187,6 +225,7 @@ SPK_ENROLL_MIN_PURITY = float(os.environ.get("SPK_ENROLL_MIN_PURITY", "0.6"))
 # tekshiruv O'TKAZIB YUBORILADI (xavfsiz standart — eski xatti-harakat
 # o'zgarmaydi, "Umumiy" talabiga mos).
 SPK_NEW_MIN_NEAR_FIELD_RATIO = float(os.environ.get("SPK_NEW_MIN_NEAR_FIELD_RATIO", "0.5"))
+SPK_NEW_CONFIRM_TURNS = max(2, int(os.environ.get("SPK_NEW_CONFIRM_TURNS", "2")))
 SPK_NEW_MIN_PAIR_MASS = float(os.environ.get("SPK_NEW_MIN_PAIR_MASS", "0.90"))
 
 
@@ -440,13 +479,17 @@ def create_session():
 def _embed(wav: np.ndarray, sample_rate: int) -> np.ndarray:
     model = _load_model()
     waveform = torch.from_numpy(np.ascontiguousarray(wav, dtype=np.float32)).reshape(1, -1)
-    if _embedding_backend == "pyannote":
-        emb = model({"waveform": waveform, "sample_rate": sample_rate})
-        emb = np.asarray(emb, dtype=np.float64).reshape(-1)
-    else:  # "speechbrain"
-        with torch.no_grad():
-            emb = model.encode_batch(waveform)
-        emb = emb.squeeze().cpu().numpy().astype(np.float64).reshape(-1)
+    # Latency spike tuzatishi (qarang app/gpu_lock.py izohi): bir nechta
+    # WebSocket sessiya BIR VAQTDA GPU'ga murojaat qilsa, lock ularni
+    # ketma-ketlashtiradi (thrashing o'rniga oddiy kutish).
+    with GPU_LOCK:
+        if _embedding_backend == "pyannote":
+            emb = model({"waveform": waveform, "sample_rate": sample_rate})
+            emb = np.asarray(emb, dtype=np.float64).reshape(-1)
+        else:  # "speechbrain"
+            with torch.no_grad():
+                emb = model.encode_batch(waveform)
+            emb = emb.squeeze().cpu().numpy().astype(np.float64).reshape(-1)
     norm = np.linalg.norm(emb)
     if norm > 0:
         emb = emb / norm
@@ -576,6 +619,66 @@ def _best_existing_match(session, embedding: np.ndarray):
     return best_id, best_sim
 
 
+def _best_match_with_margin(session, embedding: np.ndarray):
+    """`_best_existing_match`'ning margin-ogoh (qarang SPK_MIN_MARGIN izohi
+    yuqorida) versiyasi — eng yaqin IKKI nomzod orasidagi farqni ham
+    qaytaradi. Qaytaradi: (best_id, best_sim, margin) — bitta (yoki hech
+    qanday) spiker bo'lsa `margin=None` (chegara ma'nosiz, hech qachon
+    "tie" deb hisoblanmaydi)."""
+    sims: dict = {}
+    for sid, profile in session["speakers"].items():
+        sims[sid] = _speaker_best_sim(profile, embedding)
+    if not sims:
+        return None, -1.0, None
+    best_id = max(sims, key=sims.get)
+    best_sim = sims[best_id]
+    others = [sim for sid, sim in sims.items() if sid != best_id]
+    if not others:
+        return best_id, best_sim, None
+    return best_id, best_sim, best_sim - max(others)
+
+
+def embed_for_match(wav: np.ndarray, sample_rate: int) -> tuple:
+    """Trim + embed ONCE — shared by identify_speaker() (normal path, via
+    `precomputed=`) and the dialog.py language-gating pre-check
+    (quick_speaker_match) below, so one subsegment's audio is embedded at
+    most once even when its voice identity is needed before BOTH the
+    language decision (Plan B: speaker-conditioned threshold) and the
+    actual enrollment/clustering decision.
+
+    Qaytaradi: (embedding|None, trimmed, speech_s) — xuddi identify_speaker()
+    ICHIDAGI eski (endi shu yerga ko'chirilgan) trim/embed bosqichi kabi."""
+    trimmed = _trim_trailing_silence(wav, sample_rate)
+    turn_s = len(wav) / sample_rate
+    speech_s = len(trimmed) / sample_rate
+    if trimmed.size > 0 and speech_s < MIN_TRIMMED_DURATION_S and speech_s < turn_s:
+        logger.info(f"[SPK][TRIM] trim too aggressive ({turn_s:.2f}s -> {speech_s:.2f}s), using original audio")
+        trimmed = wav
+        speech_s = turn_s
+    embedding = None
+    if trimmed.size > 0 and speech_s >= MIN_TRIMMED_DURATION_S:
+        embedding = _embed(trimmed, sample_rate)
+    return embedding, trimmed, speech_s
+
+
+def quick_speaker_match(session, embedding: np.ndarray | None):
+    """Read-only best-match lookup against ALREADY ENROLLED speakers —
+    does NOT mutate session state (no enrollment, no new-speaker/unknown-
+    buffer side effects). Used BEFORE the language decision (Plan B, qarang
+    dialog.py) so a short/mixed subsegment's language threshold can be
+    relaxed when the voice clearly already belongs to a known speaker.
+    `embedding=None` (audio too short/silent) — hech kimga mos kelmaydi.
+
+    Qaytaradi: (best_id, best_sim, margin) — qarang SPK_MIN_MARGIN izohi:
+    chaqiruvchi (dialog.py) `margin`ni HAM tekshirishi SHART (bitta
+    yaqinroq spiker tanlashning O'ZI yetarli EMAS — ikkinchi nomzod bilan
+    TENG bo'lsa, bu "aniq tanilgan" hisoblanmasligi kerak)."""
+    if embedding is None:
+        return None, -1.0, None
+    with session["lock"]:
+        return _best_match_with_margin(session, embedding)
+
+
 def _process_unknown_buffer(session) -> list[tuple[int, int]]:
     """`session["lock"]` ALLAQACHON ushlab turilgan paytda chaqirilishi
     SHART. Qarang SPK_UNKNOWN_BUFFER_WINDOW_S izohi (1/2-muammolar) —
@@ -639,19 +742,22 @@ def _process_unknown_buffer(session) -> list[tuple[int, int]]:
                 # QOLADI — keyinroq ko'proq/toza namuna to'planishi mumkin).
                 # 4-muammo: endi FAQAT purity emas, near_field_ratio/
                 # pair_mass ham tekshiriladi — qarang _new_speaker_evidence.
-                strong_seqs = {
-                    e["seq"]
-                    for e in cluster
-                    if _new_speaker_evidence(
-                        e.get("purity", 1.0), e.get("near_field_ratio"), e.get("pair_mass")
-                    )[0]
-                }
-                if not strong_seqs:
-                    logger.info(
-                        f"[SPK] decision=unknown reason=weak_evidence (buffer_promote candidate "
-                        f"seqs={sorted(e['seq'] for e in cluster)} — hech qaysi a'zo yetarli dalilga ega emas)"
+                strong = []
+                for entry in cluster:
+                    ok, reasons = _new_speaker_evidence(
+                        entry.get("purity", 1.0), entry.get("near_field_ratio"), entry.get("pair_mass")
                     )
+                    if ok:
+                        strong.append(entry)
+                    else:
+                        logger.info(f"[SPK] decision=unknown reason=weak_evidence seq={entry['seq']} ({'; '.join(reasons)})")
+                # Subsegments of one browser chunk are not independent confirmations.
+                independent_turns = {int(e["seq"]) for e in strong}
+                if len(independent_turns) < SPK_NEW_CONFIRM_TURNS or sum(e["speech_s"] for e in strong) < SPK_MIN_ENROLL_SPEECH_S:
                     continue
+                cluster = strong
+                strong_seqs = {e["seq"] for e in strong}
+                total_speech = sum(e["speech_s"] for e in strong)
                 new_id = session["next_id"]
                 session["next_id"] += 1
                 session["speakers"][new_id] = {"prototypes": []}
@@ -683,6 +789,7 @@ def identify_speaker(
     purity: float = 1.0,
     near_field_ratio: float | None = None,
     pair_mass: float | None = None,
+    precomputed: tuple | None = None,
 ) -> dict:
     """Cheklanmagan sonli spiker uchun ONLAYN klasterlash — FAQAT ovoz
     asosida (til BUTUNLAY chiqarib tashlandi, `detected_lang` bu yerda
@@ -720,11 +827,10 @@ def identify_speaker(
           avval kimdir gapirgan bo'lsa — ovoz-o'xshashlik o'rniga ENG
           SO'NGGI gapirgan spiker (last_speaker) ishlatiladi ("suhbat
           davomiyligi" qisqa javoblar uchun ko'proq ishonchli signal).
-      3c. best < SPK_NEW (ANIQ boshqa odam, yoki hali spiker yo'q) VA
-          nutq >= SPK_MIN_ENROLL_SPEECH_S → YANGI spiker DARHOL ochiladi
-          (keyingi raqam, decision="new", uncertain=False) — "tasdiqlash"
-          bosqichi YO'Q (bu eski, xato mexanizm edi — qarang fayl boshidagi
-          izoh).
+      3c. best < SPK_NEW: birinchi profil uchun ishonchli nutq kamida
+          SPK_BOOTSTRAP_MIN_SPEECH_S; keyingi yangi profil uchun nutq
+          SPK_MIN_ENROLL_SPEECH_S va kuchli til/near-field dalili kerak.
+          Qolgan nomzodlar unknown buferida mustaqil tasdiq kutadi.
       3d. best < SPK_NEW VA nutq QISQA — Mentor demo'da topilgan 1/2-
           muammolar: bu holat ENDI mavjud spikerga HAM (eski "short"/
           "uncertain" fallback), prototipsiz yangi spikerga HAM (eski
@@ -734,24 +840,24 @@ def identify_speaker(
           ichida bufer orqali (mavjud spikerga mos kelib YOKI boshqa
           bufer a'zolari bilan yangi spikerga aylanib) darhol hal
           bo'lsa — decision="buffer_assigned", speaker=o'sha ID,
-          uncertain=False."""
+          uncertain=False.
+
+    `precomputed` — Plan B (speaker-conditioned language threshold):
+    dialog.py ba'zan shu AYNAN audio uchun embeddingni ALLAQACHON
+    (til qarori OLDIDAN, quick_speaker_match() orqali) hisoblagan bo'ladi
+    — shu holda `(embedding, trimmed, speech_s)` shu yerga uzatiladi va
+    pastdagi trim/embed bosqichi QAYTA hisoblashdan saqlanish uchun
+    o'tkazib yuboriladi (qarang embed_for_match())."""
     t0 = time.perf_counter()
-    trimmed = _trim_trailing_silence(wav, sample_rate)
+    if precomputed is not None:
+        embedding, trimmed, speech_s = precomputed
+    else:
+        embedding, trimmed, speech_s = embed_for_match(wav, sample_rate)
     trim_ms = (time.perf_counter() - t0) * 1000
     logger.info(f"[SPK][TRIM] wav_len={len(wav)} trimmed_len={len(trimmed)} took={trim_ms:.2f}ms")
 
     turn_s = len(wav) / sample_rate
-    speech_s = len(trimmed) / sample_rate
-    if trimmed.size > 0 and speech_s < MIN_TRIMMED_DURATION_S and speech_s < turn_s:
-        logger.info(f"[SPK][TRIM] trim too aggressive ({turn_s:.2f}s -> {speech_s:.2f}s), using original audio")
-        trimmed = wav
-        speech_s = turn_s
-
     trimmed_rms = float(np.sqrt(np.mean(trimmed.astype(np.float64) ** 2))) if trimmed.size else 0.0
-
-    embedding = None
-    if trimmed.size > 0 and speech_s >= MIN_TRIMMED_DURATION_S:
-        embedding = _embed(trimmed, sample_rate)
 
     try:
         with session["lock"]:
@@ -765,9 +871,12 @@ def identify_speaker(
             if sims:
                 best_id = max(sims, key=sims.get)
                 best_sim = sims[best_id]
+                _others = [s for sid, s in sims.items() if sid != best_id]
+                margin = (best_sim - max(_others)) if _others else None
             else:
                 best_id = None
                 best_sim = -1.0
+                margin = None
 
             decision: str
             result_speaker = None
@@ -781,18 +890,17 @@ def identify_speaker(
                 # Audio juda qisqa/jim — hech qanday ovoz dalili yo'q.
                 # Amalda deyarli bo'lmaydi (dialog.py'dagi MIN_TURN_SECONDS/
                 # STT MIN_SPEECH_S allaqachon bundan oldin filtrlaydi), lekin
-                # xavfsizlik uchun: oxirgi spikerga (bo'lsa), aks holda
-                # (sessiyaning eng boshi) 1-spikerni prototipsiz ochamiz.
+                # oxirgi spikerga (bo'lsa) noaniq tayinlaymiz; aks holda
+                # ovoz dalilisiz profil ochmasdan unknown qaytaramiz.
                 decision = "no_embedding"
                 uncertain = True
                 if session["last_speaker"] is not None:
                     result_speaker = session["last_speaker"]
                 else:
-                    result_speaker = session["next_id"]
-                    session["next_id"] += 1
-                    speakers[result_speaker] = {"prototypes": []}
+                    decision = "unknown"
+                    logger.info(f"[SPK] decision=unknown reason=weak_evidence seq={seq} (no_embedding)")
 
-            elif best_sim >= SPK_ACCEPT:
+            elif best_sim >= SPK_ACCEPT and (margin is None or margin >= SPK_MIN_MARGIN):
                 decision = "accept"
                 result_speaker = best_id
                 profile = speakers[best_id]
@@ -824,6 +932,43 @@ def identify_speaker(
                             f"speaker={best_id}"
                         )
 
+            elif best_sim >= SPK_ACCEPT:
+                # REAL TESTDA TOPILGAN MUAMMO: best_sim SPK_ACCEPT'dan
+                # yuqori, LEKIN ikkinchi eng yaqin spiker bilan farqi
+                # (margin) SPK_MIN_MARGIN'dan kam — qarang izoh yuqorida.
+                # Eng yaqinga TAYINLANADI (bubble ko'rsatish uchun BIROR
+                # ID kerak), lekin uncertain=True va PROFIL
+                # YANGILANMAYDI (noto'g'ri spikerga qo'shilib ifloslanish
+                # xavfi) — bu natija dialog.py'dagi Plan B (accept_known_
+                # speaker) relaxation uchun HAM ishlatilmaydi (chaqiruvchi
+                # quick_speaker_match orqali, MUSTAQIL, o'zining margin
+                # tekshiruvini bajaradi).
+                decision = "tie_uncertain"
+                result_speaker = best_id
+                uncertain = True
+                logger.info(
+                    f"[SPK] decision=tie_uncertain seq={seq} best={best_id}({best_sim:.3f}) "
+                    f"margin={margin:.3f} < {SPK_MIN_MARGIN}"
+                )
+
+            elif (
+                best_id is not None
+                and best_sim >= SPK_BOOTSTRAP_ACCEPT
+                and len(speakers[best_id]["prototypes"]) < SPK_BOOTSTRAP_PROTOTYPES
+                and (margin is None or margin >= SPK_MIN_MARGIN)
+                and speech_s >= SPK_MIN_ENROLL_SPEECH_S
+                and purity >= SPK_ENROLL_MIN_PURITY
+            ):
+                # Qarang SPK_BOOTSTRAP_ACCEPT izohi.
+                decision = "accept"
+                result_speaker = best_id
+                profile = speakers[best_id]
+                _add_prototype(profile, embedding, seq)
+                logger.info(
+                    f"[SPK][ENROLL] speaker={best_id} yangi prototip qo'shildi "
+                    f"(sim={best_sim:.3f} bootstrap_low) — jami prototiplar={len(profile['prototypes'])}"
+                )
+
             elif best_id is not None and SPK_NEW <= best_sim < SPK_ACCEPT:
                 # Mentor demo'da topilgan 1-muammo: eski "qisqa turn ->
                 # SO'ZSIZ last_speaker" qoidasi ENDI shu (haqiqatan "biroz
@@ -840,15 +985,28 @@ def identify_speaker(
                     result_speaker = best_id
                 uncertain = True
 
-            elif speech_s >= SPK_MIN_ENROLL_SPEECH_S and (
-                new_evidence_ok := _new_speaker_evidence(purity, near_field_ratio, pair_mass)[0]
+            elif (
+                best_id is not None
+                and best_id == session["last_speaker"]
+                and best_sim >= SPK_SHORT_CONTINUE_SIM
+                and (margin is None or margin >= SPK_MIN_MARGIN)
+                and speech_s < SPK_SHORT_CONTINUE_MAX_SPEECH_S
             ):
-                # best < SPK_NEW (yoki hali spiker yo'q) VA nutq yetarli
-                # uzun — YANGI spiker DARHOL ochiladi, tasdiqlash YO'Q.
-                # 7/4-band: FAQAT purity/near-field/pair_mass dalili
-                # yetarli bo'lsa (aks holda "iflos"/fon qismdan yangi
-                # profil "tashkil topishi" xavfli — pastdagi `else`ga
-                # tushib, "unknown" buferiga qo'yiladi).
+                # Qarang SPK_SHORT_CONTINUE_SIM izohi.
+                decision = "short_continue"
+                result_speaker = best_id
+                uncertain = True
+
+            elif _new_speaker_evidence(purity, near_field_ratio, pair_mass)[0] and (
+                (not speakers and speech_s >= SPK_BOOTSTRAP_MIN_SPEECH_S)
+                or (
+                    bool(speakers) and speech_s >= SPK_MIN_ENROLL_SPEECH_S
+                    and pair_mass is not None and pair_mass >= SPK_NEW_IMMEDIATE_PAIR_MASS
+                    and (near_field_ratio is None or near_field_ratio >= SPK_NEW_IMMEDIATE_NEAR_RATIO)
+                )
+            ):
+                # Strong single-turn evidence gets an ID immediately. Weaker
+                # candidates still need independent confirmation in the buffer.
                 new_id = session["next_id"]
                 session["next_id"] += 1
                 speakers[new_id] = {"prototypes": [{"seq": seq, "embedding": embedding}]}
@@ -874,9 +1032,12 @@ def identify_speaker(
                     # tushgan bo'lsa (ya'ni nutq yetarli uzun edi, lekin
                     # 4-band dalili yetarli emas) — aniq sababini log qilamiz.
                     _, weak_reasons = _new_speaker_evidence(purity, near_field_ratio, pair_mass)
-                    logger.info(
-                        f"[SPK] decision=unknown reason=weak_evidence seq={seq} ({'; '.join(weak_reasons)})"
-                    )
+                    if weak_reasons:
+                        logger.info(
+                            f"[SPK] decision=unknown reason=weak_evidence seq={seq} ({'; '.join(weak_reasons)})"
+                        )
+                    else:
+                        logger.info(f"[SPK] decision=unknown reason=pending_confirmation seq={seq} required_turns={SPK_NEW_CONFIRM_TURNS}")
                 session["unknown_buffer"].append(
                     {
                         "seq": seq,
@@ -899,6 +1060,11 @@ def identify_speaker(
                         decision = "buffer_assigned"
                         result_speaker = r_speaker
                         uncertain = False
+
+            # A new or improved profile can resolve earlier unknown turns,
+            # even when the current turn did not enter the unknown branch.
+            if decision != "unknown" and session["unknown_buffer"]:
+                buffer_reassigned.extend(_process_unknown_buffer(session))
 
             # Har bir enrollment/yangi-spikerdan KEYIN — ixtiyoriy ikki
             # spiker aslida bitta odam bo'lib qolmaganini tekshiramiz

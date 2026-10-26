@@ -120,6 +120,10 @@ const VAD_RMS_SMOOTHING_ALPHA = 0.5; // 0..1, kattaroq = tezroq (kamroq silliqla
 // uchun jim xonada (fon yo'q) xatti-harakat O'ZGARMAYDI: speechLevel past
 // bo'lsa, nearThreshold = dynamicThreshold bilan bir xil bo'lib qoladi.
 const NEAR_FIELD_RATIO = 0.35; // 0..1 — joriy spiker darajasining shuncha ulushidan past freym "fon" deb hisoblanadi
+const NEAR_START_RATIO = 0.35;
+const NEAR_START_MIN_TURNS = 2;
+const NEAR_START_HISTORY_SIZE = 20;
+
 const SPEECH_LEVEL_EMA_ALPHA = 0.1; // sekin EMA — bir martalik baland fon-impulsi speechLevel'ni darhol ko'tarib yubormasin
 
 // Mentor demo'da topilgan 0-muammo (ENG MUHIM): real testda deyarli HAR
@@ -164,7 +168,7 @@ const SPEECH_LEVEL_SEED_MS = 300;
 
 // --- D1: turn boshida "fon shovqinidan tasodifan ochilish"ning oldini
 // olish — nutq hech bo'lmasa shuncha millisoniya UZLUKSIZ chegaradan
-// yuqori bo'lgandagina turn RASMAN boshlanadi. PRE_ROLL_MS (300ms) bu
+// yuqori bo'lgandagina turn RASMAN boshlanadi. PRE_ROLL_MS (600ms) bu
 // qiymatdan katta bo'lishi SHART — shunda tasdiqlash davridagi audio ham
 // (preRoll orqali) yo'qolmaydi, alohida bufer kerak emas.
 //
@@ -226,30 +230,68 @@ const SILENCE_DURATION_MS = 1200;
 // yangi turnga qo'shiladi — VAD energiya-chegarasi kesib o'tilguncha
 // odatda allaqachon bir necha o'nlab millisoniya haqiqiy nutq o'tib
 // ketgan bo'ladi (masalan yumshoq undosh bilan boshlangan so'z).
-const PRE_ROLL_MS = 300;
-const PRE_ROLL_CHUNK_COUNT = Math.ceil(PRE_ROLL_MS / CHUNK_DURATION_MS);
+// REAL TESTDA TOPILGAN MUAMMO (gap boshi kesiladi): 300ms'ning ~200ms'i
+// MIN_SPEECH_START_MS tasdiqlash oynasiga ketib, Silero'ning kechikishi
+// (yumshoq boshlanishda 100-300ms) va far_field rad etishidan keyingi
+// qayta-tasdiqlash uchun deyarli joy qolmasdi — 600ms'ga oshirildi.
+const PRE_ROLL_MS = 600;
+// REAL TESTDA TOPILGAN MUAMMO (gap boshi baribir kesiladi): turn faqat
+// MIN_SPEECH_START_MS UZLUKSIZ tasdiqdan keyin ochiladi — far_field rad
+// etishi yoki Silero'ning bir freymlik "jimlik"i tasdiqni qayta boshlatadi,
+// shu orada nutq allaqachon PRE_ROLL_MS'dan uzoq davom etgan bo'ladi
+// (debug_audio'da ko'p bo'laklar birinchi 100ms'dayoq baland — so'z o'rtasidan
+// boshlangan). Endi turn shu "nutq portlashi"ning (VAD nutq dedi, orada
+// BURST_GAP_MS'dan uzun jimlik bo'lmagan) BOSHIGACHA qaytib oladi, eng ko'pi
+// PRE_ROLL_LOOKBACK_MAX_MS. Boshidagi jimlik backend'da til aniqlashga
+// endi xalaqit bermaydi (stt._trim_leading_quiet).
+// REAL TESTDA (1-odam tugatgan zahoti 2-odam boshlaganda): 2-odamning
+// (masalan uzoqroqdagi/pastroq ovoz) boshi far_field tekshiruvidan bir
+// necha marta o'tolmay, turn ~1.5-2s kechikib ochilgan va "I hope the number
+// of social" butunlay yo'qolgan — 2s'lik lookback va so'zlar orasidagi
+// 300ms'lik jimlikda "portlash"ning qayta boshlanishi buni qoplay olmagan.
+const PRE_ROLL_LOOKBACK_MAX_MS = 3000;
+const BURST_GAP_MS = 600;
+const PRE_ROLL_CHUNK_COUNT = Math.ceil(PRE_ROLL_LOOKBACK_MAX_MS / CHUNK_DURATION_MS);
+
+// REAL TESTDA TOPILGAN MUAMMO (gapning BIRINCHI so'zi yo'qoladi): soft-cut
+// pauza SOFT_CUT_SILENCE_MS'ga yetganda ishga tushadi, lekin VAD kechikishi
+// tufayli shu paytgacha odam keyingi so'zni ("I have...") boshlab bo'lgan
+// bo'ladi — bu bo'lak OLDINGI turn oxiriga tushib qolardi, Whisper esa
+// chala qolgan oxirgi so'zni tashlab yuborardi (debug_audio: "...not
+// sleeping [I have...]" | "have a lot of things"). Endi turn jimlik
+// BOSHLANGAN joydan (+ shuncha ms) kesiladi, qolgan audio keyingi turnning
+// pre-roll'iga o'tkaziladi.
+const CUT_TAIL_KEEP_MS = 150;
+// Gap TUGAGANDA (silence_timeout) ko'proq qoldiriladi — qisqa javoblar
+// ("Да.") backend'ning MIN_TURN_SECONDS (1.0s) chegarasidan pastga tushmasin.
+const SILENCE_TAIL_KEEP_MS = 500;
 
 // --- C4: majburiy kesishni yumshatish ---
 // Ilgari MAX_TURN_DURATION_MS=12000'da SO'ZSIZ, so'z o'rtasida ham kesib
-// yuborilardi. Endi: shu vaqtdan keyin birinchi QISQA (SOFT_CUT_PAUSE_MS)
+// yuborilardi. Endi: shu vaqtdan keyin birinchi QISQA (SOFT_CUT_SILENCE_MS)
 // pauza paytida kesiladi — odatda bu nafas olish/gap orasidagi tabiiy
-// to'xtash bo'ladi, SILENCE_DURATION_MS (1400ms, "turn tugadi" degani)
+// to'xtash bo'ladi, SILENCE_DURATION_MS (1200ms, "turn tugadi" degani)
 // kabi uzoq emas — bu ikkisi ATAYLAB farq qiladi, lekin ZID EMAS: ular
-// vaqt bo'yicha bir-biridan AJRATILGAN ikki rejim. SOFT_CUT_PAUSE_MS
-// FAQAT turnElapsed >= SOFT_CUT_AFTER_MS (15s) bo'lgandan KEYIN
-// tekshiriladi (handleWorkletChunk'dagi `else if`ga qarang) — shu
-// vaqtgacha YAGONA qaror SILENCE_DURATION_MS asosida beriladi, ikkisi
-// HECH QACHON bir vaqtda ishlamaydi. Agar hech qanday pauza (hatto qisqa ham) umuman
+// vaqt bo'yicha bir-biridan AJRATILGAN ikki rejim. SOFT_CUT_SILENCE_MS
+// FAQAT turnElapsed >= CHUNK_SOFT_CUT_MIN_S bo'lgandan KEYIN tekshiriladi
+// (handleWorkletChunk'dagi `else if`ga qarang) — shu vaqtgacha YAGONA
+// qaror SILENCE_DURATION_MS asosida beriladi, ikkisi HECH QACHON bir
+// vaqtda ishlamaydi. Agar hech qanday pauza (hatto qisqa ham) umuman
 // bo'lmasa, HARD_CUT_MAX_MS'da baribir majburan kesiladi — cheksiz
 // cho'zilib ketmasligi uchun oxirgi chora.
-// Mentor demo'da topilgan 2-muammo tuzatishi: uzluksiz suhbatda natijalar
-// KAM tez-tez chiqardi (avval 15s/18s) — endi ANCHA qisqartirilgan (8s/10s),
-// natijalar tez-tez chiqishi uchun. Bitta uzun gap shu sabab bilan bir
-// nechta bo'lakka bo'linib ketishi mumkin, lekin backend'dagi RETROAKTIV
-// birlashtirish (dialog.py, RETRO_MERGE_WINDOW_S) BIR XIL spiker/til
-// bo'lsa buni avtomatik qayta qo'shib, qayta tarjima qiladi.
-const SOFT_CUT_AFTER_MS = 8000;
-const SOFT_CUT_PAUSE_MS = 300;
+// REAL TESTDA TOPILGAN MUAMMO (ketma-ket, pauzasiz ikki spiker — D-band):
+// 8000ms'da boshlanadigan soft-cut ko'pincha HECH QACHON ishga tushmasdi,
+// chunki ikkinchi odam birinchisidan keyin PAUZASIZ davom etganda, 8-10s
+// oraliqda biror QISQA (300ms+) pauza ham umuman bo'lmasdi — natijada
+// HARD_CUT_MAX_MS (10s)gacha ikkala spikerning nutqi BITTA XOM bo'lakka
+// yig'ilib qolardi (backend'dagi segmenter.py keyin buni ovoz bo'yicha
+// ajratishga harakat qiladi, lekin til-filtri butun bo'lak darajasida
+// ishlagani uchun HALI HAM muammoli — qarang dialog.py Plan A/B). Soft-cut
+// endi ANCHA ERTAROQ (3s) boshlanadi va QISQAROQ pauzani (350ms) kutadi —
+// natijada ko'pchilik navbat-almashinuvlar hali HAM tabiiy pauzaga ega
+// bo'lgan joyda, 10s chegaraga yetmasdan kesiladi.
+const CHUNK_SOFT_CUT_MIN_S = 3.0;
+const SOFT_CUT_SILENCE_MS = 350;
 const HARD_CUT_MAX_MS = 10000;
 
 const AUDIO_LEVEL_RMS_MAX = 0.15; // shu RMS qiymatida audioLevel = 1 ga yetadi
@@ -288,6 +330,12 @@ const SKIP_REASON_MESSAGES = {
   // qismlardan biri begona tilda bo'lsa — butun bo'lak EMAS, FAQAT shu
   // qism tashlab yuboriladi (qarang dialog.py'dagi `is_multi` izohi).
   foreign_subsegment: "Shu qismi boshqa tilda edi — tashlab yuborildi.",
+  // Ketma-ket, pauzasiz ikki spiker (E-band): spiker ANIQ bo'lmagan VA til
+  // ishonchi ham past bo'lgan bo'lak — "Aniqlanmoqda…" bubble o'rniga
+  // shunchaki tashlab yuboriladi (qarang dialog.py'dagi
+  // WEAK_SPEAKER_LANG_DROP_PAIR_MASS izohi).
+  weak_lang_unknown_speaker: "Ovoz/til aniq bo'lmadi — tashlab yuborildi.",
+  far_field_turn: "Fondagi ovoz — tashlab yuborildi.",
 };
 const SKIP_REASON_DEFAULT = "Ovoz aniq eshitilmadi — yana gapirib ko'ring.";
 
@@ -405,6 +453,8 @@ export function useDialogSession() {
   // paytda 0 (neytral — nearThreshold shunda dynamicThreshold bilan
   // bir xil bo'lib qoladi).
   const speechLevelRef = useRef(0);
+  const acceptedLevelsRef = useRef([]);
+  const sentLevelsRef = useRef(new Map());
   // Mentor demo'da topilgan 0-muammo: speechLevel turn boshida bitta
   // namuna o'rniga SPEECH_LEVEL_SEED_MS davomidagi O'RTACHA bilan
   // boshlanishi uchun — qarang SPEECH_LEVEL_SEED_MS izohi yuqorida.
@@ -414,7 +464,12 @@ export function useDialogSession() {
   // boshlanganini belgilaydi — MIN_SPEECH_START_MS to'lmaguncha turn
   // ochilmaydi (qarang handleWorkletChunk). `null` = hozir nomzod yo'q.
   const pendingSpeechStartAtRef = useRef(null);
+  // {chunk, t} — t: chunk kelgan vaqt (Date.now()).
   const preRollChunksRef = useRef([]);
+  // Joriy "nutq portlashi" boshlangan va oxirgi marta VAD nutq degan vaqt
+  // (qarang PRE_ROLL_LOOKBACK_MAX_MS izohi).
+  const speechBurstStartAtRef = useRef(null);
+  const lastSpeakingAtRef = useRef(null);
 
   // --- Mentor demo'da topilgan 1-muammo: Silero VAD holati ---
   // `sileroModelRef` — yuklangan model instansiyasi (yoki hali/hech qachon
@@ -516,6 +571,8 @@ export function useDialogSession() {
     speechLevelSeedCountRef.current = 0;
     pendingSpeechStartAtRef.current = null;
     preRollChunksRef.current = [];
+    speechBurstStartAtRef.current = null;
+    lastSpeakingAtRef.current = null;
     turnChunksRef.current = null;
     turnStartedAtRef.current = null;
     silenceStartedAtRef.current = null;
@@ -581,6 +638,7 @@ export function useDialogSession() {
       try {
         const wireReason = _categorizeFinalizeReason(reason);
         const clientSeq = nextClientSeqRef.current++;
+        sentLevelsRef.current.set(clientSeq, speechLevelRef.current);
         // Backend (dialog.py'dagi handle_client_message, action="turn_meta")
         // buni AYNAN keyingi binary chunk uchun amal qiladi deb kutadi —
         // shuning uchun matnli xabar har doim audio'dan OLDIN yuboriladi
@@ -628,15 +686,29 @@ export function useDialogSession() {
 
   const finalizeTurn = useCallback(
     (reason) => {
-      const chunks = turnChunksRef.current;
+      const entries = turnChunksRef.current;
       const turnStartedAt = turnStartedAtRef.current;
+      const silenceStartedAt = silenceStartedAtRef.current;
       turnChunksRef.current = null;
       turnStartedAtRef.current = null;
       silenceStartedAtRef.current = null;
-      speechLevelRef.current = 0;
-      if (!chunks || chunks.length === 0) return;
+      // Qarang CUT_TAIL_KEEP_MS izohi — jimlikdan keyingi audio (ehtimol
+      // keyingi so'z boshi) keyingi turnning pre-roll'iga o'tadi. Pre-roll'ning
+      // QOLGANI tozalanadi — aks holda keyingi bo'lak shu bo'lakning oxirini
+      // takrorlab boshlanardi (so'zlar ikki marta chiqardi).
+      let kept = entries || [];
+      let carry = [];
+      if ((reason === "soft_cut_pause" || reason === "silence_timeout") && silenceStartedAt !== null) {
+        const splitAt = silenceStartedAt + (reason === "soft_cut_pause" ? CUT_TAIL_KEEP_MS : SILENCE_TAIL_KEEP_MS);
+        kept = kept.filter((e) => e.t <= splitAt);
+        carry = entries.filter((e) => e.t > splitAt);
+      }
+      preRollChunksRef.current = carry.slice(-PRE_ROLL_CHUNK_COUNT);
+      speechBurstStartAtRef.current = null;
+      lastSpeakingAtRef.current = null;
+      if (kept.length === 0) return;
 
-      const merged = _mergeFloat32Chunks(chunks);
+      const merged = _mergeFloat32Chunks(kept.map((e) => e.chunk));
       const durationMs = (merged.length / TARGET_SAMPLE_RATE) * 1000;
       console.log(
         `[VAD] speech ENDED at=${new Date().toISOString()} reason=${reason} ` +
@@ -773,6 +845,18 @@ export function useDialogSession() {
         ? sileroSpeakingRef.current
         : smoothedRmsRef.current >= dynamicThreshold;
       const hasActiveTurn = turnChunksRef.current !== null;
+      let startAllowed = speaking;
+      const levels = acceptedLevelsRef.current;
+      if (!hasActiveTurn && speaking && levels.length >= NEAR_START_MIN_TURNS) {
+        const sorted = [...levels].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+        // Silliqlangan RMS — bitta past bo'g'in/undosh freymi turn boshlanishini qayta-qayta bekor qilmasin.
+        startAllowed = smoothedRmsRef.current >= NEAR_START_RATIO * median;
+        if (!startAllowed) {
+          console.log(`[VAD] start rejected reason=far_field rms=${rms.toFixed(5)} median=${median.toFixed(5)}`);
+        }
+      }
 
       // --- D1: nisbiy (near-field) VAD — qarang NEAR_FIELD_RATIO izohi
       // yuqorida. FAQAT faol turn davomida qo'llaniladi: turn hali
@@ -868,13 +952,22 @@ export function useDialogSession() {
 
       // --- C3: pre-roll — faol turn bo'lmagandayam doim so'nggi
       // PRE_ROLL_CHUNK_COUNT blokni saqlab turamiz ---
-      preRollChunksRef.current.push(chunk);
+      preRollChunksRef.current.push({ chunk, t: now });
       if (preRollChunksRef.current.length > PRE_ROLL_CHUNK_COUNT) {
         preRollChunksRef.current.shift();
       }
-
       if (!hasActiveTurn) {
         if (speaking) {
+          if (speechBurstStartAtRef.current === null) speechBurstStartAtRef.current = now;
+          lastSpeakingAtRef.current = now;
+        } else if (lastSpeakingAtRef.current !== null && now - lastSpeakingAtRef.current > BURST_GAP_MS) {
+          speechBurstStartAtRef.current = null;
+          lastSpeakingAtRef.current = null;
+        }
+      }
+
+      if (!hasActiveTurn) {
+        if (startAllowed) {
           // D1: turn FAQAT nutq kamida MIN_SPEECH_START_MS UZLUKSIZ
           // chegaradan yuqori bo'lgandan KEYIN rasman boshlanadi — bitta
           // qisqa fon-impulsi (masalan uzoqdagi odamning bir so'zi) shu
@@ -892,7 +985,14 @@ export function useDialogSession() {
             // JUMLADAN tasdiqlash davridagi audio — PRE_ROLL_MS >
             // MIN_SPEECH_START_MS bo'lgani uchun allaqachon preRoll'da) ham
             // qo'shiladi.
-            turnChunksRef.current = [...preRollChunksRef.current];
+            const speechStartAt = Math.min(
+              pendingSpeechStartAtRef.current,
+              speechBurstStartAtRef.current ?? pendingSpeechStartAtRef.current
+            );
+            const takeFrom = speechStartAt - PRE_ROLL_MS;
+            turnChunksRef.current = preRollChunksRef.current.filter((e) => e.t > takeFrom);
+            speechBurstStartAtRef.current = null;
+            lastSpeakingAtRef.current = null;
             turnStartedAtRef.current = pendingSpeechStartAtRef.current;
             silenceStartedAtRef.current = null;
             // Mentor demo'da topilgan 0-muammo: BITTA namuna o'rniga
@@ -923,7 +1023,7 @@ export function useDialogSession() {
       // Faol turn davom etadi — gapirilmayotgan bo'lsa ham audio
       // qo'shib boriladi (turn SILENCE_DURATION_MS to'liq o'tgunga qadar
       // yopilmaydi, shuning uchun qisqa pauzalar gap ICHIDA qoladi).
-      turnChunksRef.current.push(chunk);
+      turnChunksRef.current.push({ chunk, t: now });
 
       // D1: silence-taymer endi BAZAVIY `speaking` emas, NISBIY
       // `nearFieldSpeaking`ga qarab yuritiladi — fondagi odam(lar)ning
@@ -940,9 +1040,10 @@ export function useDialogSession() {
 
       if (silenceElapsedMs >= SILENCE_DURATION_MS) {
         finalizeTurn("silence_timeout");
-      } else if (turnElapsedMs >= SOFT_CUT_AFTER_MS && silenceElapsedMs >= SOFT_CUT_PAUSE_MS) {
-        // C4: qattiq belgilangan vaqtda emas, SOFT_CUT_AFTER_MS'dan keyingi
-        // BIRINCHI qisqa pauzada kesiladi — odatda bu so'z/gap chegarasi.
+      } else if (turnElapsedMs >= CHUNK_SOFT_CUT_MIN_S * 1000 && silenceElapsedMs >= SOFT_CUT_SILENCE_MS) {
+        // C4/D: qattiq belgilangan vaqtda emas, CHUNK_SOFT_CUT_MIN_S'dan
+        // keyingi BIRINCHI qisqa pauzada kesiladi — odatda bu so'z/gap
+        // chegarasi (ko'pincha spiker almashinuvi ham).
         finalizeTurn("soft_cut_pause");
       } else if (turnElapsedMs >= HARD_CUT_MAX_MS) {
         // C4: hech qanday pauza (hatto qisqa ham) topilmadi — oxirgi
@@ -1108,6 +1209,8 @@ export function useDialogSession() {
       // TTS tovushi pre-roll'ga "ko'rinmas" tarzda kirib qolmasligi uchun
       // tozalanadi — pauza tugagach, pre-roll nolldan to'planadi.
       preRollChunksRef.current = [];
+      speechBurstStartAtRef.current = null;
+      lastSpeakingAtRef.current = null;
     },
     [finalizeTurn]
   );
@@ -1162,6 +1265,13 @@ export function useDialogSession() {
           break;
 
         case "turn":
+          for (const clientSeq of msg.client_seqs || []) {
+            const level = sentLevelsRef.current.get(clientSeq);
+            if (msg.speaker != null && level > 0) {
+              acceptedLevelsRef.current = [...acceptedLevelsRef.current, level].slice(-NEAR_START_HISTORY_SIZE);
+              sentLevelsRef.current.delete(clientSeq);
+            }
+          }
           setNotice(null);
           setIsProcessing(false);
           if (noticeTimeoutRef.current) {
@@ -1278,6 +1388,7 @@ export function useDialogSession() {
           break;
 
         case "turn_skipped": {
+          for (const clientSeq of msg.client_seqs || []) sentLevelsRef.current.delete(clientSeq);
           console.warn("[useDialogSession] turn skipped", msg.reason);
           setIsProcessing(false);
           // Mentor demo'da topilgan 4-muammo: rad etilgan bo'lak(lar)ning
@@ -1321,6 +1432,8 @@ export function useDialogSession() {
     setSpeakerColorOrder({});
     nextSpeakerColorOrderRef.current = 0;
     nextClientSeqRef.current = 1;
+    acceptedLevelsRef.current = [];
+    sentLevelsRef.current.clear();
     stoppedRef.current = false;
 
     try {

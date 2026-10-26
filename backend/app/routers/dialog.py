@@ -21,7 +21,10 @@ from app.models.speaker_diart import (
     remove_turn_prototype,
     merge_speakers_manual,
     has_known_speakers,
+    embed_for_match,
+    quick_speaker_match,
     save_turn_label,
+    _save_debug_audio_async,
 )
 from app.models.translator import translate_text
 from app.models.segmenter import segment_turn
@@ -83,6 +86,9 @@ MERGE_CONTINUATION_MAX_DURATION_S = 3.0
 # yo'q, navbat DARHOL qayta ishlanadi, faqat natija KEYINROQ (agar kerak
 # bo'lsa) birlashtiriladi.
 RETRO_MERGE_WINDOW_S = 2.5
+
+# Qarang process_turn ichidagi _merge_same_known_speaker.
+SEG_SAME_SPEAKER_MIN_SIM = float(os.environ.get("SEG_SAME_SPEAKER_MIN_SIM", "0.35"))
 
 # Mentor demo'da topilgan 3-muammo: real testda bitta bubble'ga 15+ bo'lak
 # (456 belgi) qo'shilib ketgan edi — retroaktiv birlashtirish hech qanday
@@ -165,6 +171,12 @@ async def websocket_dialog(websocket: WebSocket):
         # process_turn() yangi navbatni shu bilan solishtirib, birlashtirish
         # kerakligini aniqlaydi (qarang RETRO_MERGE_WINDOW_S izohi yuqorida).
         "last_turn_by_speaker": {},
+        # Gap oxiri yo'qolmasligi uchun (qarang stt.CONTINUATION_MIN_PAIR_MASS):
+        # oxirgi qayta ishlangan bo'lak gap o'rtasida kesilganmi (reason !=
+        # "silence"), qachon kelgan va qaysi tilda tanilgan (rad etilgan
+        # bo'lsa None). process_turn() keyingi bo'lak shu gapning davomimi
+        # yo'qligini shu orqali aniqlaydi.
+        "last_chunk": None,
     }
     # DIALOG_PLAN.md 1-bosqich (D1): navbatlar endi shu YAGONA FIFO navbat
     # orqali, turn_worker() tomonidan KETMA-KET qayta ishlanadi — qarang
@@ -282,7 +294,7 @@ async def websocket_dialog(websocket: WebSocket):
 
     async def _process_subsegment(
         wav, seq, client_seqs: list, is_multi: bool, purity: float,
-        sub_index: int = 0, sub_total: int = 1,
+        sub_index: int = 0, sub_total: int = 1, continuation_lang: str | None = None,
     ):
         """Bitta QISM (sub-segment, qarang segmenter.segment_turn) uchun
         to'liq quvur — STT, spiker aniqlash, retro-merge, tarjima. Bitta
@@ -335,7 +347,7 @@ async def websocket_dialog(websocket: WebSocket):
         try:
             try:
                 text, detected_lang, lang_prob, unsupported_language, stt_diag = await loop.run_in_executor(
-                    None, transcribe_audio, temp_filename, None, SESSION_LANGS
+                    None, transcribe_audio, temp_filename, None, SESSION_LANGS, continuation_lang
                 )
             except Exception as e:
                 logger.error(f"[/ws/dialog] turn processing failed: {e!r}")
@@ -360,6 +372,9 @@ async def websocket_dialog(websocket: WebSocket):
             # nomi ham alohida — frontend buni "butun gap tashlandi"
             # emas, "bir qismi tashlandi" sifatida talqin qila oladi.
             reason = "foreign_subsegment" if is_multi else "unsupported_language"
+            # Diagnostika: til bo'yicha rad etilgan audio ham tinglash uchun saqlanadi.
+            rms = float(np.sqrt(np.mean(wav.astype(np.float64) ** 2)))
+            _save_debug_audio_async(wav, SAMPLE_RATE, duration_s, rms, f"rejected_lang_seq{seq}")
             logger.info(f"[/ws/dialog] turn skipped (reason={reason}: session_langs={SESSION_LANGS})")
             await send_status("turn_skipped", reason=reason, client_seqs=client_seqs)
             return
@@ -369,6 +384,8 @@ async def websocket_dialog(websocket: WebSocket):
             logger.info("[/ws/dialog] turn skipped (empty transcription)")
             await send_status("turn_skipped", reason="empty_transcription", client_seqs=client_seqs)
             return
+        if state.get("last_chunk") is not None:
+            state["last_chunk"]["lang"] = detected_lang
 
         # SPIKER ANIQLASH — endi FAQAT ovoz asosida, cheklanmagan sonli
         # onlayn klasterlash (qarang speaker_diart.identify_speaker).
@@ -584,7 +601,39 @@ async def websocket_dialog(websocket: WebSocket):
             await _resend_turn(out_seq, state["turn_history"][out_seq])
 
 
-    async def process_turn(wav, seq: int, client_seqs: list | None = None):
+    def _merge_same_known_speaker(subsegments: list[dict]) -> list[dict]:
+        """REAL TESTDA: segmenter 3.2s'lik bitta odam gapini 1.6s+1.6s'ga
+        bo'lib yuborgan (so'z o'rtasidan: "conver|sation"), ikkala qism ham
+        o'sha bitta tanilgan spikerga eng yaqin bo'lgan (0.39 va 0.46).
+        Qo'shni qismlar AYNI tanilgan spikerga SEG_SAME_SPEAKER_MIN_SIM'dan
+        yuqori mos kelsa — qayta birlashtiriladi."""
+        matches = []
+        for sub in subsegments:
+            emb, _, _ = embed_for_match(sub["wav"], SAMPLE_RATE)
+            best_id, best_sim, _ = quick_speaker_match(state["speaker_session"], emb)
+            matches.append(best_id if best_sim >= SEG_SAME_SPEAKER_MIN_SIM else None)
+        merged = [dict(subsegments[0])]
+        merged_matches = [matches[0]]
+        for sub, match in zip(subsegments[1:], matches[1:]):
+            if match is not None and match == merged_matches[-1]:
+                last = merged[-1]
+                last["wav"] = np.concatenate([last["wav"], sub["wav"]])
+                last["end"] = sub["end"]
+                last["purity"] = min(last["purity"], sub["purity"])
+            else:
+                merged.append(dict(sub))
+                merged_matches.append(match)
+        if len(merged) < len(subsegments):
+            logger.info(
+                f"[/ws/dialog] {len(subsegments)} qism bir xil tanilgan spikerga mos — "
+                f"{len(merged)} qismga qayta birlashtirildi (matches={matches})"
+            )
+        return merged
+
+    async def process_turn(
+        wav, seq: int, client_seqs: list | None = None,
+        reason: str | None = None, arrived_at: float | None = None,
+    ):
         """Mentor demo'da topilgan 5/6-muammolar: bitta turn'ning XOM
         audiosini (kerak bo'lsa) segmenter.segment_turn() orqali bir
         nechta MUSTAQIL qismga ajratib, HAR BIRINI alohida
@@ -612,9 +661,24 @@ async def websocket_dialog(websocket: WebSocket):
         < seq+1 <= keyingi_seq` (amalda bir turn hech qachon 999 qismga
         bo'linmaydi), demak tartib HAR DOIM to'g'ri saqlanadi."""
         client_seqs = client_seqs or []
+        arrived_at = time.monotonic() if arrived_at is None else arrived_at
+
+        # Oldingi bo'lak gap o'rtasida kesilgan va shu bo'lak undan keyin
+        # RETRO_MERGE_WINDOW_S ichida boshlangan bo'lsa — bu o'sha gapning
+        # davomi: STT'ga oldingi bo'lak tili uzatiladi.
+        continuation_lang = None
+        last_chunk = state.get("last_chunk")
+        if last_chunk is not None and last_chunk["cut"] and last_chunk["lang"] is not None:
+            gap_s = arrived_at - wav.size / SAMPLE_RATE - last_chunk["arrived_at"]
+            if gap_s <= RETRO_MERGE_WINDOW_S:
+                continuation_lang = last_chunk["lang"]
+        state["last_chunk"] = {"cut": reason != "silence", "lang": None, "arrived_at": arrived_at}
+
         t_seg0 = time.perf_counter()
         subsegments = await loop.run_in_executor(None, segment_turn, wav, SAMPLE_RATE, seq)
         seg_elapsed = time.perf_counter() - t_seg0
+        if len(subsegments) > 1 and has_known_speakers(state["speaker_session"]):
+            subsegments = await loop.run_in_executor(None, _merge_same_known_speaker, subsegments)
         is_multi = len(subsegments) > 1
         if is_multi:
             logger.info(f"[/ws/dialog] seq={seq} {len(subsegments)} qismga bo'lindi (seg took={seg_elapsed * 1000:.1f}ms)")
@@ -625,6 +689,7 @@ async def websocket_dialog(websocket: WebSocket):
             await _process_subsegment(
                 sub["wav"], sub_seq, sub_client_seqs, is_multi, sub["purity"],
                 sub_index=i, sub_total=len(subsegments),
+                continuation_lang=continuation_lang if i == 0 else None,
             )
 
 
@@ -646,7 +711,7 @@ async def websocket_dialog(websocket: WebSocket):
             try:
                 if item is None:
                     break
-                wav, seq, client_seqs = item
+                wav, seq, client_seqs, reason, arrived_at = item
                 # DIALOG_PLAN.md 4-bosqich: frontend shu statusni ko'rib
                 # "Qayta ishlanmoqda…" deb ko'rsatadi (qarang
                 # useDialogSession.js) — STT/tarjima bir necha soniya
@@ -656,7 +721,7 @@ async def websocket_dialog(websocket: WebSocket):
                 # "turn_skipped" bilan) shu holatni frontend tarafda
                 # avtomatik tugatadi.
                 await send_status("processing")
-                await process_turn(wav, seq, client_seqs)
+                await process_turn(wav, seq, client_seqs, reason, arrived_at)
             except Exception as e:
                 logger.error(f"[/ws/dialog] turn_worker: process_turn raised unexpectedly: {e!r}")
             finally:
@@ -680,7 +745,10 @@ async def websocket_dialog(websocket: WebSocket):
             f"[MERGE] seq={pending['seq']} reason={pending.get('reason')} "
             f"waited={waited_s:.2f}s merged={pending.get('merge_count', 0) > 0}"
         )
-        turn_queue.put_nowait((pending["wav"], pending["seq"], pending.get("client_seqs", [])))
+        turn_queue.put_nowait((
+            pending["wav"], pending["seq"], pending.get("client_seqs", []),
+            pending.get("reason"), time.monotonic(),
+        ))
 
     async def dispatch_after_delay(seq):
         try:
