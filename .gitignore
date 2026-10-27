@@ -100,3 +100,4 @@ desktop.ini
 *.swp
 *.swo
 *~
+backend/debug_audio/

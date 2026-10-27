@@ -1,4 +1,3 @@
-import collections
 import datetime
 import glob
 import json
@@ -10,16 +9,12 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from app import diart_compat
-from diart import models as m
 from app.config import SAVE_DEBUG_AUDIO, DEBUG_AUDIO_DIR
+from app.gpu_lock import GPU_LOCK
 import logging
 
 logger = logging.getLogger(__name__)
 
-
-
-_embedding_model = None
 
 RMS_SILENCE_THRESHOLD = 0.003  # stt.py bilan bir xil qiymat
 _TRIM_FRAME_MS = 50
@@ -27,79 +22,63 @@ _TRIM_FRAME_MS = 50
 # _trim_trailing_silence() 50ms'lik LAHZAVIY kadr RMS'ini tekshiradi
 MIN_TRIMMED_DURATION_S = 0.5
 
-# ---------------------------------------------------------------------------
-# DIALOG_PLAN.md 2-bosqich: spiker aniqlash endi OVOZ + TIL signallarining
-# BIRLASHGAN balli orqali hal qilinadi — eski alohida bosqichlar (avval
-# FAQAT ovoz orqali klasterlash/bog'lash, til esa FAQAT klaster birinchi
-# marta tashkil bo'lganda tekshirilardi, "ovoz orqali, til tekshirilmadi"
-# yo'li) BUTUNLAY OLIB TASHLANDI. Sabab — real testda topilgan xato:
-# ikkinchi spikerning ovozi birinchisiga tasodifan o'xshab qolgani (sim
-# 0.45-0.66, eski SPEAKER_MATCH_THRESHOLD=0.4'dan yuqori) uchun uning
-# nutqi YANGI klaster emas, birinchisiga qo'shilib ketgan edi — til farqli
-# bo'lsa ham, mantiq buni TEKSHIRMAGANI uchun bu signal yo'qolgan edi.
-#
-# Yangi qaror: har bir turn uchun
-#     score_X = w_lang * p_lang(X) + w_voice * voice_sim_norm(X)   (X = A, B)
-# hisoblanadi va kattarog'i g'olib e'lon qilinadi — FAQAT agar ikkisi
-# orasidagi farq (margin) AMBIGUOUS_MARGIN'dan katta bo'lsa (pastga
-# qarang). `identify_speaker()`ga qarang.
-# ---------------------------------------------------------------------------
+SPK_EMBEDDING_MODEL = os.environ.get("SPK_EMBEDDING_MODEL", "pyannote/wespeaker-voxceleb-resnet34-LM")
+SPK_EMBEDDING_FALLBACK_MODEL = os.environ.get("SPK_EMBEDDING_FALLBACK_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
+HF_TOKEN = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("HUGGINGFACE_TOKEN")
+    or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+)
 
-# Bazaviy (teng) vaznlar — turn "til aniq hal qiluvchi" rejimida bo'lmaganda
-# ishlatiladi (qarang LANG_DECISIVE_* va _effective_weights()). Boshlang'ich
-# qiymat sifatida teng tanlangan — real eval_dialog.py natijalariga qarab
-# keyinroq sozlanishi mumkin, shuning uchun konstanta sifatida yuqorida.
-W_LANG = 0.5
-W_VOICE = 0.5
+SPK_DEVICE = os.environ.get("SPK_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
 
-# Til "hal qiluvchi" (deyarli yakuniy qarorni beradigan) rejimga o'tadigan
-# shartlar: turn yetarlicha uzun (qisqa turnlarda til-aniqlash ishonchsiz
-# bo'ladi) VA til ishonchi "noaniq oraliq"dan (pastga qarang) tashqarida —
-# ya'ni STT ANIQ bir tilni ishonch bilan ko'rsatgan. Shu holatda ovoz
-# deyarli e'tiborga olinmaydi (LANG_DECISIVE_W_VOICE juda kichik) — chunki
-# STT'ning aniq natijasi ovoz-o'xshashlikdan ANCHA ishonchli signal.
-LANG_DECISIVE_MIN_DURATION_S = 1.5
-LANG_AMBIGUOUS_PROB_LOW = 0.4
-LANG_AMBIGUOUS_PROB_HIGH = 0.6
-LANG_DECISIVE_W_LANG = 0.9
-LANG_DECISIVE_W_VOICE = 0.1
+_embedding_backend: str | None = None  # "pyannote" | "speechbrain"
+_embedding_model = None  # pyannote Inference OBYEKTI yoki speechbrain EncoderClassifier
+_embedding_model_name: str | None = None
+_embedding_load_lock = threading.Lock()
 
-# Ovoz profili (markaz) FAQAT shu til-ishonchidan yuqori turnlardan
-# tashkil topadi/yangilanadi — past/noaniq ishonchli turnlar o'ziga
-# spiker tayinlanishi mumkin (agar margin yetarli bo'lsa), lekin ULARNING
-# embeddingi markazga HECH QACHON qo'shilmaydi. Bu A3/A4'ni (sifatsiz
-# "founding sample" markazni buzishi) ildizidan hal qiladi — eski
-# MIN_RMS_FOR_NEW_CLUSTER/MIN_LANG_PROB_FOR_NEW_CLUSTER/RMS-asosidagi
-# tekshiruvlar endi keraksiz, chunki til-ishonch ulardan ANCHA to'g'ridan
-# to'g'ri va ishonchli signal.
-CENTROID_UPDATE_MIN_LANG_PROB = 0.85
 
-# Ikki ball orasidagi farq shundan kichik bo'lsa, natija "ambiguous" deb
-# belgilanadi (A2) — noto'g'ri, lekin "ishonchli ko'ringan" qarordan ko'ra
-# ochiq tanlashni so'rash xavfsizroq.
-AMBIGUOUS_MARGIN = 0.15
+SPK_ACCEPT = float(os.environ.get("SPK_ACCEPT", "0.55"))
 
-# REAL TESTDA TOPILGAN MUAMMO (3-band): w_lang=0.90 bo'lgani uchun til
-# signali amalda deyarli HAR DOIM g'olib bo'ladi — HATTO ovoz butunlay
-# QARAMA-QARSHI narsani ko'rsatsa ham (masalan ovoz aniq A, til esa B
-# tomonidan). Bunday holatda g'olibni (til bo'yicha) o'zgartirmaymiz —
-# lekin uning centroidiga BOSHQA odamning ovozini "yuklab" qo'yish ham
-# xavfli (keyingi turnlarda ovoz-aniqlashni butunlay buzadi). Shu sababli:
-# ikkala profil ham mavjud bo'lganda, agar OVOZ g'olibi (voice_winner) TIL
-# g'olibidan (lang_winner) farq qilsa VA ovoz ballari orasidagi farq
-# yetarlicha katta (ishonchli) bo'lsa — demak ovoz signali "jim" emas, u
-# HAQIQATDA boshqa odamni ko'rsatmoqda — markaz YANGILANMAYDI (hech kim
-# uchun) va turn "conflict" deb belgilanadi (dialog.py buni frontendga
-# uzatadi, qarang DialogBubble.jsx'dagi "⚠ spiker noaniq" belgisi).
-VOICE_CONFLICT_MARGIN = 0.10
+SPK_MIN_MARGIN = float(os.environ.get("SPK_MIN_MARGIN", "0.08"))
+SPK_NEW = float(os.environ.get("SPK_NEW", "0.40"))
+SPK_MIN_ENROLL_SPEECH_S = float(os.environ.get("SPK_MIN_ENROLL_SPEECH_S", "2.0"))
+# Bootstrap can use a confident short answer without relaxing later enrollment.
+SPK_BOOTSTRAP_MIN_SPEECH_S = float(os.environ.get("SPK_BOOTSTRAP_MIN_SPEECH_S", "1.5"))
+SPK_NEW_IMMEDIATE_PAIR_MASS = float(os.environ.get("SPK_NEW_IMMEDIATE_PAIR_MASS", "0.95"))
+SPK_NEW_IMMEDIATE_NEAR_RATIO = float(os.environ.get("SPK_NEW_IMMEDIATE_NEAR_RATIO", "0.75"))
+SPK_MAX_PROTOTYPES = int(os.environ.get("SPK_MAX_PROTOTYPES", "10"))
+SPK_SHORT_TURN_S = float(os.environ.get("SPK_SHORT_TURN_S", "1.5"))
 
-# Har bir A/B ovoz profili uchun so'nggi shuncha SIFATLI (CENTROID_UPDATE_
-# MIN_LANG_PROB'dan yuqori ishonchli) embedding saqlanadi; markaz —
-# shularning (+ doim saqlanadigan "founding" namunaning, pastga qarang)
-# o'rtachasi. Eski qiymat (5) juda kichik edi — bitta "burchakka og'ib
-# ketgan" namuna markazni sezilarli siljitib yuborishi mumkin edi; 15-20
-# oraliq buferni "drift"ga ancha chidamli qiladi.
-CENTROID_BUFFER_SIZE = 18
+SPK_DUPLICATE_PROTOTYPE_SIM = 0.95
+
+SPK_ENROLL_MIN_SIM = float(os.environ.get("SPK_ENROLL_MIN_SIM", "0.65"))
+
+SPK_BOOTSTRAP_PROTOTYPES = int(os.environ.get("SPK_BOOTSTRAP_PROTOTYPES", "3"))
+SPK_BOOTSTRAP_ACCEPT = float(os.environ.get("SPK_BOOTSTRAP_ACCEPT", "0.45"))
+SPK_SHORT_CONTINUE_SIM = float(os.environ.get("SPK_SHORT_CONTINUE_SIM", "0.30"))
+SPK_SHORT_CONTINUE_MAX_SPEECH_S = float(os.environ.get("SPK_SHORT_CONTINUE_MAX_SPEECH_S", "3.0"))
+
+SPK_MERGE_SIM = float(os.environ.get("SPK_MERGE_SIM", "0.65"))
+
+SPK_ENROLL_MIN_PURITY = float(os.environ.get("SPK_ENROLL_MIN_PURITY", "0.6"))
+
+SPK_NEW_MIN_NEAR_FIELD_RATIO = float(os.environ.get("SPK_NEW_MIN_NEAR_FIELD_RATIO", "0.5"))
+SPK_NEW_CONFIRM_TURNS = max(2, int(os.environ.get("SPK_NEW_CONFIRM_TURNS", "2")))
+SPK_NEW_MIN_PAIR_MASS = float(os.environ.get("SPK_NEW_MIN_PAIR_MASS", "0.90"))
+
+
+def _new_speaker_evidence(purity: float, near_field_ratio: float | None, pair_mass: float | None):
+    reasons = []
+    if purity < SPK_ENROLL_MIN_PURITY:
+        reasons.append(f"purity={purity:.3f}<{SPK_ENROLL_MIN_PURITY}")
+    if near_field_ratio is not None and near_field_ratio < SPK_NEW_MIN_NEAR_FIELD_RATIO:
+        reasons.append(f"near_field_ratio={near_field_ratio:.3f}<{SPK_NEW_MIN_NEAR_FIELD_RATIO}")
+    if pair_mass is not None and pair_mass < SPK_NEW_MIN_PAIR_MASS:
+        reasons.append(f"pair_mass={pair_mass:.3f}<{SPK_NEW_MIN_PAIR_MASS}")
+    return (not reasons), reasons
+
+SPK_UNKNOWN_BUFFER_WINDOW_S = float(os.environ.get("SPK_UNKNOWN_BUFFER_WINDOW_S", "30"))
 
 
 def _trim_trailing_silence(wav: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -117,21 +96,55 @@ def _trim_trailing_silence(wav: np.ndarray, sample_rate: int) -> np.ndarray:
     return wav[:end]
 
 
+def _load_pyannote_model(model_name: str):
+    from pyannote.audio import Model, Inference
+
+    model = Model.from_pretrained(model_name, token=HF_TOKEN)
+    model.eval()
+    inference = Inference(model, window="whole")
+    inference.to(torch.device(SPK_DEVICE))
+    return inference
+
+
+def _load_speechbrain_model(model_name: str):
+    from speechbrain.inference.speaker import EncoderClassifier
+
+    savedir = os.path.join("pretrained_models", model_name.replace("/", "_"))
+    return EncoderClassifier.from_hparams(
+        source=model_name,
+        run_opts={"device": SPK_DEVICE},
+        savedir=savedir,
+    )
+
+
 def _load_model():
-    global _embedding_model
-    if _embedding_model is None:
-        model = m.EmbeddingModel.from_pyannote("pyannote/embedding")
-        model.to(torch.device("cpu"))
-        model.eval()
-        _embedding_model = model
-    return _embedding_model
+    global _embedding_backend, _embedding_model, _embedding_model_name
+    if _embedding_model is not None:
+        return _embedding_model
+
+    with _embedding_load_lock:
+        if _embedding_model is not None:
+            return _embedding_model
+
+        try:
+            _embedding_model = _load_pyannote_model(SPK_EMBEDDING_MODEL)
+            _embedding_backend = "pyannote"
+            _embedding_model_name = SPK_EMBEDDING_MODEL
+        except Exception as e:
+            logger.error(
+                f"[SPK] {SPK_EMBEDDING_MODEL!r} modelini pyannote.audio orqali yuklab bo'lmadi: "
+                f"{e!r} — zaxira modelga ({SPK_EMBEDDING_FALLBACK_MODEL!r}, speechbrain) o'tilyapti. "
+                f"Agar bu gated/xususiy HF Hub repo bo'lsa, HF_TOKEN muhit o'zgaruvchisini "
+                f"sozlash kerak bo'lishi mumkin."
+            )
+            _embedding_model = _load_speechbrain_model(SPK_EMBEDDING_FALLBACK_MODEL)
+            _embedding_backend = "speechbrain"
+            _embedding_model_name = SPK_EMBEDDING_FALLBACK_MODEL
+
+        return _embedding_model
 
 
 def _clear_debug_audio_dir() -> None:
-    """Server ishga tushganda (faqat SAVE_DEBUG_AUDIO yoqilgan bo'lsa)
-    debug_audio/ papkasidagi OLDINGI ishga tushishdan qolgan .wav
-    fayllarni tozalaydi — aks holda bu fayllar vaqt o'tishi bilan
-    cheksiz ko'payib, diskni to'ldirib yuboradi."""
     if not SAVE_DEBUG_AUDIO:
         return
     os.makedirs(DEBUG_AUDIO_DIR, exist_ok=True)
@@ -150,16 +163,6 @@ def _clear_debug_audio_dir() -> None:
 def _save_debug_audio_async(
     wav: np.ndarray, sample_rate: int, duration_s: float, rms: float, outcome: str
 ) -> str | None:
-    """Embedding modelga AYNAN uzatiladigan (trim qilingan) audio'ni
-    diagnostika uchun diskka yozadi — faqat SAVE_DEBUG_AUDIO=True bo'lsa.
-    Asosiy oqimni bloklamasligi uchun alohida (daemon) thread'da ishlaydi —
-    bu funksiyaning o'zi disk I/O'ni kutmasdan darhol qaytadi.
-
-    Fayl nomini (timestamp'ga asoslangani uchun) THREAD BOSHLANISHIDAN OLDIN,
-    sinxron hisoblab, qaytaradi — shunda chaqiruvchi (identify_speaker)
-    ushbu nomni debug_label_out'ga yozib qo'yishi mumkin, dialog.py esa keyinroq
-    (speaker/lang/text ANIQLANGANDAN KEYIN) save_turn_label() orqali shu AYNAN
-    faylga mos .json yaratishi uchun — disk yozishning o'zi hamon asinxron."""
     if not SAVE_DEBUG_AUDIO:
         return None
 
@@ -177,18 +180,7 @@ def _save_debug_audio_async(
     return filename
 
 
-def save_turn_label(wav_filename: str | None, speaker: str | None, lang: str | None, text: str | None) -> None:
-    """dialog.py tomonidan, bitta turn uchun YAKUNIY natija (A/B spiker, til,
-    transkripsiya) ma'lum bo'lgandan keyin chaqiriladi. `wav_filename` —
-    identify_speaker() debug_label_out orqali qaytargan, AYNAN shu turnga
-    tegishli audio fayl nomi (_save_debug_audio_async natijasi). Shu nom bilan
-    bir xil, lekin .json kengaytmali faylga {"speaker", "lang", "text"} yoziladi
-    — eval_dialog.py labels.json shablonini shundan avtomatik to'ldiradi
-    (foydalanuvchi faqat xatolarni tuzatadi).
-
-    `wav_filename=None` bo'lsa (SAVE_DEBUG_AUDIO=False edi, YOKI audio juda
-    qisqa/jim bo'lgani uchun identify_speaker hech qanday wav saqlamagan
-    edi) — yozadigan narsa yo'q, hech narsa qilinmaydi."""
+def save_turn_label(wav_filename: str | None, speaker, lang: str | None, text: str | None) -> None:
     if not SAVE_DEBUG_AUDIO or not wav_filename:
         return
 
@@ -208,19 +200,22 @@ def warmup(run_inference: bool = True) -> None:
     _clear_debug_audio_dir()
     t0 = time.perf_counter()
     _load_model()
-    logger.info(f"[SPK] pyannote embedding model loaded in {time.perf_counter() - t0:.2f}s")
+    load_s = time.perf_counter() - t0
+    logger.info(
+        f"[SPK] ovoz embedding modeli yuklandi: backend={_embedding_backend!r} "
+        f"model={_embedding_model_name!r} device={SPK_DEVICE!r} ({load_s:.2f}s)"
+    )
     if not run_inference:
         return
     try:
+        dummy_wav = (np.random.randn(16000 * 2).astype(np.float32) * 0.05)
+        t1 = time.perf_counter()
+        _embed(dummy_wav, 16000)
+        embed_ms = (time.perf_counter() - t1) * 1000
+        logger.info(f"[SPK] bitta embedding (2.0s audio, device={SPK_DEVICE!r}): {embed_ms:.1f}ms")
+
         session = create_session()
-        identify_speaker(
-            session,
-            np.random.randn(16000).astype(np.float32) * 0.05,
-            16000,
-            speaker_langs={"A": "en", "B": "ru"},
-            detected_lang="en",
-            lang_prob=0.9,
-        )
+        identify_speaker(session, dummy_wav, 16000, seq=0)
         logger.info("[SPK] warm-up inference done")
     except Exception as e:
         logger.info(f"[SPK] warm-up inference skipped: {e!r}")
@@ -228,312 +223,542 @@ def warmup(run_inference: bool = True) -> None:
 
 def create_session():
     return {
-        "embedding_model": _load_model(),
-        # "A"/"B" -> {"founding_embedding": np.ndarray, "embeddings": deque,
-        #             "centroid": np.ndarray} — kalit faqat shu spiker
-        # UCHUN ovoz profili tashkil topgandan keyin paydo bo'ladi (qarang
-        # identify_speaker/enroll_speaker).
-        "voices": {},
+        "speakers": {},
+        "next_id": 1,
+        "last_speaker": None,
+        "unknown_buffer": [],
         "lock": threading.Lock(),
     }
 
 
-def _embed(embedding_model, wav: np.ndarray) -> np.ndarray:
-    waveform = torch.from_numpy(np.ascontiguousarray(wav, dtype=np.float32)).reshape(1, 1, -1)
-    with torch.no_grad():
-        emb = embedding_model(waveform)
-    emb = emb.squeeze(0).cpu().numpy().astype(np.float64)
+def _embed(wav: np.ndarray, sample_rate: int) -> np.ndarray:
+    model = _load_model()
+    waveform = torch.from_numpy(np.ascontiguousarray(wav, dtype=np.float32)).reshape(1, -1)
+    with GPU_LOCK:
+        if _embedding_backend == "pyannote":
+            emb = model({"waveform": waveform, "sample_rate": sample_rate})
+            emb = np.asarray(emb, dtype=np.float64).reshape(-1)
+        else:  # "speechbrain"
+            with torch.no_grad():
+                emb = model.encode_batch(waveform)
+            emb = emb.squeeze().cpu().numpy().astype(np.float64).reshape(-1)
     norm = np.linalg.norm(emb)
     if norm > 0:
         emb = emb / norm
     return emb
 
 
-def _recompute_voice_centroid(profile: dict) -> None:
-    """Markaz — "founding" (asos) namuna + sirpanuvchi bufердаgi hamma
-    namunalarning o'rtachasi. `founding_embedding` ATAYLAB `embeddings`
-    deque'sidan TASHQARIDA saqlanadi (A3): deque `maxlen=CENTROID_BUFFER_
-    SIZE` bo'lgani uchun eski namunalarni o'zi "unutadi", lekin founding
-    namuna HECH QACHON shu tarzda chiqarib tashlanmaydi — klaster "kim
-    ekanligi"ning barqaror langari sifatida doim markazga hissa qo'shadi."""
-    vectors = [profile["founding_embedding"], *profile["embeddings"]]
-    mean = np.mean(vectors, axis=0)
-    norm = np.linalg.norm(mean)
-    profile["centroid"] = mean / norm if norm > 0 else mean
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b))
 
 
-def _voice_profile_score(session, speaker: str, embedding: np.ndarray | None) -> float:
-    """[0,1] oraliqda — `speaker`ning OVOZ profili asosida ushbu embedding
-    unga qanchalik mos kelishi (cosine o'xshashlik [-1,1]'dan chiziqli
-    o'tkazilgan). Profil hali tashkil topmagan BO'LSA yoki `embedding` yo'q
-    (audio juda qisqa/jim bo'lib trim qilingan) bo'lsa — NEUTRAL (0.5, ya'ni
-    "hech qanday dalil yo'q") qaytaradi, shunda yakuniy qaror shu daraja
-    bo'yicha butunlay til signaliga tortiladi."""
-    profile = session["voices"].get(speaker)
-    if profile is None or embedding is None:
-        return 0.5
-    sim = float(np.dot(embedding, profile["centroid"]))
-    return min(1.0, max(0.0, (sim + 1.0) / 2.0))
+def _speaker_best_sim(profile: dict, embedding: np.ndarray) -> float:
+    if not profile["prototypes"]:
+        return -1.0
+    return max(_cosine_sim(embedding, p["embedding"]) for p in profile["prototypes"])
 
 
-def _lang_profile_scores(
-    speaker_langs: dict, detected_lang: str | None, lang_prob: float
-) -> tuple[float, float]:
-    """(p_lang(A), p_lang(B)) qaytaradi. `detected_lang` A yoki B'ning
-    TANLAGAN tiliga mos kelsa, shu tomonga `lang_prob` (stt.py'da
-    ALLAQACHON 2 til orasida qayta normallashtirilgan — qarang
-    _detect_language_restricted) beriladi, ikkinchi tomonga `1 - lang_prob`
-    (faqat 2 nomzod bo'lgani uchun ehtimolliklar yig'indisi 1 bo'ladi).
-    `detected_lang` ikkisiga ham mos kelmasa (STT candidate_languages
-    orqali shu ikkisiga cheklangani uchun amalda bo'lmasligi kerak — faqat
-    himoya sifatida) — ikkisiga ham NEUTRAL (0.5)."""
-    if detected_lang == speaker_langs.get("A"):
-        return lang_prob, 1.0 - lang_prob
-    if detected_lang == speaker_langs.get("B"):
-        return 1.0 - lang_prob, lang_prob
-    return 0.5, 0.5
+def _add_prototype(profile: dict, embedding: np.ndarray, seq: int) -> None:
+    profile["prototypes"].append({"seq": seq, "embedding": embedding})
+    if len(profile["prototypes"]) > SPK_MAX_PROTOTYPES:
+        del profile["prototypes"][1]
 
 
-def _effective_weights(duration_s: float, lang_prob: float) -> tuple[float, float]:
-    """(w_lang, w_voice). Til "hal qiluvchi" rejimga o'tadi (deyarli
-    yakuniy qarorni belgilaydi) FAQAT turn >= LANG_DECISIVE_MIN_DURATION_S
-    VA lang_prob "noaniq oraliq" [LANG_AMBIGUOUS_PROB_LOW,
-    LANG_AMBIGUOUS_PROB_HIGH]'dan TASHQARIDA bo'lsa — ya'ni STT yetarlicha
-    uzun audio'da ANIQ bir tilni ko'rsatgan. Aks holda (qisqa turn YOKI
-    til ishonchi noaniq) bazaviy (teng) vaznlarga qaytiladi va ovoz
-    amalda hal qiluvchi bo'lib qoladi."""
-    lang_is_decisive = duration_s >= LANG_DECISIVE_MIN_DURATION_S and not (
-        LANG_AMBIGUOUS_PROB_LOW <= lang_prob <= LANG_AMBIGUOUS_PROB_HIGH
-    )
-    if lang_is_decisive:
-        return LANG_DECISIVE_W_LANG, LANG_DECISIVE_W_VOICE
-    return W_LANG, W_VOICE
+def _pop_prototypes_by_seqs(profile: dict, seqs) -> list[dict]:
+    seqs_set = set(seqs)
+    popped = [proto for proto in profile["prototypes"] if proto["seq"] in seqs_set]
+    profile["prototypes"] = [proto for proto in profile["prototypes"] if proto["seq"] not in seqs_set]
+    return popped
+
+
+def _max_cross_sim(profile_a: dict, profile_b: dict) -> float:
+    best = -1.0
+    for pa in profile_a["prototypes"]:
+        for pb in profile_b["prototypes"]:
+            sim = _cosine_sim(pa["embedding"], pb["embedding"])
+            if sim > best:
+                best = sim
+    return best
+
+
+def _merge_profile_into(target_profile: dict, source_profile: dict) -> None:
+    target_profile["prototypes"].extend(source_profile["prototypes"])
+    while len(target_profile["prototypes"]) > SPK_MAX_PROTOTYPES:
+        del target_profile["prototypes"][1]
+
+
+def _check_and_merge(session) -> list[tuple[int, int, float]]:
+    events: list[tuple[int, int, float]] = []
+    changed = True
+    while changed:
+        changed = False
+        ids = sorted(session["speakers"].keys())
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = ids[i], ids[j]
+                sim = _max_cross_sim(session["speakers"][a], session["speakers"][b])
+                if sim >= SPK_MERGE_SIM:
+                    _merge_profile_into(session["speakers"][a], session["speakers"][b])
+                    del session["speakers"][b]
+                    events.append((b, a, sim))
+                    logger.info(f"[SPK][MERGE] from={b} into={a} sim={sim:.3f}")
+                    changed = True
+                    break
+            if changed:
+                break
+    return events
+
+
+def _apply_remap(speaker_id, merges: list[tuple[int, int, float]]):
+    for frm, into, _ in merges:
+        if speaker_id == frm:
+            speaker_id = into
+    return speaker_id
+
+
+def _trim_unknown_buffer(session) -> None:
+    now = time.monotonic()
+    session["unknown_buffer"] = [
+        e for e in session["unknown_buffer"] if now - e["received_at"] <= SPK_UNKNOWN_BUFFER_WINDOW_S
+    ]
+
+
+def _best_existing_match(session, embedding: np.ndarray):
+    best_id, best_sim = None, -1.0
+    for sid, profile in session["speakers"].items():
+        sim = _speaker_best_sim(profile, embedding)
+        if sim > best_sim:
+            best_id, best_sim = sid, sim
+    return best_id, best_sim
+
+
+def _best_match_with_margin(session, embedding: np.ndarray):
+    sims: dict = {}
+    for sid, profile in session["speakers"].items():
+        sims[sid] = _speaker_best_sim(profile, embedding)
+    if not sims:
+        return None, -1.0, None
+    best_id = max(sims, key=sims.get)
+    best_sim = sims[best_id]
+    others = [sim for sid, sim in sims.items() if sid != best_id]
+    if not others:
+        return best_id, best_sim, None
+    return best_id, best_sim, best_sim - max(others)
+
+
+def embed_for_match(wav: np.ndarray, sample_rate: int) -> tuple:
+    trimmed = _trim_trailing_silence(wav, sample_rate)
+    turn_s = len(wav) / sample_rate
+    speech_s = len(trimmed) / sample_rate
+    if trimmed.size > 0 and speech_s < MIN_TRIMMED_DURATION_S and speech_s < turn_s:
+        logger.info(f"[SPK][TRIM] trim too aggressive ({turn_s:.2f}s -> {speech_s:.2f}s), using original audio")
+        trimmed = wav
+        speech_s = turn_s
+    embedding = None
+    if trimmed.size > 0 and speech_s >= MIN_TRIMMED_DURATION_S:
+        embedding = _embed(trimmed, sample_rate)
+    return embedding, trimmed, speech_s
+
+
+def quick_speaker_match(session, embedding: np.ndarray | None):
+    if embedding is None:
+        return None, -1.0, None
+    with session["lock"]:
+        return _best_match_with_margin(session, embedding)
+
+
+def _process_unknown_buffer(session) -> list[tuple[int, int]]:
+    _trim_unknown_buffer(session)
+    buf = session["unknown_buffer"]
+    reassigned: list[tuple[int, int]] = []
+
+    still_unknown = []
+    for entry in buf:
+        sid, sim = _best_existing_match(session, entry["embedding"])
+        if sid is not None and sim >= SPK_ACCEPT:
+            purity = entry.get("purity", 1.0)
+            if purity >= SPK_ENROLL_MIN_PURITY:
+                _add_prototype(session["speakers"][sid], entry["embedding"], entry["seq"])
+            else:
+                logger.info(
+                    f"[SPK][ENROLL] skipped reason=impure purity={purity:.3f} "
+                    f"seq={entry['seq']} (buffer_assign -> speaker={sid})"
+                )
+            reassigned.append((entry["seq"], sid))
+            logger.info(
+                f"[SPK] decision=buffer_assign seq={entry['seq']} -> speaker={sid} sim={sim:.3f}"
+            )
+        else:
+            still_unknown.append(entry)
+    buf[:] = still_unknown
+
+    changed = True
+    while changed:
+        changed = False
+        n = len(buf)
+        for i in range(n):
+            cluster = [buf[i]]
+            for j in range(n):
+                if j == i:
+                    continue
+                sim = _cosine_sim(buf[i]["embedding"], buf[j]["embedding"])
+                if sim >= SPK_ACCEPT:
+                    cluster.append(buf[j])
+            total_speech = sum(e["speech_s"] for e in cluster)
+            if len(cluster) >= 2 and total_speech >= SPK_MIN_ENROLL_SPEECH_S:
+                strong = []
+                for entry in cluster:
+                    ok, reasons = _new_speaker_evidence(
+                        entry.get("purity", 1.0), entry.get("near_field_ratio"), entry.get("pair_mass")
+                    )
+                    if ok:
+                        strong.append(entry)
+                    else:
+                        logger.info(f"[SPK] decision=unknown reason=weak_evidence seq={entry['seq']} ({'; '.join(reasons)})")
+                # Subsegments of one browser chunk are not independent confirmations.
+                independent_turns = {int(e["seq"]) for e in strong}
+                if len(independent_turns) < SPK_NEW_CONFIRM_TURNS or sum(e["speech_s"] for e in strong) < SPK_MIN_ENROLL_SPEECH_S:
+                    continue
+                cluster = strong
+                strong_seqs = {e["seq"] for e in strong}
+                total_speech = sum(e["speech_s"] for e in strong)
+                new_id = session["next_id"]
+                session["next_id"] += 1
+                session["speakers"][new_id] = {"prototypes": []}
+                cluster_seqs = []
+                for e in cluster:
+                    if e["seq"] in strong_seqs:
+                        _add_prototype(session["speakers"][new_id], e["embedding"], e["seq"])
+                    reassigned.append((e["seq"], new_id))
+                    cluster_seqs.append(e["seq"])
+                seqs_set = set(cluster_seqs)
+                buf[:] = [e for e in buf if e["seq"] not in seqs_set]
+                logger.info(
+                    f"[SPK] decision=buffer_promote seqs={sorted(cluster_seqs)} -> "
+                    f"speaker={new_id} total_speech={total_speech:.2f}s "
+                    f"strong_members={len(strong_seqs)}/{len(cluster)}"
+                )
+                changed = True
+                break
+    return reassigned
 
 
 def identify_speaker(
     session,
     wav: np.ndarray,
     sample_rate: int,
-    speaker_langs: dict,
-    detected_lang: str | None,
-    lang_prob: float,
+    seq: int,
+    detected_lang: str | None = None,
     debug_label_out: dict | None = None,
-) -> tuple[str, dict]:
-    """DIALOG_PLAN.md 2-bosqich: bitta turn uchun A/B qarorini TIL va OVOZ
-    signallarining birlashgan balli orqali chiqaradi:
-
-        score_X = w_lang * p_lang(X) + w_voice * voice_sim_norm(X)   (X=A,B)
-
-    Qaytaradi: (`"A"` | `"B"` | `"ambiguous"`, debug_info_dict).
-    HECH QACHON `None`/"unknown_speaker" qaytarmaydi — bu suhbat ANIQ 2
-    kishi orasida ekani ma'lum (speaker_langs orqali), shuning uchun har
-    bir (bo'sh bo'lmagan) turn ALBATTA A, B yoki (agar ikkisi ham deyarli
-    teng ball olsa) "ambiguous" bo'ladi. Chaqiruvchi (dialog.py) `detected_
-    lang`/`lang_prob`ni BU FUNKSIYA chaqirilishidan OLDIN STT orqali olishi
-    kerak — eski kodda STT faqat "founding sample" tekshiruvi uchun shartli
-    chaqirilardi, endi til ASOSIY signallardan biri bo'lgani uchun HAR DOIM
-    oldindan kerak.
-
-    Eski alohida bosqichlar — FAQAT ovoz orqali klasterlash
-    (SPEAKER_MATCH_THRESHOLD), keyin FAQAT birinchi marta klaster ochilganda
-    til tekshirish, shundan keyin "ovoz orqali, til tekshirilmadi" doimiy
-    bog'lash — BUTUNLAY OLIB TASHLANDI. Buning o'rniga har bir turn
-    MUSTAQIL baholanadi (streak/pending holat saqlanmaydi)."""
+    purity: float = 1.0,
+    near_field_ratio: float | None = None,
+    pair_mass: float | None = None,
+    precomputed: tuple | None = None,
+) -> dict:
     t0 = time.perf_counter()
-    trimmed = _trim_trailing_silence(wav, sample_rate)
+    if precomputed is not None:
+        embedding, trimmed, speech_s = precomputed
+    else:
+        embedding, trimmed, speech_s = embed_for_match(wav, sample_rate)
     trim_ms = (time.perf_counter() - t0) * 1000
     logger.info(f"[SPK][TRIM] wav_len={len(wav)} trimmed_len={len(trimmed)} took={trim_ms:.2f}ms")
 
-    original_duration_s = len(wav) / sample_rate
-    trimmed_duration_s = len(trimmed) / sample_rate
-    if trimmed.size > 0 and trimmed_duration_s < MIN_TRIMMED_DURATION_S and trimmed_duration_s < original_duration_s:
-        logger.info(f"[SPK][TRIM] trim too aggressive ({original_duration_s:.2f}s -> "
-            f"{trimmed_duration_s:.2f}s), using original audio")
-        trimmed = wav
-
-    duration_s = len(trimmed) / sample_rate
+    turn_s = len(wav) / sample_rate
     trimmed_rms = float(np.sqrt(np.mean(trimmed.astype(np.float64) ** 2))) if trimmed.size else 0.0
 
     try:
         with session["lock"]:
-            # Audio juda qisqa/butunlay jim bo'lsa, ishonchli embedding
-            # OLISH MUMKIN EMAS — lekin bu, eski koddan farqli, ENDI turnni
-            # butunlay rad etishga sabab BO'LMAYDI: voice_sim ikki tomon
-            # uchun ham NEUTRAL (0.5) qoladi va qaror butunlay til signaliga
-            # tayanadi (agar u ham noaniq bo'lsa, margin tekshiruvi buni
-            # "ambiguous" deb to'g'ri belgilaydi — pastga qarang).
-            embedding = None
-            if trimmed.size > 0 and duration_s >= MIN_TRIMMED_DURATION_S:
-                embedding = _embed(session["embedding_model"], trimmed)
+            speakers = session["speakers"]
 
-            voice_a = _voice_profile_score(session, "A", embedding)
-            voice_b = _voice_profile_score(session, "B", embedding)
-            lang_a, lang_b = _lang_profile_scores(speaker_langs, detected_lang, lang_prob)
-            w_lang, w_voice = _effective_weights(duration_s, lang_prob)
+            sims: dict = {}
+            if embedding is not None:
+                for sid, profile in speakers.items():
+                    sims[sid] = _speaker_best_sim(profile, embedding)
 
-            score_a = w_lang * lang_a + w_voice * voice_a
-            score_b = w_lang * lang_b + w_voice * voice_b
+            if sims:
+                best_id = max(sims, key=sims.get)
+                best_sim = sims[best_id]
+                _others = [s for sid, s in sims.items() if sid != best_id]
+                margin = (best_sim - max(_others)) if _others else None
+            else:
+                best_id = None
+                best_sim = -1.0
+                margin = None
 
-            debug_info = {
-                "score_a": score_a,
-                "score_b": score_b,
-                "voice_a": voice_a,
-                "voice_b": voice_b,
-                "lang_a": lang_a,
-                "lang_b": lang_b,
-                "w_lang": w_lang,
-                "w_voice": w_voice,
-            }
+            decision: str
+            result_speaker = None
+            uncertain = False
+            buffer_reassigned: list[tuple[int, int]] = []
 
-            logger.info(f"[SPK][SCORE] A={score_a:.3f} (lang={lang_a:.2f} voice={voice_a:.2f}) "
-                f"B={score_b:.3f} (lang={lang_b:.2f} voice={voice_b:.2f}) "
-                f"w_lang={w_lang:.2f} w_voice={w_voice:.2f} duration={duration_s:.2f}s "
-                f"detected_lang={detected_lang!r} lang_prob={lang_prob:.2f}")
-
-            margin = abs(score_a - score_b)
-            if margin < AMBIGUOUS_MARGIN:
-                logger.info(f"[SPK][DEBUG] ambiguous (margin={margin:.3f} < {AMBIGUOUS_MARGIN}) — "
-                    f"foydalanuvchidan tanlash so'ralishi kerak")
-                wav_filename = _save_debug_audio_async(trimmed, sample_rate, duration_s, trimmed_rms, "ambiguous")
-                if debug_label_out is not None:
-                    debug_label_out["wav_filename"] = wav_filename
-                return "ambiguous", debug_info
-
-            winner = "A" if score_a > score_b else "B"
-
-            # 3-band: ikkala profil ham mavjud bo'lgandagina voice_winner
-            # mazmunli (aks holda _voice_profile_score mavjud bo'lmagan
-            # tomon uchun NEUTRAL 0.5 qaytaradi — "g'olib" tasodifiy bo'lib
-            # qoladi, haqiqiy ziddiyat emas).
-            conflict = False
-            if "A" in session["voices"] and "B" in session["voices"]:
-                voice_winner = "A" if voice_a > voice_b else "B"
-                lang_winner = "A" if lang_a > lang_b else "B"
-                voice_margin = abs(voice_a - voice_b)
-                if voice_winner != lang_winner and voice_margin > VOICE_CONFLICT_MARGIN:
-                    conflict = True
-                    debug_info["conflict"] = True
-                    logger.info(
-                        f"[SPK][CONFLICT] lang→{lang_winner} voice→{voice_winner} "
-                        f"margin={voice_margin:.3f} — centroid yangilanmadi"
-                    )
-
-            # Markaz FAQAT yuqori til-ishonchli turnlardan tashkil topadi/
-            # yangilanadi (A3/A4) — g'olib ANIQLANGANDAN keyin, HAR DOIM,
-            # g'olib qanday aniqlanganidan (til yoki ovoz hal qilganidan)
-            # qat'i nazar shu BITTA shart tekshiriladi. 3-band: til/ovoz
-            # ziddiyati bo'lsa, bu tekshiruv UMUMAN o'tkazilmaydi — hech
-            # qaysi spiker centroidi yangilanmaydi (g'olibning o'zi esa
-            # o'zgarishsiz, hali til bo'yicha qolaveradi).
-            if conflict:
-                pass
-            elif embedding is not None and lang_prob >= CENTROID_UPDATE_MIN_LANG_PROB:
-                profile = session["voices"].get(winner)
-                if profile is None:
-                    session["voices"][winner] = {
-                        "founding_embedding": embedding,
-                        "embeddings": collections.deque(maxlen=CENTROID_BUFFER_SIZE),
-                        "centroid": embedding,
-                    }
-                    logger.info(f"[SPK][DEBUG] {winner!r} uchun YANGI ovoz profili tashkil topdi "
-                        f"(lang_prob={lang_prob:.2f} >= {CENTROID_UPDATE_MIN_LANG_PROB})")
+            if embedding is None:
+                decision = "no_embedding"
+                uncertain = True
+                if session["last_speaker"] is not None:
+                    result_speaker = session["last_speaker"]
                 else:
-                    profile["embeddings"].append(embedding)
-                    _recompute_voice_centroid(profile)
-                    logger.info(f"[SPK][DEBUG] {winner!r} ovoz profili yangilandi "
-                        f"(lang_prob={lang_prob:.2f} >= {CENTROID_UPDATE_MIN_LANG_PROB})")
-            elif embedding is not None:
-                logger.info(f"[SPK][DEBUG] {winner!r} g'olib, lekin markaz YANGILANMADI "
-                    f"(lang_prob={lang_prob:.2f} < {CENTROID_UPDATE_MIN_LANG_PROB})")
+                    decision = "unknown"
+                    logger.info(f"[SPK] decision=unknown reason=weak_evidence seq={seq} (no_embedding)")
+
+            elif best_sim >= SPK_ACCEPT and (margin is None or margin >= SPK_MIN_MARGIN):
+                decision = "accept"
+                result_speaker = best_id
+                profile = speakers[best_id]
+                if speech_s >= SPK_MIN_ENROLL_SPEECH_S and best_sim < SPK_DUPLICATE_PROTOTYPE_SIM:
+                    is_bootstrap = len(profile["prototypes"]) < SPK_BOOTSTRAP_PROTOTYPES
+                    if purity < SPK_ENROLL_MIN_PURITY:
+                        logger.info(
+                            f"[SPK][ENROLL] skipped reason=impure purity={purity:.3f} < "
+                            f"{SPK_ENROLL_MIN_PURITY} speaker={best_id}"
+                        )
+                    elif is_bootstrap or best_sim >= SPK_ENROLL_MIN_SIM:
+                        _add_prototype(profile, embedding, seq)
+                        logger.info(
+                            f"[SPK][ENROLL] speaker={best_id} yangi prototip qo'shildi "
+                            f"(sim={best_sim:.3f}{' bootstrap' if is_bootstrap else ''}) — "
+                            f"jami prototiplar={len(profile['prototypes'])}"
+                        )
+                    else:
+                        logger.info(
+                            f"[SPK][ENROLL] skipped sim={best_sim:.3f} < {SPK_ENROLL_MIN_SIM} "
+                            f"speaker={best_id}"
+                        )
+
+            elif best_sim >= SPK_ACCEPT:
+                decision = "tie_uncertain"
+                result_speaker = best_id
+                uncertain = True
+                logger.info(
+                    f"[SPK] decision=tie_uncertain seq={seq} best={best_id}({best_sim:.3f}) "
+                    f"margin={margin:.3f} < {SPK_MIN_MARGIN}"
+                )
+
+            elif (
+                best_id is not None
+                and best_sim >= SPK_BOOTSTRAP_ACCEPT
+                and len(speakers[best_id]["prototypes"]) < SPK_BOOTSTRAP_PROTOTYPES
+                and (margin is None or margin >= SPK_MIN_MARGIN)
+                and speech_s >= SPK_MIN_ENROLL_SPEECH_S
+                and purity >= SPK_ENROLL_MIN_PURITY
+            ):
+                # Qarang SPK_BOOTSTRAP_ACCEPT izohi.
+                decision = "accept"
+                result_speaker = best_id
+                profile = speakers[best_id]
+                _add_prototype(profile, embedding, seq)
+                logger.info(
+                    f"[SPK][ENROLL] speaker={best_id} yangi prototip qo'shildi "
+                    f"(sim={best_sim:.3f} bootstrap_low) — jami prototiplar={len(profile['prototypes'])}"
+                )
+
+            elif best_id is not None and SPK_NEW <= best_sim < SPK_ACCEPT:
+                if turn_s < SPK_SHORT_TURN_S and session["last_speaker"] is not None:
+                    decision = "short"
+                    result_speaker = session["last_speaker"]
+                else:
+                    decision = "uncertain"
+                    result_speaker = best_id
+                uncertain = True
+
+            elif (
+                best_id is not None
+                and best_id == session["last_speaker"]
+                and best_sim >= SPK_SHORT_CONTINUE_SIM
+                and (margin is None or margin >= SPK_MIN_MARGIN)
+                and speech_s < SPK_SHORT_CONTINUE_MAX_SPEECH_S
+            ):
+                # Qarang SPK_SHORT_CONTINUE_SIM izohi.
+                decision = "short_continue"
+                result_speaker = best_id
+                uncertain = True
+
+            elif _new_speaker_evidence(purity, near_field_ratio, pair_mass)[0] and (
+                (not speakers and speech_s >= SPK_BOOTSTRAP_MIN_SPEECH_S)
+                or (
+                    bool(speakers) and speech_s >= SPK_MIN_ENROLL_SPEECH_S
+                    and pair_mass is not None and pair_mass >= SPK_NEW_IMMEDIATE_PAIR_MASS
+                    and (near_field_ratio is None or near_field_ratio >= SPK_NEW_IMMEDIATE_NEAR_RATIO)
+                )
+            ):
+                new_id = session["next_id"]
+                session["next_id"] += 1
+                speakers[new_id] = {"prototypes": [{"seq": seq, "embedding": embedding}]}
+                decision = "new"
+                result_speaker = new_id
+
+            else:
+                decision = "unknown"
+                result_speaker = None
+                uncertain = True
+                if speech_s >= SPK_MIN_ENROLL_SPEECH_S:
+                    _, weak_reasons = _new_speaker_evidence(purity, near_field_ratio, pair_mass)
+                    if weak_reasons:
+                        logger.info(
+                            f"[SPK] decision=unknown reason=weak_evidence seq={seq} ({'; '.join(weak_reasons)})"
+                        )
+                    else:
+                        logger.info(f"[SPK] decision=unknown reason=pending_confirmation seq={seq} required_turns={SPK_NEW_CONFIRM_TURNS}")
+                session["unknown_buffer"].append(
+                    {
+                        "seq": seq,
+                        "embedding": embedding,
+                        "speech_s": speech_s,
+                        "purity": purity,
+                        "near_field_ratio": near_field_ratio,
+                        "pair_mass": pair_mass,
+                        "received_at": time.monotonic(),
+                    }
+                )
+                buffer_reassigned = _process_unknown_buffer(session)
+                for r_seq, r_speaker in buffer_reassigned:
+                    if r_seq == seq:
+                        decision = "buffer_assigned"
+                        result_speaker = r_speaker
+                        uncertain = False
+
+            if decision != "unknown" and session["unknown_buffer"]:
+                buffer_reassigned.extend(_process_unknown_buffer(session))
+
+            merges = _check_and_merge(session)
+            result_speaker = _apply_remap(result_speaker, merges)
+            reassigned = [
+                (r_seq, _apply_remap(r_speaker, merges))
+                for r_seq, r_speaker in buffer_reassigned
+                if r_seq != seq
+            ]
+
+            if result_speaker is not None:
+                session["last_speaker"] = result_speaker
+
+            sims_str = ", ".join(f"{sid}:{sim:.2f}" for sid, sim in sims.items())
+            best_str = f"{best_id}({best_sim:.2f})" if best_id is not None else "none"
+            proto_str = ", ".join(f"{sid}:{len(p['prototypes'])}" for sid, p in speakers.items())
+            logger.info(
+                f"[SPK] seq={seq} speech={speech_s:.2f}s turn={turn_s:.2f}s lang={detected_lang!r} "
+                f"sims={{{sims_str}}} best={best_str} decision={decision} speaker={result_speaker} "
+                f"uncertain={uncertain} prototypes={{{proto_str}}} "
+                f"thresholds=(accept={SPK_ACCEPT},new={SPK_NEW})"
+            )
 
             wav_filename = _save_debug_audio_async(
-                trimmed, sample_rate, duration_s, trimmed_rms,
-                f"speaker_{winner}_conflict" if conflict else f"speaker_{winner}",
+                trimmed, sample_rate, speech_s, trimmed_rms, f"speaker_{result_speaker}_{decision}"
             )
             if debug_label_out is not None:
                 debug_label_out["wav_filename"] = wav_filename
-            return winner, debug_info
+
+            return {
+                "speaker": result_speaker,
+                "uncertain": uncertain,
+                "decision": decision,
+                "merges": merges,
+                "reassigned": reassigned,
+            }
     except Exception as e:
         logger.error(f"[SPK][ERROR] identify_speaker raised {e!r}")
         raise
 
 
-def both_slots_bound(session) -> bool:
-    """A VA B ikkisi ham allaqachon OVOZ PROFILIGA ega (founded) — ya'ni
-    suhbatdagi ikkita spikerning ovoz "imzosi" aniq. dialog.py'dagi "fast
-    path" uchun ishlatiladi: shu holatda juda qisqa/juda past-energiyali
-    (frontend VAD'ning past chegarasi tufayli shovqindan ham "nutq" deb
-    yuborilgan bo'lishi mumkin bo'lgan) audio bo'laklarini STT/embedding'ga
-    yubormasdan oldin saralab tashlash mumkin."""
+def has_known_speakers(session) -> bool:
     with session["lock"]:
-        return "A" in session["voices"] and "B" in session["voices"]
+        return len(session["speakers"]) > 0
 
 
-def enroll_speaker(session, speaker: str, wav: np.ndarray, sample_rate: int) -> None:
-    """KEYINGI ISH uchun joy (DIALOG_PLAN.md 2-bosqich, ixtiyoriy band):
-    til tanlangandan keyin, suhbat boshlanishidan OLDIN, har bir spiker
-    3-4 soniya namunaviy gapirib "ro'yxatdan o'tishi" (enrollment) orqali
-    ovoz profilini SUHBAT boshidanoq, til signaliga bog'liq bo'lmay turib
-    tayyorlab qo'yish mumkin — bu sovuq-start muammosini (suhbatning
-    birinchi bir-ikki turnida hali hech kim uchun ovoz profili yo'qligi,
-    shuning uchun qaror butunlay til signaliga tayanishi) butunlay hal
-    qiladi.
-
-    Hozircha TO'LIQ ishlatilmaydi — na dialog.py (websocket oqimi), na
-    frontend (UI qadam/tugma) buni chaqirmaydi; bu shunchaki tayyor,
-    ishlaydigan backend funksiyasi, keyingi bosqichda ulash uchun.
-    Enrollment paytida foydalanuvchi ANIQ KIM ekanini UI orqali (masalan
-    "A, hozir 3 soniya gapiring" ko'rsatmasi bilan) o'zi tasdiqlagan
-    bo'ladi — shuning uchun bu yerda til-ishonch tekshiruvi (CENTROID_
-    UPDATE_MIN_LANG_PROB) shart emas, berilgan audio to'g'ridan-to'g'ri
-    "founding" namuna sifatida qabul qilinadi."""
-    embedding = _embed(session["embedding_model"], wav)
-    with session["lock"]:
-        session["voices"][speaker] = {
-            "founding_embedding": embedding,
-            "embeddings": collections.deque(maxlen=CENTROID_BUFFER_SIZE),
-            "centroid": embedding,
-        }
-    logger.info(f"[SPK][ENROLL] {speaker!r} uchun ovoz profili enrollment orqali tashkil topdi")
-
-
-def apply_speaker_correction(session, wav: np.ndarray, sample_rate: int, speaker: str) -> None:
-    """DIALOG_PLAN.md 4-bosqich: har bir bubble'dagi "spikerni almashtirish"
-    tugmasi uchun — foydalanuvchi "bu A emas, B edi" deb TUZATGANDA
-    chaqiriladi (dialog.py, `correct_speaker` action). Foydalanuvchining
-    o'zi tasdiqlagani — identify_speaker()dagi til/ovoz balli yoki
-    CENTROID_UPDATE_MIN_LANG_PROB tekshiruvidan HAM ishonchli signal,
-    shuning uchun enroll_speaker() kabi, hech qanday ishonch chegarasi
-    tekshirilmasdan, embedding to'g'ridan-to'g'ri TO'G'RI spikerning
-    markaziga qo'shiladi.
-
-    Eski (noto'g'ri) spikerning markazidan bu namunani olib tashlash
-    amalga oshirilmaydi (qaysi namuna ekanini qidirib topish/pop qilish
-    keraksiz murakkablik qo'shardi) — bu YETARLI, chunki markaz so'nggi
-    CENTROID_BUFFER_SIZE namunaning o'rtachasi, bitta noto'g'ri namunaning
-    ta'siri keyingi to'g'ri namunalar bilan tezda suyultiriladi."""
+def apply_speaker_correction(
+    session, wav: np.ndarray, sample_rate: int, seqs: list[int], old_speaker, target_speaker
+) -> dict:
     trimmed = _trim_trailing_silence(wav, sample_rate)
     duration_s = len(trimmed) / sample_rate
     original_duration_s = len(wav) / sample_rate
     if trimmed.size > 0 and duration_s < MIN_TRIMMED_DURATION_S and duration_s < original_duration_s:
         trimmed = wav
         duration_s = original_duration_s
-    if duration_s < MIN_TRIMMED_DURATION_S:
-        logger.info(
-            f"[SPK][CORRECT] audio juda qisqa ({duration_s:.2f}s) — {speaker!r} markazi yangilanmadi"
-        )
-        return
+
+    primary_seq = seqs[0]
 
     with session["lock"]:
-        embedding = _embed(session["embedding_model"], trimmed)
-        profile = session["voices"].get(speaker)
-        if profile is None:
-            session["voices"][speaker] = {
-                "founding_embedding": embedding,
-                "embeddings": collections.deque(maxlen=CENTROID_BUFFER_SIZE),
-                "centroid": embedding,
-            }
-        else:
-            profile["embeddings"].append(embedding)
-            _recompute_voice_centroid(profile)
-    logger.info(f"[SPK][CORRECT] {speaker!r} markazi foydalanuvchi tuzatishi orqali yangilandi")
+        removed_speaker = None
+
+        seqs_set = set(seqs)
+        session["unknown_buffer"] = [
+            e for e in session["unknown_buffer"] if e["seq"] not in seqs_set
+        ]
+
+        old_profile = session["speakers"].get(old_speaker)
+        moved_protos: list[dict] = []
+        if old_profile is not None:
+            moved_protos = _pop_prototypes_by_seqs(old_profile, seqs)
+            if not old_profile["prototypes"]:
+                del session["speakers"][old_speaker]
+                removed_speaker = old_speaker
+                if session["last_speaker"] == old_speaker:
+                    session["last_speaker"] = None
+
+        if target_speaker == "new":
+            target_speaker = session["next_id"]
+            session["next_id"] += 1
+
+        if not moved_protos and duration_s >= MIN_TRIMMED_DURATION_S:
+            moved_protos = [{"seq": primary_seq, "embedding": _embed(trimmed, sample_rate)}]
+
+        if moved_protos:
+            profile = session["speakers"].get(target_speaker)
+            if profile is None:
+                session["speakers"][target_speaker] = {"prototypes": []}
+                profile = session["speakers"][target_speaker]
+            for proto in moved_protos:
+                _add_prototype(profile, proto["embedding"], proto["seq"])
+        elif target_speaker not in session["speakers"]:
+            session["speakers"][target_speaker] = {"prototypes": []}
+
+        session["last_speaker"] = target_speaker
+
+        merges = _check_and_merge(session)
+        target_speaker = _apply_remap(target_speaker, merges)
+
+    logger.info(
+        f"[SPK][CORRECT] seqs={seqs} {old_speaker} -> {target_speaker}"
+        + (f" (speaker={removed_speaker} prototip qolmagani uchun o'chirildi)" if removed_speaker is not None else "")
+    )
+    return {"speaker": target_speaker, "removed_speaker": removed_speaker, "merges": merges}
+
+
+def remove_turn_prototype(session, speaker_id, seqs: list[int]) -> dict:
+    with session["lock"]:
+        removed_speaker = None
+        profile = session["speakers"].get(speaker_id)
+        if profile is not None:
+            popped = _pop_prototypes_by_seqs(profile, seqs)
+            if popped and not profile["prototypes"]:
+                del session["speakers"][speaker_id]
+                removed_speaker = speaker_id
+                if session["last_speaker"] == speaker_id:
+                    session["last_speaker"] = None
+
+        merges = _check_and_merge(session)
+
+    if removed_speaker is not None:
+        logger.info(
+            f"[SPK][DELETE] speaker={speaker_id} profili o'chirildi "
+            f"(turn seqs={seqs} o'chirilgandan keyin prototip qolmadi)"
+        )
+    return {"removed_speaker": removed_speaker, "merges": merges}
+
+
+def merge_speakers_manual(session, from_speaker, into_speaker) -> dict:
+    with session["lock"]:
+        if from_speaker == into_speaker:
+            return {"merged": False, "merges": []}
+        from_profile = session["speakers"].get(from_speaker)
+        into_profile = session["speakers"].get(into_speaker)
+        if from_profile is None or into_profile is None:
+            return {"merged": False, "merges": []}
+
+        _merge_profile_into(into_profile, from_profile)
+        del session["speakers"][from_speaker]
+        if session["last_speaker"] == from_speaker:
+            session["last_speaker"] = into_speaker
+
+        chain_merges = _check_and_merge(session)
+
+    final_into = _apply_remap(into_speaker, chain_merges)
+    logger.info(f"[SPK][MERGE] reason=user from={from_speaker} into={final_into}")
+    return {"merged": True, "merges": [(from_speaker, into_speaker, 1.0)] + chain_merges}

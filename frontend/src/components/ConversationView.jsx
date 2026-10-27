@@ -3,19 +3,19 @@ import MicButton from "./MicButton";
 import LanguageSelector from "./LanguageSelector";
 import TranscriptLine from "./TranscriptLine";
 import DialogSessionView from "./DialogSessionView";
+import ErrorBoundary from "./ErrorBoundary";
 import { usePlayAudio } from "../hooks/usePlayAudio";
 import { useLiveTranscription } from "../hooks/useLiveTranscription";
 import { translateText, speakText } from "../services/api";
 
 export default function ConversationView({ mode, onBack }) {
-  // `mode` is fixed for the lifetime of a mounted instance — App.jsx only
-  // renders ConversationView after a mode is picked and unmounts it on
-  // "back", so it never changes across re-renders of the same instance.
-  // This early return (before any hooks below) is therefore safe, even
-  // though the lint rule can't verify that invariant statically.
   /* eslint-disable react-hooks/rules-of-hooks */
   if (mode === "dialog") {
-    return <DialogSessionView onBack={onBack} />;
+    return (
+      <ErrorBoundary>
+        <DialogSessionView onBack={onBack} />
+      </ErrorBoundary>
+    );
   }
 
   const [sourceLang, setSourceLang] = useState("en");

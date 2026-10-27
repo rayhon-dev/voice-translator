@@ -2,29 +2,44 @@
 
 A real-time speech translation app with two modes:
 
-- **Solo mode** — one person speaks, their speech is transcribed live and translated into a target language.
-- **Dialog mode** — two people have a conversation; the app automatically detects who is speaking, transcribes their turn, and translates it into the other person's language.
+- **Solo mode** — one person speaks; their speech is transcribed live and translated into a target language.
+- **Dialog mode** — a conversation between two or more people. The app detects who is speaking (no voice enrollment needed), transcribes each turn, and translates it into the other language (English ⇄ Russian).
 
 ## Tech stack
 
-- **Backend:** FastAPI (Python), served over both REST and WebSocket endpoints.
-- **Frontend:** React + Vite, using the browser's `MediaRecorder` and Web Audio API (`AnalyserNode`) for microphone capture and voice-activity detection.
-- **Containerization:** Docker + Docker Compose, with NVIDIA GPU passthrough (tested under WSL2).
+- **Backend:** FastAPI (Python), REST + WebSocket endpoints.
+- **Frontend:** React + Vite. Microphone audio is captured with an `AudioWorklet` as raw 16 kHz PCM; voice activity is detected in the browser with Silero VAD (`@ricky0123/vad-web`), with an energy-based fallback.
+- **Containerization:** Docker + Docker Compose with NVIDIA GPU passthrough (tested under WSL2).
 - **Models:**
-  - **Speech-to-text:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (`medium` size, float16, CUDA).
-  - **Translation:** [`facebook/nllb-200-distilled-600M`](https://huggingface.co/facebook/nllb-200-distilled-600M) (NLLB-200).
-  - **Text-to-speech:** [`facebook/mms-tts-*`](https://huggingface.co/facebook/mms-tts) (one model per target language).
-  - **Speaker identification:** [Resemblyzer](https://github.com/resemble-ai/Resemblyzer) (used only in Dialog mode, to tell the two speakers apart).
-- **Supported languages:** English (`en`), Uzbek (`uz`), Korean (`ko`), Russian (`ru`) — for both speech recognition and translation/text-to-speech. Whisper (`faster-whisper`, `medium`) is multilingual and transcribes in whichever of these four languages the speaker selects (it is not English-only); that selected language is then translated into whichever of the four the listener/other speaker uses.
+  - **Speech-to-text:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — `large-v3-turbo` (`deepdml/faster-whisper-large-v3-turbo-ct2`, `int8_float16`, CUDA) via `.env`; `medium` if not configured. ElevenLabs Scribe can be used instead (`STT_PROVIDER=elevenlabs`).
+  - **Translation:** [DeepL API](https://www.deepl.com/pro-api) as the primary provider, with [`facebook/nllb-200-distilled-600M`](https://huggingface.co/facebook/nllb-200-distilled-600M) as an automatic local fallback.
+  - **Text-to-speech:** [`facebook/mms-tts-*`](https://huggingface.co/facebook/mms-tts) (one model per language).
+  - **Speaker identification:** [`pyannote/wespeaker-voxceleb-resnet34-LM`](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) voice embeddings on GPU, with `speechbrain/spkrec-ecapa-voxceleb` as a fallback.
+- **Languages:** Dialog mode works with English (`en`) and Russian (`ru`). Solo mode supports English, Russian and Korean (`ko`).
 
 ## Requirements
 
-- Docker and Docker Compose (Compose v2 syntax — no `version:` key needed).
-- An NVIDIA GPU with `nvidia-container-toolkit` installed (or GPU passthrough enabled under WSL2 on Windows).
-- **VRAM:** the app has been developed and tested on an **RTX 4050 with 6GB VRAM**, running Whisper (medium), NLLB-200-distilled-600M, four MMS-TTS models, and Resemblyzer concurrently. Treat ~6GB as the practical minimum; more headroom is safer if you plan to run other GPU workloads at the same time.
-- A working microphone in the browser you use to open the app.
+- Docker and Docker Compose (Compose v2), **or** Python 3.10 + Node.js for running locally.
+- An NVIDIA GPU with `nvidia-container-toolkit` (or GPU passthrough under WSL2).
+- **VRAM:** developed and tested on an **RTX 4050 (6 GB)** running Whisper, NLLB-600M, MMS-TTS and the speaker-embedding model together. Treat ~6 GB as the practical minimum.
+- A DeepL API key (the free tier is enough). Without it, translation falls back to NLLB.
+- A working microphone in the browser.
+
+## Configuration (`backend/.env`)
+
+```env
+DEEPL_API_KEY=...                 # DeepL translation (primary)
+MT_PROVIDER=deepl                 # deepl | nllb
+WHISPER_MODEL_SIZE=deepdml/faster-whisper-large-v3-turbo-ct2
+WHISPER_COMPUTE_TYPE=int8_float16
+STT_PROVIDER=whisper              # whisper | elevenlabs
+ELEVENLABS_API_KEY=...            # only for STT_PROVIDER=elevenlabs
+HF_TOKEN=...                      # Hugging Face token, if the pyannote model requires it
+```
 
 ## Installation and running
+
+**With Docker:**
 
 ```bash
 git clone <this-repo-url>
@@ -32,100 +47,119 @@ cd voice-translator
 docker compose up --build
 ```
 
+**Locally (development):**
+
+```bash
+cd backend
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+venv/bin/uvicorn app.main:app --port 8000
+```
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
 - Backend: `http://localhost:8000`
 - Frontend: `http://localhost:5173`
 
-**First run note:** the backend downloads and caches all models (Whisper, NLLB, MMS-TTS, Resemblyzer) from Hugging Face on first startup — this can take several minutes and roughly 2.5GB of disk space. Downloaded weights are cached in the `hf-cache` Docker volume, so subsequent restarts only need to *load* the models (not re-download), which still takes on the order of a minute while the GPU warms up. The backend's `/` health check has a 600-second start period specifically to tolerate this on first boot.
+**First run note:** the backend downloads and caches all models from Hugging Face on first start, which can take several minutes. Every start then loads the models onto the GPU before accepting requests (about a minute); wait for `All models ready` in the backend log before opening the app.
 
 ## Solo mode
 
-Solo mode is for one person translating their own speech.
-
-1. The frontend opens a WebSocket to **`/ws/transcribe`** (`backend/app/routers/live_transcribe.py`), passing the spoken language as a query parameter.
-2. The browser (`frontend/src/hooks/useLiveTranscription.js`) records continuously with a single `MediaRecorder`, and every second sends the backend the full audio recorded so far. The backend re-transcribes that growing clip on each poll (`DIALOG_PROCESS_INTERVAL`, see below) and streams the text back, so a live (partial) transcription is shown while you're still talking.
-3. When you stop recording, the complete clip is sent one final time, the backend transcribes it in full, and that result is used as the final transcription before the socket closes.
-4. The resulting text is sent to `POST /translate` (`backend/app/routers/translate.py`) to get the translation, and optionally to `POST /speak` (`backend/app/routers/speak.py`) to synthesize and play back spoken audio in the target language.
+1. The frontend opens a WebSocket to **`/ws/transcribe`** (`backend/app/routers/live_transcribe.py`) with the spoken language.
+2. `frontend/src/hooks/useLiveTranscription.js` records continuously and periodically sends the audio recorded so far; the backend re-transcribes it and streams back a live partial transcript.
+3. When recording stops, the full clip is transcribed one final time.
+4. The text is translated with `POST /translate` and can be played back with `POST /speak`.
 
 ## Dialog mode
 
-Dialog mode is for a two-person conversation, connecting to **`/ws/dialog`** (`backend/app/routers/dialog.py`).
+Dialog mode connects to **`/ws/dialog`** (`backend/app/routers/dialog.py`).
 
-1. **Enrollment:** each of the two speakers, in turn, picks their spoken language and records a short (~4 second) voice sample. The backend (`backend/app/models/speaker_id.py`) builds a voice embedding (via Resemblyzer) for each speaker from that sample.
-2. **Listening:** once both speakers are enrolled, the app moves into continuous listening. The frontend uses the Web Audio API (`AudioContext` + `AnalyserNode`) to measure microphone volume (RMS) roughly 10 times a second — this is a **client-side voice-activity detector (VAD)**. It requires no server round-trip to know whether someone is currently speaking.
-3. **Turn detection:** when volume crosses the speech threshold, the frontend starts a single continuous `MediaRecorder` recording for that turn. When volume stays below the threshold for long enough (silence), the recorder is stopped and the complete audio blob for that turn is sent to the backend in one piece — this avoids the audio-quality problems that come from stitching together many small, independently-encoded recordings.
-4. **Per-turn processing (backend):** the backend decodes the full turn, checks it isn't too short (likely noise), identifies which of the two enrolled speakers it best matches (Resemblyzer), transcribes it (faster-whisper) in that speaker's language, and translates it (NLLB) into the other speaker's language. The result is pushed back over the WebSocket and rendered as a chat bubble; either side's translated text can also be played back as speech via `POST /speak`.
+1. **Turn detection (browser, `useDialogSession.js`):** Silero VAD decides when someone is speaking. A turn ends after a pause of `SILENCE_DURATION_MS`; long continuous speech is split at the first short pause after `CHUNK_SOFT_CUT_MIN_S`. Each turn starts from the actual beginning of speech (pre-roll / look-back buffer), and a turn is cut where the silence begins, so the first word of the next sentence is never lost. A relative "near-field" check ignores distant background voices.
+2. **Segmentation (`segmenter.py`):** a turn that contains two different voices is split by comparing voice embeddings; splits that turn out to be the same known speaker are merged back.
+3. **Language detection and transcription (`stt.py`):** Whisper's language-ID is restricted to the two session languages. Leading silence is trimmed before detection, related languages (Ukrainian, Polish, Bulgarian, …) count toward Russian, and ambiguous turns are decoded in both languages so the more confident result wins. Speech in other languages (e.g. Uzbek, Korean) is rejected instead of being mistranslated. Low-confidence hallucinations are filtered out.
+4. **Speaker identification (`speaker_diart.py`):** each turn's voice embedding is compared with the known speakers' voice prototypes. A new voice gets its own speaker number once a second turn confirms it (until then it shows as "Aniqlanmoqda…"); short turns fall back to the most recent speaker when the voice clearly matches.
+5. **Translation and display:** consecutive turns of the same speaker are merged retroactively, translated (DeepL → NLLB fallback), and shown as chat bubbles. Each bubble can be played back as speech, assigned to another speaker, deleted, and speakers can be renamed.
 
-## Configuration constants
+## Main tuning constants
 
 | Constant | File | What it controls |
 |---|---|---|
-| `SPEECH_RMS_THRESHOLD` | `frontend/src/hooks/useDialogSession.js` | RMS volume level above which the mic is considered "speaking" (client-side VAD, Dialog mode). |
-| `SILENCE_DURATION_MS` | `frontend/src/hooks/useDialogSession.js` | How many milliseconds of continuous silence end the current turn and trigger sending it to the backend. |
-| `VAD_CHECK_INTERVAL_MS` | `frontend/src/hooks/useDialogSession.js` | How often (ms) the mic's volume is sampled while listening. |
-| `DEBUG_VAD` | `frontend/src/hooks/useDialogSession.js` | Set to `true` to log detailed VAD tick/recording events to the browser console (see Debug mode below). |
-| `ENROLL_RECORD_MS` | `frontend/src/hooks/useDialogSession.js` | Length (ms) of each speaker's enrollment recording. |
-| `NO_SPEECH_PROB_THRESHOLD` | `backend/app/models/stt.py` | Whisper segments with a "no speech" probability above this are treated as noise/silence and dropped. |
-| `AVG_LOGPROB_THRESHOLD` | `backend/app/models/stt.py` | Whisper segments with an average log-probability (confidence) below this are dropped. |
-| `RMS_SILENCE_THRESHOLD` | `backend/app/models/stt.py` | Below this RMS, an audio clip is treated as silent and transcription is skipped outright. |
-| `DEBUG_STT` | `backend/app/models/stt.py` | Set to `True` to print per-segment KEPT/DROPPED confidence details and fallback-transcript usage to the backend logs (see Debug mode below). |
-| `MIN_TURN_SECONDS` | `backend/app/config.py` | A recorded Dialog-mode turn shorter than this (seconds) is discarded as noise before transcription is even attempted. |
-| `MIN_VOICED_SECONDS` | `backend/app/models/speaker_id.py` | Minimum voiced audio (seconds) required to enroll a speaker or identify one from a turn; shorter clips are treated as unreliable. |
-| `UNKNOWN_SPEAKER_THRESHOLD` | `backend/app/config.py` | Minimum Resemblyzer similarity score to attribute a turn to an enrolled speaker; below this, the turn matches neither A nor B and is skipped. |
-| `DIALOG_PROCESS_INTERVAL` | `backend/app/config.py` | Poll interval (seconds) used by Solo mode's live-transcription loop (`/ws/transcribe`). |
-| `WHISPER_MODEL_SIZE` / `WHISPER_DEVICE` / `WHISPER_COMPUTE_TYPE` | `backend/app/config.py` | Which faster-whisper model size, device, and precision to load. |
-| `TRANSLATION_MODEL_NAME` | `backend/app/config.py` | Hugging Face model id used for translation (NLLB-200). |
-| `TTS_MODEL_NAMES` | `backend/app/config.py` | Hugging Face model id per language used for text-to-speech. |
+| `SILENCE_DURATION_MS` | `frontend/src/hooks/useDialogSession.js` | Pause length (ms) that ends a turn. |
+| `PRE_ROLL_MS` | `frontend/src/hooks/useDialogSession.js` | Audio kept from before the detected start of speech. |
+| `CHUNK_SOFT_CUT_MIN_S` / `SOFT_CUT_SILENCE_MS` / `HARD_CUT_MAX_MS` | `frontend/src/hooks/useDialogSession.js` | How long continuous speech is split into chunks. |
+| `VAD_POS_THRESHOLD` | `frontend/src/hooks/useDialogSession.js` | Silero speech-probability threshold. |
+| `SESSION_LANGS` | `backend/app/routers/dialog.py` | The two Dialog mode languages. |
+| `MIN_PAIR_MASS` / `MIN_PAIR_MASS_SHORT` | `backend/app/models/stt.py` | Minimum language-ID confidence for long / short turns. |
+| `LANG_FAMILY` | `backend/app/models/stt.py` | Related languages counted toward a session language. |
+| `SPK_ACCEPT` / `SPK_NEW` | `backend/app/models/speaker_diart.py` | Voice-similarity thresholds for matching a known speaker / opening a new one. |
+| `SPK_NEW_CONFIRM_TURNS` | `backend/app/models/speaker_diart.py` | Turns needed to confirm a new speaker. |
+| `MIN_TURN_SECONDS` | `backend/app/config.py` | Turns shorter than this are discarded as noise. |
+
+Most backend thresholds can also be overridden with environment variables of the same name.
 
 ## Project structure
 
 ```
 backend/
   app/
-    main.py                 # FastAPI app, router registration, model warmup on startup
-    config.py                # Shared configuration constants
+    main.py                 # FastAPI app, routers, model warmup on startup
+    config.py               # Shared configuration
+    gpu_lock.py             # Serializes GPU work between models
     models/
-      stt.py                 # faster-whisper wrapper (transcription, segment filtering)
-      translator.py          # NLLB-200 wrapper (translation)
-      tts.py                  # MMS-TTS wrapper (speech synthesis, uz/ko/ru transliteration helpers)
-      speaker_id.py           # Resemblyzer wrapper (enrollment + speaker identification)
+      stt.py                # Whisper / ElevenLabs STT, language gating, hallucination filters
+      speaker_diart.py      # Voice embeddings and speaker identification
+      segmenter.py          # Splits a turn by speaker change
+      translator.py         # DeepL + NLLB fallback
+      tts.py                # MMS-TTS speech synthesis
     routers/
-      dialog.py               # WebSocket /ws/dialog — Dialog mode (enrollment + turn-based conversation)
-      live_transcribe.py       # WebSocket /ws/transcribe — Solo mode (live transcription)
-      translate.py             # POST /translate
-      speak.py                  # POST /speak (text-to-speech)
+      dialog.py             # WebSocket /ws/dialog — Dialog mode
+      live_transcribe.py    # WebSocket /ws/transcribe — Solo mode
+      translate.py          # POST /translate
+      speak.py              # POST /speak
+  tools/
+    test_dialog_noise_regressions.py  # Regression tests (no models needed)
+    test_phantom_phrase.py            # Hallucination-phrase filter check
+    eval_dialog.py                    # Evaluates speaker/language accuracy on saved debug audio
+    mt_bench.py                       # Compares DeepL and NLLB translations
   Dockerfile
   requirements.txt
 
 frontend/
   src/
-    App.jsx                    # Mode selection (Solo vs Dialog)
-    main.jsx
+    App.jsx
     components/
-      ModeSelector.jsx          # Solo / Dialog picker
-      ConversationView.jsx       # Solo mode UI
-      DialogSessionView.jsx       # Dialog mode UI
-      LanguageSelector.jsx
-      MicButton.jsx
-      TranscriptLine.jsx           # Solo mode transcript row
-      DialogBubble.jsx              # Dialog mode chat bubble
-      AnimatedBackground.jsx
+      DialogSessionView.jsx  # Dialog mode UI
+      DialogBubble.jsx       # Dialog chat bubble (play, rename, reassign, delete)
+      ConversationView.jsx   # Solo mode UI
+      ...
     hooks/
-      useLiveTranscription.js       # Solo mode: mic capture + /ws/transcribe client
-      useDialogSession.js            # Dialog mode: mic capture, client-side VAD, /ws/dialog client
-      usePlayAudio.js                  # Play/pause toggling for a synthesized-speech audio blob
+      useDialogSession.js    # Dialog mode: audio capture, VAD, turn logic, /ws/dialog client
+      useLiveTranscription.js
+      usePlayAudio.js
+    lib/
+      sileroVad.js           # Silero VAD model loader
     services/
-      api.js                          # REST calls: /translate, /speak
-  Dockerfile
-  package.json
+      api.js                 # REST calls: /translate, /speak
 
 docker-compose.yml
 ```
 
-## Debug mode
+## Testing
 
-Both the frontend VAD logic and the backend transcription filter support optional, verbose debug logging that is off by default.
+```bash
+cd backend
+venv/bin/python -m unittest tools.test_dialog_noise_regressions
+venv/bin/python tools/test_phantom_phrase.py
+```
 
-- **Frontend (Dialog mode VAD):** in `frontend/src/hooks/useDialogSession.js`, set `DEBUG_VAD = true`. This logs every VAD sampling tick (RMS value, speaking/silent state, whether a turn recording is active) and every turn start/stop event to the browser's developer console, prefixed with `[VAD-DEBUG]`. Rebuild the frontend (`docker compose build frontend && docker compose up -d frontend`) for the change to take effect.
-- **Backend (transcription filtering):** in `backend/app/models/stt.py`, set `DEBUG_STT = True`. This prints, for every Whisper segment, whether it was kept or dropped and why (`no_speech_prob` / `avg_logprob` values), plus a note whenever the raw-transcript fallback is used because all segments were filtered out. Logs are prefixed with `[STT][DEBUG]` and visible via `docker logs voice-translator-backend-1`. Rebuild the backend for the change to take effect.
+## Debugging
 
-Remember to set both flags back to `false` / `False` before shipping, since they add non-trivial log volume.
+- **Saved audio:** with `SAVE_DEBUG_AUDIO = True` (`backend/app/config.py`), every processed turn is saved to `backend/debug_audio/` as a `.wav` with a `.json` label (speaker, language, text). Turns rejected for language are saved as `*_rejected_lang_*.wav`. The folder is cleared on every backend start.
+- **Frontend VAD:** set `DEBUG_VAD = true` in `useDialogSession.js` for detailed VAD logs in the browser console (`[VAD]` lines are always logged).
+- **Backend STT:** set `DEBUG_STT = True` in `stt.py` for per-segment keep/drop details.
+
+Turn `SAVE_DEBUG_AUDIO`, `DEBUG_VAD` and `DEBUG_STT` off for production use.

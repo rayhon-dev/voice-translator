@@ -6,10 +6,6 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.models.stt import transcribe_audio
 from app.config import DIALOG_PROCESS_INTERVAL
-import logging
-
-logger = logging.getLogger(__name__)
-
 
 router = APIRouter()
 
@@ -20,10 +16,6 @@ async def websocket_transcribe(websocket: WebSocket):
     loop = asyncio.get_running_loop()
     language = websocket.query_params.get("language", "en")
     temp_filename = f"/tmp/{uuid.uuid4()}_live.webm"
-
-    # Shared state between the receiver and processor loops
-    #   latest: the most recent audio chunk received, or None
-    #   dirty:  True when `latest` has not been transcribed yet
     state = {"latest": None, "dirty": False}
     disconnected = asyncio.Event()
 
@@ -47,11 +39,11 @@ async def websocket_transcribe(websocket: WebSocket):
 
         tag = "final" if final else "live"
         try:
-            text, _detected_lang, _lang_prob, _unsupported_language = await loop.run_in_executor(
+            text, _detected_lang, _lang_prob = await loop.run_in_executor(
                 None, transcribe_audio, temp_filename, language
             )
         except Exception as e:
-            logger.error(f"[/ws/transcribe] {tag} pass failed: {e!r}")
+            print(f"[/ws/transcribe] {tag} pass failed: {e!r}", flush=True)
             return
 
         try:
@@ -60,7 +52,7 @@ async def websocket_transcribe(websocket: WebSocket):
             pass
 
         if final:
-            logger.info(f"[/ws/transcribe] final transcription: {len(text)} chars")
+            print(f"[/ws/transcribe] final transcription: {len(text)} chars", flush=True)
 
     async def processor():
         while not disconnected.is_set():

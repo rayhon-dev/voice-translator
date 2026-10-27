@@ -10,7 +10,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-
 _models = {}
 _tokenizers = {}
 
@@ -106,16 +105,7 @@ def text_to_speech(text: str, lang: str) -> tuple[np.ndarray, int]:
 
 
 def warmup(run_inference: bool = True) -> None:
-    # XATO TUZATISHI: "en" ro'yxatda yo'q edi — bu TTS_MODEL_NAMES'dagi 4
-    # tildan BIRI bo'lsa ham, hech qachon oldindan yuklanmasdi. Natijada
-    # inglizcha audio BIRINCHI so'ralganda model "sovuq" holda (hali
-    # GPU'ga yuklanmagan) lazy-load qilinardi — bu sekin, va agar aynan
-    # shu payt GPU boshqa model (Whisper/NLLB/boshqa til) bilan band
-    # bo'lsa, xatolikka ham olib kelishi mumkin edi (speak.py bu holatda
-    # 500 qaytaradi, frontend esa buni jim yutib yuboradi — DialogSessionView.
-    # handlePlayAudio faqat console.error qiladi, foydalanuvchiga xato
-    # ko'rsatilmaydi).
-    samples = {"uz": "Salom", "ko": "안녕", "ru": "Привет", "en": "Hello"}
+    samples = {"ru": "Привет", "en": "Hello"}
     for lang, sample_text in samples.items():
         try:
             if run_inference:
