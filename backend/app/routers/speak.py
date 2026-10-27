@@ -22,11 +22,6 @@ class SpeakRequest(BaseModel):
 
 @router.post("/speak")
 def speak(request: SpeakRequest):
-    # DIALOG_PLAN.md 4-bosqich (D3): translate.py'dagi bilan bir xil sabab —
-    # text_to_speech() sinxron GPU chaqiruvi, `async def` ichida to'g'ridan-
-    # to'g'ri chaqirilsa event loop'ni bloklardi (shu payt Dialog rejimidagi
-    # WebSocket ham to'xtab qolardi). Oddiy `def` — Starlette avtomatik
-    # threadpool'ga chiqaradi.
     t0 = time.perf_counter()
 
     audio_array, sample_rate = text_to_speech(request.text, request.lang)

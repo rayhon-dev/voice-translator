@@ -1,10 +1,3 @@
-"""Tarjima sinovi — DeepL (asosiy) va NLLB-600M (zaxira) ni real muammoli
-misollarda yonma-yon solishtiradi, so'ng DeepL'ga NOTO'G'RI kalit bilan bir
-marta sinab, avtomatik NLLB'ga o'tishni tasdiqlaydi.
-
-Ishlatish (backend/ papkasidan, venv faollashtirilgan holda):
-    python tools/mt_bench.py
-"""
 import sys
 import time
 

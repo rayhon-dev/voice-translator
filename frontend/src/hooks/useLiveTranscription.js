@@ -1,15 +1,10 @@
 import { useRef, useState, useCallback } from "react";
 
-// How long to wait after sending the final blob for the backend to deliver
-// its last (most accurate) transcription before we close the socket.
 const FINAL_RESULT_GRACE_MS = 1200;
 
 export function useLiveTranscription() {
   const [liveText, setLiveText] = useState("");
 
-  // Mirror of the latest transcription text, updated synchronously in the
-  // WebSocket onmessage handler. React state (`liveText`) updates async and is
-  // captured by stale closures, so the processing flow must read this ref.
   const liveTextRef = useRef("");
 
   const wsRef = useRef(null);
@@ -85,8 +80,6 @@ export function useLiveTranscription() {
   }, []);
 
   const stop = useCallback(() => {
-    // This Promise ALWAYS resolves. Every cleanup step is guarded, and a
-    // watchdog covers the case where mediaRecorder.onstop never fires.
     return new Promise((resolve) => {
       let finished = false;
       let watchdog = null;
@@ -173,8 +166,6 @@ export function useLiveTranscription() {
 
       mediaRecorder.onstop = finish;
 
-      // Belt-and-suspenders: if onstop never fires, force cleanup anyway so
-      // the caller's `await stop()` can never hang forever.
       watchdog = setTimeout(() => {
         console.error(
           "[useLiveTranscription] mediaRecorder.onstop did not fire within timeout — forcing cleanup"

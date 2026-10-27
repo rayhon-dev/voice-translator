@@ -2,11 +2,6 @@ import time
 from contextlib import asynccontextmanager
 import logging
 
-# DIALOG_PLAN.md 4-bosqich: `print` o'rniga logging. Root logger'ni ANIQ
-# shu yerda, boshqa app.* modullar import qilinishidan OLDIN sozlash kerak —
-# aks holda ularning logger.info() chaqiruvlari uvicorn hech qanday
-# handler/level o'rnatmagan root logger orqali JIMGINA yo'qolib ketardi
-# (standart root level — WARNING).
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -20,7 +15,6 @@ from app.routers import speak, translate, live_transcribe, dialog
 from app.models import stt, translator, speaker_diart, tts
 
 logger = logging.getLogger(__name__)
-
 
 
 @asynccontextmanager

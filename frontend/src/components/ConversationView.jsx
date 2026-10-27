@@ -9,20 +9,8 @@ import { useLiveTranscription } from "../hooks/useLiveTranscription";
 import { translateText, speakText } from "../services/api";
 
 export default function ConversationView({ mode, onBack }) {
-  // `mode` is fixed for the lifetime of a mounted instance — App.jsx only
-  // renders ConversationView after a mode is picked and unmounts it on
-  // "back", so it never changes across re-renders of the same instance.
-  // This early return (before any hooks below) is therefore safe, even
-  // though the lint rule can't verify that invariant statically.
   /* eslint-disable react-hooks/rules-of-hooks */
   if (mode === "dialog") {
-    // Mentor demo'da topilgan "oq sahifa" nosozligi: Dialog rejimi (Silero
-    // VAD yuklanishi/WebSocket/AudioWorklet kabi ko'p sinxron bo'lmagan
-    // qismlarga ega) ichida kutilmagan xato chiqsa, ErrorBoundary'siz
-    // React butun daraxtni o'chirib, hech narsa ko'rsatmay qoladi. Shu
-    // sababli shu yerda alohida ErrorBoundary bilan o'raladi — xato
-    // bo'lsa foydalanuvchi tushunarli xabar va "Qayta urinish" tugmasini
-    // ko'radi, qolgan ilova (ModeSelector'ga qaytish) ishlashda davom etadi.
     return (
       <ErrorBoundary>
         <DialogSessionView onBack={onBack} />

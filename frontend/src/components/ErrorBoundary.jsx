@@ -1,11 +1,5 @@
 import { Component } from "react";
 
-// Oq (bo'sh) sahifa xatosi tuzatishi: avval DialogSessionView daraxtida
-// (yoki uning ichidagi useDialogSession.js kabi hook'larda) sodir bo'lgan
-// HAR QANDAY kutilmagan render/effekt xatosi React'ni butun daraxtni
-// o'chirib, HECH NARSA ko'rsatmasdan qoldirardi — chunki hech qanday
-// ErrorBoundary yo'q edi. React error boundary'lari FAQAT klass
-// komponent sifatida yozilishi SHART (hook ekvivalenti yo'q).
 export default class ErrorBoundary extends Component {
   constructor(props) {
     super(props);

@@ -3,9 +3,6 @@ const BAR_DELAYS_MS = [0, 30, 60, 90, 60, 30, 0];
 const MIN_HEIGHT_PX = 8;
 const MAX_HEIGHT_PX = 56;
 
-// Energiya PAST bo'lganda xira (deyarli rangsiz) binafsha, BALAND bo'lganda
-// to'liq yorqin binafshaga o'tadi — foydalanuvchi bir qarashda "eshitilyapti"
-// yoki "jim turibman"ligini, matn o'qimasdan ham, darhol sezishi uchun.
 const MUTED_RGB = [205, 194, 236];
 const VIVID_RGB = [147, 51, 234];
 
@@ -21,8 +18,6 @@ export default function AudioLevelBars({ level }) {
     <div
       className="flex items-end gap-2 h-16 px-4 py-3 rounded-2xl bg-white/50 backdrop-blur transition-shadow duration-150"
       style={{
-        // Gapirayotganda ustunchalar atrofida yengil "porlash" — darajaga
-        // qarab kuchayadi/kuchsizlanadi, jim bo'lganda butunlay yo'qoladi.
         boxShadow: isActive
           ? `0 0 ${12 + clamped * 24}px ${2 + clamped * 4}px rgba(147, 51, 234, ${0.18 + clamped * 0.32})`
           : "none",

@@ -1,9 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 
-// Spiker endi A/B emas, cheklanmagan sonli butun son ID (speaker_diart.py'dagi
-// onlayn klasterlash) — menyu/yorliq/ism uchun kerakli ma'lumot (label/rang/
-// ism) DialogSessionView.jsx'dan tayyor holda keladi. "Men" tushunchasi
-// YO'Q — joylashuv FAQAT spiker ID'ning juft-toqligiga bog'liq (`isRight`).
 export default function DialogBubble({
   originalText,
   translatedText,
@@ -66,8 +62,6 @@ export default function DialogBubble({
     setIsEditingName(false);
   };
 
-  // Tarjima: DeepL (asosiy) + NLLB-600M (zaxira) — qaysi provayder shu
-  // bubble'ni tarjima qilgani juda kichik kulrang belgi bilan ko'rsatiladi.
   const PROVIDER_LABELS = { deepl: "DeepL", nllb: "lokal" };
   const providerLabel = PROVIDER_LABELS[mtProvider];
 

@@ -5,17 +5,6 @@ import { speakText } from "../services/api";
 import DialogBubble from "./DialogBubble";
 import AudioLevelBars from "./AudioLevelBars";
 
-// Spiker endi A/B (ikki kishi) emas, cheklanmagan sonli butun son ID
-// (speaker_diart.py'dagi onlayn ovoz-klasterlash). ESKI yondashuv — rang
-// (id-1) % N bo'yicha, ya'ni SPIKER RAQAMIGA bog'langan edi: birlashtirish
-// (speakers_merged) yoki o'chirish (speaker_removed) natijasida bir xil
-// raqam boshqa odamga "tegib" qolsa, uning rangi ham noto'g'ri o'zgarib
-// ketardi. ENDI rang spiker OB'EKTIGA (uning paydo bo'lish TARTIBIGA)
-// bog'lanadi — qarang pastdagi `speakerColorIds`/`colorForSpeaker`:
-// har bir YANGI spiker birinchi marta ko'ringanda navbatdagi rang oladi
-// va shu rang (birlashtirish paytida "into" rangi saqlanib qolgan holda)
-// sessiya davomida O'ZGARMAYDI. 12 ta rang — bir-biridan aniq farq
-// qiladigan tus (hue) bo'yicha tanlangan.
 const SPEAKER_PALETTE = [
   { avatar: "bg-red-400", name: "text-red-600", dot: "bg-red-400", border: "border-red-400", light: "bg-red-50" },
   { avatar: "bg-orange-400", name: "text-orange-600", dot: "bg-orange-400", border: "border-orange-400", light: "bg-orange-50" },
@@ -35,12 +24,6 @@ function defaultSpeakerName(speakerId) {
   return `${speakerId}-spiker`;
 }
 
-// Mentor demo'da topilgan 1-muammo: backend endi ANIQ boshqa ovozli,
-// lekin yangi spiker ochish uchun ham qisqa bo'lgan bo'laklarni darhol
-// (noto'g'ri) biror spikerga "yopishtirmasdan", `speaker: null` bilan
-// "unknown" deb qaytaradi (qarang speaker_diart.py, "unknown" buferi).
-// Bunday bubble kulrang, hech qanday rangga BOG'LANMAGAN neytral
-// ko'rinishda — qarang colorForSpeaker/render pastda.
 const UNKNOWN_SPEAKER_LABEL = "Aniqlanmoqda…";
 const NEUTRAL_PALETTE = {
   avatar: "bg-gray-300",
@@ -50,13 +33,7 @@ const NEUTRAL_PALETTE = {
   light: "bg-gray-50",
 };
 
-// Pastdan shuncha pikseldan UZOQROQ bo'lsa, foydalanuvchi "o'zi yuqoriga
-// skroll qilgan" deb hisoblanadi — avtomatik skroll to'xtaydi va "Yangi
-// xabarlar" tugmasi chiqadi.
 const AUTO_SCROLL_THRESHOLD_PX = 150;
-// Mentor demo'da topilgan 5-muammo: foydalanuvchi qo'lda yuqoriga skroll
-// qilgandan keyin avtoskroll shuncha millisoniyaga to'xtaydi — shundan
-// keyin (yoki "↓ Yangi xabarlar" tugmasi bosilganda) qayta yoqiladi.
 const AUTO_SCROLL_RESUME_MS = 5000;
 
 export default function DialogSessionView({ onBack }) {
@@ -80,28 +57,11 @@ export default function DialogSessionView({ onBack }) {
   } = useDialogSession();
 
   const [audioCache, setAudioCache] = useState({});
-  // XATO TUZATISHI: ilgari TTS so'rovi muvaffaqiyatsiz bo'lganda (masalan
-  // "en" modeli hali GPU'ga yuklanmagan paytda birinchi so'rov bilan to'qnashib
-  // qolsa) handlePlayAudio buni faqat console.error qilardi — foydalanuvchi
-  // hech narsa eshitmay, SABABSIZ qolardi. Endi shu seq uchun ko'rinadigan
-  // xato belgisi chiqariladi.
   const [audioErrors, setAudioErrors] = useState({});
   const { playingId, togglePlay } = usePlayAudio();
 
-  // --- Guruh-chat qulayliklari (frontend-ONLY holat, backend'ga ta'sir
-  // qilmaydi) ---
-  // Spiker ismlari: {speakerId: customName}. Kalit yo'q bo'lsa default
-  // ("N-spiker") ishlatiladi.
   const [speakerNames, setSpeakerNames] = useState({});
 
-  // Rang HAR BIR spiker OB'EKTIGA uning paydo bo'lish TARTIBIDA
-  // tayinlanadi va bir marta tayinlangandan keyin HECH QACHON o'zgarmaydi
-  // — tayinlovning o'zi (`speakerColorOrder`: {speakerId: order}) endi
-  // useDialogSession.js'da, FAQAT yangi spiker ID birinchi "turn" xabarida
-  // ko'ringanda, bitta joyda yuritiladi (qarang undagi izoh). Bu yerda
-  // FAQAT shu order'ni palitra indeksiga aylantiramiz — o'chirish
-  // (delete_turn) yoki birlashtirish (speakers_merged) HECH QANDAY qayta
-  // hisoblashga olib kelmaydi, demak qolgan spikerlarning rangi siljimaydi.
   const colorForSpeaker = useCallback(
     (speakerId) =>
       speakerId === null
@@ -111,10 +71,6 @@ export default function DialogSessionView({ onBack }) {
   );
 
   const knownSpeakers = useMemo(() => {
-    // Placeholder bubble'lar (qarang sendTurnAudio) spiker bilan hali
-    // bog'lanmagan (speaker=null) — "spikerni almashtirish" menyusiga
-    // noto'g'ri "null-spiker" yozuvi sifatida kirib ketmasligi uchun
-    // bu yerda chiqarib tashlanadi.
     const ids = [...new Set(messages.map((m) => m.speaker))]
       .filter((id) => id !== null)
       .sort((a, b) => a - b);
@@ -136,20 +92,11 @@ export default function DialogSessionView({ onBack }) {
         }
         return next;
       });
-      // Backend'ga FAQAT diagnostika/log maqsadida yuboriladi — klasterlash
-      // mantig'iga ta'sir qilmaydi (qarang dialog.py, rename_speaker action).
       renameSpeaker(speakerId, newName || defaultSpeakerName(speakerId));
     },
     [renameSpeaker]
   );
 
-  // Bir xil ism = bitta odam: foydalanuvchi ismni boshqa MAVJUD spikerning
-  // (bo'sh joylarsiz, katta-kichik harfga e'tibor bermasdan solishtirilgan)
-  // ismi bilan bir xil qilib tahrirlasa — ikki alohida spiker bitta odam
-  // bo'lib qolishiga yo'l qo'ymaslik uchun avval tasdiqlash so'raladi
-  // (pastdagi `pendingRename` modal). Tasdiqlanmaguncha ism O'ZGARMAYDI
-  // (applyRename chaqirilmaydi, shuning uchun bubble eski ismini
-  // ko'rsatishda davom etadi).
   const [pendingRename, setPendingRename] = useState(null); // {speakerId, newName, conflictId, conflictName} | null
 
   const handleRename = useCallback(
@@ -186,13 +133,6 @@ export default function DialogSessionView({ onBack }) {
     setPendingRename(null);
   }, []);
 
-  // Backend'dan kelgan "speakers_merged"/"speaker_removed" voqealarini
-  // (useDialogSession.js'dagi speakerEvents, append-only ro'yxat) kuzatib,
-  // LOKAL speakerNames xaritasini mos ravishda yangilaydi — bu, server
-  // tomonidan allaqachon SODIR BO'LGAN tashqi hodisaga REAKSIYA (klassik,
-  // to'g'ri effekt holati — render vaqtida hisoblab bo'lmaydigan narsa).
-  // `processedEventCountRef` — har safar FAQAT yangi (hali ishlanmagan)
-  // voqealarni qayta ishlash uchun.
   const processedEventCountRef = useRef(0);
   useEffect(() => {
     if (processedEventCountRef.current >= speakerEvents.length) return;
@@ -209,8 +149,6 @@ export default function DialogSessionView({ onBack }) {
         setSpeakerNames((prev) => {
           if (!(ev.from in prev)) return prev;
           const next = { ...prev };
-          // "from"ning ismi FAQAT "into" hali default nomda bo'lsa
-          // (ya'ni xaritada o'z yozuvi yo'q bo'lsa) meros oladi.
           if (!(ev.into in prev)) {
             next[ev.into] = next[ev.from];
           }
@@ -222,25 +160,11 @@ export default function DialogSessionView({ onBack }) {
     processedEventCountRef.current = speakerEvents.length;
   }, [speakerEvents]);
 
-  // --- Avtomatik skroll (3-band, mentor demo'da topilgan 5-muammo) ---
-  // Mentor demo'dagi eski xatti-harakat: `onScroll` HAR safar (shu
-  // jumladan dastur O'ZI chaqirgan `scrollTo()` paytida ham) ishga
-  // tushib, foydalanuvchi hech narsa qilmagan bo'lsa ham auto-skrollni
-  // "sinab" to'xtatib qo'yardi — bu yerda endi dastur o'zi boshlagan
-  // skroll alohida bayroq (`programmaticScrollRef`) bilan ANIQ ajratiladi
-  // va onScroll shu paytda butunlay e'tiborsiz qoldiriladi.
   const scrollContainerRef = useRef(null);
-  // Ref, state EMAS — har scroll-hodisasida o'zgaradi, re-render shart
-  // emas (faqat keyingi auto-skroll qarori uchun o'qiladi).
   const autoFollowRef = useRef(true);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
-  // `scrollToBottom()`ning O'ZI chaqirgan `scroll` hodisasini foydalanuvchi
-  // skrolli deb hisoblamaslik uchun — qarang handleUserScroll.
   const programmaticScrollRef = useRef(false);
   const programmaticScrollTimeoutRef = useRef(null);
-  // Foydalanuvchi qo'lda yuqoriga skroll qilgandan keyin avtoskroll shuncha
-  // millisoniyaga to'xtaydi (keyin — yoki "Yangi xabarlar" tugmasi
-  // bosilganda — avtomatik qayta yoqiladi).
   const resumeTimeoutRef = useRef(null);
 
   const scrollToBottom = useCallback((behavior = "smooth") => {
@@ -251,9 +175,6 @@ export default function DialogSessionView({ onBack }) {
     if (programmaticScrollTimeoutRef.current) {
       clearTimeout(programmaticScrollTimeoutRef.current);
     }
-    // Silliq skroll animatsiyasi tugaguncha (taxminan) kutiladi — shu
-    // oraliqdagi barcha `scroll` hodisalari dastur o'zi chaqirgani deb
-    // belgilanadi.
     programmaticScrollTimeoutRef.current = setTimeout(() => {
       programmaticScrollRef.current = false;
     }, 600);
@@ -281,10 +202,6 @@ export default function DialogSessionView({ onBack }) {
     }, AUTO_SCROLL_RESUME_MS);
   }, [resumeAutoFollow]);
 
-  // `onScroll` — wheel, touch va scrollbar-sudrash HAMMASI shu bitta
-  // native hodisaga olib keladi, shuning uchun alohida listener kerak
-  // emas; FAQAT dastur o'zi chaqirgan skrollni (`programmaticScrollRef`)
-  // ajratib tashlash muhim.
   const handleUserScroll = useCallback(() => {
     if (programmaticScrollRef.current) return;
     const el = scrollContainerRef.current;
@@ -300,10 +217,6 @@ export default function DialogSessionView({ onBack }) {
     }
   }, [pauseAutoFollow, resumeAutoFollow]);
 
-  // Yangi bubble/placeholder, natija yangilanishi ("…" haqiqiy bubble
-  // bilan almashishi) yoki "Yozmoqda…" ko'rsatkichi — FAQAT foydalanuvchi
-  // hozir pastda (auto-follow yoqilgan) bo'lsa — pastga silliq skroll
-  // qilinadi.
   useEffect(() => {
     if (!autoFollowRef.current) return;
     scrollToBottom();
@@ -320,13 +233,6 @@ export default function DialogSessionView({ onBack }) {
     resumeAutoFollow();
   }, [resumeAutoFollow]);
 
-  // DIALOG_PLAN.md 3-bosqich (C5): TTS (tarjima ovozi) ijro etilayotganda
-  // mikrofon VAD'ini to'xtatamiz — aks holda karnaydan chiqayotgan ovoz
-  // mikrofon orqali qayta eshitilib, YANGI turn sifatida yuborilib ketishi
-  // mumkin edi. `playingId` — usePlayAudio() dagi reaktiv holat: biror
-  // bubble ijro etilayotganda shu bubble'ning `seq`'iga teng, aks holda
-  // `null`. shuning uchun null<->non-null o'tishi aynan "TTS boshlandi"/
-  // "TTS tugadi" voqeasiga to'g'ri keladi.
   useEffect(() => {
     if (playingId !== null) {
       pauseMic("tts_playback");
@@ -433,10 +339,6 @@ export default function DialogSessionView({ onBack }) {
         ) : (
           <>
             <AudioLevelBars level={audioLevel} />
-            {/* DIALOG_PLAN.md 4-bosqich: "Tinglanmoqda / Qayta ishlanmoqda…"
-                ko'rsatkichi — STT/tarjima bir necha soniya cho'zilishi
-                mumkin, shu payt hech narsa ko'rinmasa foydalanuvchi
-                "ishlamayapti" deb o'ylab qolishi mumkin edi. */}
             <p className="text-xs text-gray-400">
               {isProcessing ? "Qayta ishlanmoqda…" : "Tinglanmoqda…"}
             </p>
@@ -452,10 +354,6 @@ export default function DialogSessionView({ onBack }) {
         >
           <div className="w-full max-w-3xl mx-auto flex flex-col px-3 sm:px-10 py-4 sm:py-8">
             {messages.map((msg, idx) => {
-              // Mentor demo'da topilgan 4-muammo: bo'lak backendga
-              // yuborilgani bilan (natija kelmasdan OLDIN) paydo bo'ladigan
-              // spikersiz, kulrang "…" placeholder — qarang
-              // useDialogSession.js'dagi sendTurnAudio/handleServerMessage.
               if (msg.placeholder) {
                 return (
                   <div key={`ph-${msg.clientSeq}`} className="flex justify-start w-full mt-4">
@@ -467,23 +365,12 @@ export default function DialogSessionView({ onBack }) {
               }
 
               const prev = messages[idx - 1];
-              // Guruhlashni o'chirish: ENDI faqat BO'SHLIQ (margin)ga ta'sir
-              // qiladi — avatar/ism/tugmalar HAR BIR bubble'da (grouped
-              // bo'lsa ham) ko'rsatiladi, qarang DialogBubble.jsx.
               const grouped = Boolean(prev && !prev.placeholder && prev.speaker === msg.speaker);
               const palette = colorForSpeaker(msg.speaker);
-              // Mentor demo'da topilgan 1-muammo: speaker=null ("unknown")
-              // uchun hali hech qanday barqaror identifikatsiya yo'q —
-              // doimiy ism/avatar/joylashuv o'rniga neytral "Aniqlanmoqda…"
-              // yorlig'i ko'rsatiladi (qarang NEUTRAL_PALETTE yuqorida).
               const isUnknown = msg.speaker === null;
               const resolvedName = isUnknown
                 ? UNKNOWN_SPEAKER_LABEL
                 : speakerNames[msg.speaker] || defaultSpeakerName(msg.speaker);
-              // Toq raqamli spikerlar (1, 3, 5...) chapda, juft raqamlilar
-              // (2, 4...) o'ngda — "Men"/"Bu menman" tushunchasi YO'Q, bu
-              // faqat spiker ID'ning juft-toqligiga bog'liq, doimiy
-              // joylashuv. "unknown" doim chapda (hali spikerga bog'lanmagan).
               const isRight = isUnknown ? false : Number(msg.speaker) % 2 === 0;
               return (
                 <DialogBubble
@@ -511,8 +398,6 @@ export default function DialogSessionView({ onBack }) {
                   onPlayAudio={() => handlePlayAudio(msg.seq, msg.translation, msg.targetLang)}
                   onSelectSpeaker={(targetSpeaker) => correctSpeaker(msg.seq, targetSpeaker)}
                   onRename={(newName) => {
-                    // "unknown" bubble hali barqaror spiker ID'ga ega
-                    // emas — ism tahrirlash ma'nosiz (qarang isUnknown).
                     if (isUnknown) return;
                     handleRename(msg.speaker, newName);
                   }}
@@ -533,8 +418,6 @@ export default function DialogSessionView({ onBack }) {
         ) : null}
       </div>
 
-      {/* Bir xil ism = bitta odam: tasdiqlash oynasi — qarang handleRename
-          izohi yuqorida. */}
       {pendingRename ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-6">
           <div className="max-w-sm w-full rounded-3xl bg-white p-6 shadow-xl text-center">

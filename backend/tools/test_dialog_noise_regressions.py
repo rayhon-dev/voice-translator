@@ -190,8 +190,6 @@ class NoiseRegressions(unittest.TestCase):
         self.assertEqual(turn(3, 1.792)["speaker"], 1)
         self.assertEqual(turn(4, 2.5)["speaker"], 1)
         current[0] = np.array([0., 1., 0.])
-        # A short new voice waits; a clean full turn creates speaker 2 and
-        # assigns the earlier short utterance to the same numbered speaker.
         self.assertIsNone(turn(5, 1.2, ratio=1.)["speaker"])
         result = turn(6, 3., ratio=1.)
         self.assertEqual(result["speaker"], 2)
@@ -229,10 +227,6 @@ class NoiseRegressions(unittest.TestCase):
         self.assertEqual([e["seq"] for e in session["unknown_buffer"]], [6])
 
     def test_speaker_tie_marks_uncertain_without_enrollment(self):
-        """Fix B: sims={1: 0.58, 3: 0.58} (a real tie) must NOT be silently
-        accepted as speaker 1 — the margin between the top two candidates
-        is below SPK_MIN_MARGIN, so the result is uncertain and no new
-        prototype is added to either profile."""
         import threading
         scope = dict(
             np=np, time=__import__("time"), logger=logging.getLogger("test"),
@@ -253,9 +247,6 @@ class NoiseRegressions(unittest.TestCase):
         functions("speaker_diart.py", {"identify_speaker", "_new_speaker_evidence",
                   "_speaker_best_sim", "_cosine_sim", "_add_prototype",
                   "_process_unknown_buffer", "_best_existing_match", "embed_for_match"}, scope)
-        # Two speaker prototypes placed symmetrically around the incoming
-        # embedding, both at sim=0.58 to it (a genuine, not just
-        # approximate, tie).
         s = np.sqrt(1 - 0.58 ** 2)
         incoming = np.array([1., 0., 0.])
         v1 = np.array([0.58, s, 0.])

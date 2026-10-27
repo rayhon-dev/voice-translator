@@ -37,12 +37,6 @@ export default function LanguageSelector({ selectedLang, onSelect, excludeLangs 
       {open && (
         <div className="absolute top-full mt-2 left-0 bg-white/90 backdrop-blur rounded-2xl shadow-lg overflow-hidden min-w-[140px] z-20">
           {LANGUAGES.map((lang) => {
-            // Suhbatdosh (masalan A) allaqachon shu tilni tanlagan bo'lsa —
-            // Google Translate'ning "conversation mode"idagi kabi, ikkinchi
-            // spiker bir xil tilni tanlay olmasligi uchun band qilib
-            // (disabled) ko'rsatiladi, ro'yxatdan butunlay olib
-            // tashlanmaydi — shunda foydalanuvchi "nega faqat 2 ta variant
-            // bor" deb chalkashmaydi, balki NIMA UCHUN band ekanini ko'radi.
             const isExcluded = excludeLangs.includes(lang.code);
             return (
               <button

@@ -1,26 +1,3 @@
-"""DIALOG_PLAN.md 0-bosqich: o'lchash vositasi.
-
-Dialog pipeline'ning (speaker_diart.py: identify_speaker — til+ovoz
-birlashgan balli, 2-bosqich; stt.py: transcribe_audio, joriy STT_PROVIDER
-bo'yicha) uchta ko'rsatkichini backend/debug_audio/ ga yozilgan HAQIQIY
-turnlar ustida o'lchaydi:
-
-  - spiker aniqligi (%)              — pipeline spiker tayinlagan turnlar orasida
-  - tashlab yuborilgan turnlar (%)   — pipeline "turn_skipped" deb hisoblagan turnlar
-  - WER (%)                          — transkripsiya sifati (jiwer)
-
-Ishlatish (fayl oxiridagi "ISHLATISH" bo'limiga ham qarang):
-
-    python backend/tools/eval_dialog.py
-    python backend/tools/eval_dialog.py backend/debug_audio_session1 backend/debug_audio_session2
-
-Argumentsiz chaqirilsa, app.config.DEBUG_AUDIO_DIR (odatda backend/debug_audio)
-ishlatiladi. Har bir argument — BITTA suhbatga (bitta diart sessiyasiga) mos
-keladigan wav+labels.json papka; bir nechta suhbatni bitta hisobotda ko'rish
-uchun ularni alohida papkalarga yozib, shu papkalarni ketma-ket argument
-qilib bering.
-"""
-
 import argparse
 import glob
 import json
@@ -49,16 +26,7 @@ REQUIRED_LABEL_FIELDS = ("speaker", "lang", "text")
 EXPECTED_SAMPLE_RATE = 16000
 
 
-# ---------------------------------------------------------------------------
-# labels.json shablonini yaratish
-# ---------------------------------------------------------------------------
-
-
 def _load_auto_detected_draft(debug_dir: str, basename: str) -> dict | None:
-    """SAVE_DEBUG_AUDIO yoqilgan paytda dialog.py (save_turn_label orqali)
-    har bir wav yoniga yozib qo'ygan <nom>.json sidecar'ni o'qiydi — bu
-    backend O'ZI shu turnda avtomatik nima deb topgani, HAQIQIY to'g'ri javob
-    emas, faqat labels.json shablonini to'ldirish uchun DRAFT sifatida."""
     sidecar = os.path.join(debug_dir, os.path.splitext(basename)[0] + ".json")
     if not os.path.exists(sidecar):
         return None
@@ -107,11 +75,6 @@ def build_labels_template(wav_paths: list[str], debug_dir: str) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Bitta sessiya (bitta papka = bitta suhbat) uchun pipeline'ni qayta ishga tushirish
-# ---------------------------------------------------------------------------
-
-
 def run_session(debug_dir: str):
     wav_paths = sorted(glob.glob(os.path.join(debug_dir, "*.wav")))
     if not wav_paths:
@@ -134,9 +97,6 @@ def run_session(debug_dir: str):
             f"lekin klaster holatini saqlash uchun pipeline orqali baribir o'tkaziladi."
         )
 
-    # Real suhbatda til sessiya BOSHIDA (UI'da) tanlanadi va butun suhbat
-    # davomida o'zgarmaydi — bu yerda esa har bir spikerning BIRINCHI
-    # to'liq-label'langan turnidagi tili speaker_langs sifatida olinadi.
     speaker_langs: dict[str, str] = {}
     for wav_path in wav_paths:
         label = labels.get(os.path.basename(wav_path))
@@ -155,13 +115,6 @@ def run_session(debug_dir: str):
             f"kamida bitta TO'LIQ yozuv borligiga ishonch hosil qiling."
         )
 
-    # DIALOG_PLAN.md 1-bosqich (B1): dialog.py endi SUPPORTED_LANGUAGES
-    # (3 til) o'rniga FAQAT sessiyaning ikki tilini ([langA, langB])
-    # nomzod sifatida beradi — shu yerda ham AYNAN shunga moslashamiz,
-    # aks holda bu eval haqiqiy pipeline'ni emas, eskirgan xatti-harakatni
-    # o'lchab chiqadi. `None` qiymatlar (til hali aniqlanmagan bo'lsa)
-    # pastroqda (_transcribe_audio_whisper/_detect_language_restricted)
-    # avtomatik filtrlanadi.
     session_langs = [speaker_langs.get("A"), speaker_langs.get("B")]
 
     session = create_session()
@@ -185,15 +138,10 @@ def run_session(debug_dir: str):
 
         duration_s = len(wav) / sr
         if duration_s < MIN_TURN_SECONDS:
-            # dialog.py'dagi birinchi filtr bilan BIR XIL: bunchalik qisqa
-            # audio umuman qayta ishlanmaydi.
             row.update(predicted_speaker=None, skip_reason="too_short", text=None, lang=None)
             rows.append(row)
             continue
 
-        # DIALOG_PLAN.md 2-bosqich: dialog.py'dagi kabi, STT endi HAR DOIM
-        # speaker-aniqlashdan OLDIN ishga tushadi (til identify_speaker()
-        # uchun ASOSIY signallardan biri, shuning uchun oldindan kerak).
         text, detected_lang, lang_prob, unsupported_language, _stt_diag = transcribe_audio(wav_path, None, session_langs)
         text = (text or "").strip()
 
@@ -222,11 +170,6 @@ def run_session(debug_dir: str):
         rows.append(row)
 
     return rows
-
-
-# ---------------------------------------------------------------------------
-# Hisobot
-# ---------------------------------------------------------------------------
 
 
 def _label_complete(label: dict | None) -> bool:
@@ -319,32 +262,6 @@ def print_report(session_results: list[tuple[str, list[dict]]]) -> None:
             )
         except Exception as e:
             print(f"WER hisoblanmadi: {e!r}")
-
-
-# ---------------------------------------------------------------------------
-# ISHLATISH
-# ---------------------------------------------------------------------------
-#
-# 1) Backendni SAVE_DEBUG_AUDIO=True bilan ishga tushiring (hozir config.py'da
-#    default shunday) — har bir dialog turni backend/debug_audio/ ga wav +
-#    (avtomatik aniqlangan) .json sidecar sifatida yoziladi.
-# 2) Bitta suhbatni (20-30 turn) to'liq boshidan oxirigacha yozib oling, keyin
-#    "Suhbatni tugatish"ni bosing.
-# 3) Backendni QAYTA ishga tushirishdan OLDIN (chunki ishga tushishda
-#    debug_audio/ tozalanadi!) backend/debug_audio/ papkasini boshqa nomga
-#    ko'chiring, masalan:
-#        mv backend/debug_audio backend/debug_audio_session1
-# 4) 2-3 suhbat uchun 2-3 qadamni takrorlang (session2, session3, ...).
-# 5) Birinchi marta ishga tushirganda labels.json yo'q bo'ladi — skript uni
-#    avtomatik (SAVE_DEBUG_AUDIO yozib qo'ygan taxminlar bilan oldindan
-#    to'ldirilgan) shablon sifatida yaratadi va chiqadi:
-#        python backend/tools/eval_dialog.py backend/debug_audio_session1
-#    Har bir yozuvni tinglab, speaker/lang/text'ni qo'lda tekshirib/tuzating.
-# 6) Hamma session'lar uchun labels.json to'ldirilgach, haqiqiy baholashni
-#    ishga tushiring (bir yoki bir nechta sessiyani birga berish mumkin):
-#        python backend/tools/eval_dialog.py backend/debug_audio_session1 backend/debug_audio_session2 backend/debug_audio_session3
-#
-# ---------------------------------------------------------------------------
 
 
 def main() -> None:

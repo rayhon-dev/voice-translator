@@ -1,16 +1,3 @@
-"""Qisqa, qo'lda ishga tushiriladigan tekshiruv — _is_phantom_phrase() haqiqatan
-ham fuzzy-ratio (substring EMAS) bilan ishlayotganini tasdiqlaydi.
-
-pytest emas (loyihada hali test infratuzilmasi yo'q) — backend venv'ida
-(torch/faster-whisper o'rnatilgan joyda) ishga tushiriladi:
-
-    python backend/tools/test_phantom_phrase.py
-
-Haqiqiy app.models.stt._is_phantom_phrase()ni import qiladi (nusxa emas) —
-shunda mantiq ikki joyda yozilib, vaqt o'tishi bilan bir-biridan chetlashib
-qolmaydi.
-"""
-
 import sys
 from pathlib import Path
 
@@ -20,9 +7,6 @@ if str(BACKEND_DIR) not in sys.path:
 
 from app.models.stt import _is_phantom_phrase  # noqa: E402
 
-# (text, expected_is_phantom) — DIALOG_PLAN.md: real testda topilgan
-# false-positive'lar ("субтитры" so'zini tabiiy ishlatgan haqiqiy gaplar)
-# + klassik Whisper subtitle-boilerplate gallyutsinatsiyalari.
 CASES = [
     ("Для вас есть субтитры, как обычно, здесь...", False),
     ("Где можно включить субтитры", False),
